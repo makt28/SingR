@@ -18,9 +18,9 @@
             "users": [],
             "tls": {
                 "enabled": true,
-                "server_name": "sa.akanyoni.com",
-                "certificate_path": "/etc/singr/cert.pem",
-                "key_path": "/etc/singr/key.pem"
+                "server_name": "xxxx.com",
+                "certificate_path": "/etc/singr/certs/anytls.crt",
+                "key_path": "/etc/singr/certs/anytls.key"
             }
         }
     ],

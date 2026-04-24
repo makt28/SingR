@@ -18,7 +18,7 @@ func newTestClient(nodeType string) *APIClient {
 func TestParseV2rayNodeResponseAnyTLSAlias(t *testing.T) {
 	client := newTestClient("V2ray")
 	nodeInfo, err := client.ParseV2rayNodeResponse(&NodeInfoResponse{
-		RawServerString: "sa.akanyoni.com;14555;0;ws;;path=/anytls|relay_server=other.agstores99.vip|relay_port=42132",
+		RawServerString: "sa.akanyoni.com;14555;0;ws;;path=/anytls|host=xxxx.com|relay_server=other.agstores99.vip|relay_port=42132",
 		TrafficRate:     1,
 	})
 	if err != nil {
@@ -39,6 +39,9 @@ func TestParseV2rayNodeResponseAnyTLSAlias(t *testing.T) {
 	}
 	if nodeInfo.Path != "/anytls" {
 		t.Fatalf("Path = %q, want /anytls", nodeInfo.Path)
+	}
+	if nodeInfo.Host != "xxxx.com" {
+		t.Fatalf("Host = %q, want xxxx.com", nodeInfo.Host)
 	}
 	if nodeInfo.RelayServer != "other.agstores99.vip" {
 		t.Fatalf("RelayServer = %q, want other.agstores99.vip", nodeInfo.RelayServer)
