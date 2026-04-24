@@ -97,6 +97,12 @@ func (c *Controller) Start() error {
 	c.nodeInfo = newNodeInfo
 	c.Tag = c.buildNodeTag() //== inTag
 
+	if configurable, ok := (*c.inbound).(adapter.PStartupConfigurableInbound); ok {
+		if err := configurable.ConfigureFromPanelNode(c.nodeInfo); err != nil {
+			return err
+		}
+	}
+
 	//sync controller user list
 	err = c.syncUserList()
 	if err != nil {

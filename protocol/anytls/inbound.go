@@ -13,6 +13,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/poet/api"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -35,6 +36,8 @@ type Inbound struct {
 	logger    logger.ContextLogger
 	listener  *listener.Listener
 	service   *anytls.Service
+	ctx       context.Context
+	options   option.AnyTLSInboundOptions
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
@@ -42,6 +45,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter: inbound.NewAdapter(C.TypeAnyTLS, tag),
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
+		ctx:     ctx,
+		options: options,
 	}
 
 	if options.TLS != nil && options.TLS.Enabled {
@@ -77,6 +82,48 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 	})
 	return inbound, nil
+}
+
+func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
+	if nodeInfo == nil || nodeInfo.NodeType != C.TypeAnyTLS {
+		return nil
+	}
+
+	options := h.options
+	if nodeInfo.Port > 0 {
+		if nodeInfo.Port > 65535 {
+			return E.New("invalid anytls listen port from panel: ", nodeInfo.Port)
+		}
+		options.ListenPort = uint16(nodeInfo.Port)
+	}
+	if nodeInfo.Host != "" {
+		tlsOptions := options.TLS
+		if tlsOptions == nil {
+			tlsOptions = &option.InboundTLSOptions{Enabled: true}
+		}
+		tlsOptions.ServerName = nodeInfo.Host
+		options.TLS = tlsOptions
+	}
+
+	var tlsConfig tls.ServerConfig
+	var err error
+	if options.TLS != nil && options.TLS.Enabled {
+		tlsConfig, err = tls.NewServer(h.ctx, h.logger, common.PtrValueOrDefault(options.TLS))
+		if err != nil {
+			return err
+		}
+	}
+
+	h.options = options
+	h.tlsConfig = tlsConfig
+	h.listener = listener.New(listener.Options{
+		Context:           h.ctx,
+		Logger:            h.logger,
+		Network:           []string{N.NetworkTCP},
+		Listen:            options.ListenOptions,
+		ConnectionHandler: h,
+	})
+	return nil
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {

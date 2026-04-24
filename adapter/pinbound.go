@@ -8,3 +8,9 @@ type PInbound interface {
 	// RefreshUsers 更新用户数据
 	RefreshUsers(users *[]api.UserInfo, nodeInfo *api.NodeInfo) error
 }
+
+// PStartupConfigurableInbound lets the panel layer apply node settings before
+// the sing-box inbound starts listening.
+type PStartupConfigurableInbound interface {
+	ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error
+}
