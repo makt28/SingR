@@ -1,0 +1,47 @@
+{
+    "log": {
+        "disabled": false,
+        "level": "info",
+        "timestamp": true,
+        "output": "lumberjack",
+        "filename": "/var/log/singr.log",
+        "maxsize": 20,
+        "maxbackups": 5,
+        "maxage": 14
+    },
+    "inbounds": [
+        {
+            "type": "anytls",
+            "tag": "anytls-in",
+            "listen": "::",
+            "listen_port": 14555,
+            "users": [],
+            "tls": {
+                "enabled": true,
+                "server_name": "sa.akanyoni.com",
+                "certificate_path": "/etc/singr/cert.pem",
+                "key_path": "/etc/singr/key.pem"
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "anytls-out"
+        },
+        {
+            "type": "direct",
+            "tag": "direct"
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "inbound": "anytls-in",
+                "outbound": "anytls-out"
+            }
+        ],
+        "final": "direct",
+        "auto_detect_interface": true
+    }
+}
