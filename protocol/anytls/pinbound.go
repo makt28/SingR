@@ -20,7 +20,7 @@ func (h *Inbound) RefreshUsers(users *[]api.UserInfo, nodeInfo *api.NodeInfo) er
 	for i, user := range *users {
 		opUsers[i] = anytls.User{
 			Name:     fmt.Sprintf("u%d", user.UID),
-			Password: user.Passwd,
+			Password: buildAnyTLSPassword(user),
 		}
 	}
 
@@ -28,4 +28,11 @@ func (h *Inbound) RefreshUsers(users *[]api.UserInfo, nodeInfo *api.NodeInfo) er
 	h.service.UpdateUsers(opUsers)
 
 	return nil
+}
+
+func buildAnyTLSPassword(user api.UserInfo) string {
+	if user.UUID != "" {
+		return user.UUID
+	}
+	return user.Passwd
 }

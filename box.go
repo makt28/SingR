@@ -24,6 +24,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	POET "github.com/sagernet/sing-box/poet"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing/common"
@@ -157,6 +158,7 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "create log factory")
 	}
+	POET.SetLogger(logFactory)
 
 	var internalServices []adapter.LifecycleService
 	certificateOptions := common.PtrValueOrDefault(options.Certificate)
@@ -420,6 +422,8 @@ func (s *Box) PreStart() error {
 }
 
 func (s *Box) Start() error {
+	POET.Start()
+
 	err := s.start()
 	if err != nil {
 		// TODO: remove catch error

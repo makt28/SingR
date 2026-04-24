@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	POET "github.com/sagernet/sing-box/poet"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -159,5 +160,6 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	}
 	m.inbounds = append(m.inbounds, inbound)
 	m.inboundByTag[tag] = inbound
+	POET.SetInboud(&inbound, tag)
 	return nil
 }

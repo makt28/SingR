@@ -138,8 +138,15 @@ func (c *Controller) buildAnyTLSUser(userInfo *[]api.UserInfo) (users []*option.
 	for i, user := range *userInfo {
 		users[i] = &option.AnyTLSUser{
 			Name:     c.buildUserHash(&user),
-			Password: user.Passwd,
+			Password: c.buildAnyTLSPassword(&user),
 		}
 	}
 	return users
+}
+
+func (c *Controller) buildAnyTLSPassword(user *api.UserInfo) string {
+	if user.UUID != "" {
+		return user.UUID
+	}
+	return user.Passwd
 }
