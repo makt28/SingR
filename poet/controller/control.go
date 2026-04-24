@@ -27,9 +27,6 @@ func (c *Controller) syncUserList() error {
 	added, deleted := c.compareUsersMapReDeleted(&c.usersMap, userInfo)
 	adLen, deLen := len(added), len(deleted)
 	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d", adLen, deLen), "info")
-	if adLen == 0 && deLen == 0 {
-		return nil
-	}
 
 	if deLen > 0 {
 		for hash := range deleted {
