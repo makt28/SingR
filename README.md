@@ -40,43 +40,38 @@ SingR 会按旧 SSPanel V2ray 格式解析：
 也可以使用安装脚本：
 
 ```sh
-sudo bash release/singr/install.sh
+sudo bash install.sh
 ```
 
 脚本会优先使用当前源码目录下已编译好的 `sing-box`，没有二进制时会尝试从源码编译。也可以显式指定二进制：
 
 ```sh
-sudo env SINGR_BINARY=/path/to/sing-box bash release/singr/install.sh
+sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 ```
 
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash release/singr/install.sh v0.1.1
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.2
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
 
 ```sh
-sudo bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/release/singr/install.sh)
-```
-
-也可以从 GitHub Release 下载 `install.sh` 后运行：
-
-```sh
-curl -fL -o install.sh https://github.com/makt28/SingR/releases/latest/download/install.sh
-sudo bash install.sh
+sudo bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
 ```
 
 脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
 
+`SingR` 和 `singr` 两个管理命令等价，大小写都可以。
+
 管理命令示例：
 
 ```sh
-SingR status
-SingR log
-SingR update
-SingR restart
+singr status
+singr log
+singr update
+singr restart
 ```
 
 手动编译安装方式如下。

@@ -380,8 +380,8 @@ EOF
 install_management_script() {
     local target="/usr/bin/SingR"
     local lower="/usr/bin/singr"
-    local source_script="${PROJECT_DIR}/release/singr/SingR.sh"
-    local script_url="https://raw.githubusercontent.com/${SINGR_RELEASE_REPO}/${SINGR_RELEASE_BRANCH}/release/singr/SingR.sh"
+    local source_script="${PROJECT_DIR}/SingR.sh"
+    local script_url="https://raw.githubusercontent.com/${SINGR_RELEASE_REPO}/${SINGR_RELEASE_BRANCH}/SingR.sh"
 
     if [[ -f "${SCRIPT_DIR}/SingR.sh" ]]; then
         install -m 755 "${SCRIPT_DIR}/SingR.sh" "${target}"
@@ -397,22 +397,36 @@ install_management_script() {
 
 print_usage() {
     echo ""
-    echo "SingR 管理命令："
+    echo "SingR 安装完成。"
+    echo ""
+    echo "管理命令已安装："
+    echo "  SingR"
+    echo "  singr"
+    echo ""
+    echo "两个命令等价，大小写都可以。直接输入 SingR 或 singr 打开管理菜单。"
+    echo ""
+    echo "常用管理命令："
     echo "------------------------------------------"
-    echo "systemctl start ${SERVICE_NAME}      启动 SingR"
-    echo "systemctl stop ${SERVICE_NAME}       停止 SingR"
-    echo "systemctl restart ${SERVICE_NAME}    重启 SingR"
-    echo "systemctl status ${SERVICE_NAME}     查看状态"
-    echo "journalctl -u ${SERVICE_NAME} -f     查看日志"
-    echo "${BIN_PATH} version               查看版本"
+    echo "singr start        启动 SingR"
+    echo "singr stop         停止 SingR"
+    echo "singr restart      重启 SingR"
+    echo "singr status       查看状态"
+    echo "singr log          查看日志"
+    echo "singr update       更新 SingR"
+    echo "singr config       修改配置"
+    echo "singr version      查看版本"
     echo "------------------------------------------"
+    echo ""
+    echo "systemd 命令仍可直接使用：systemctl restart ${SERVICE_NAME}"
+    echo "运行二进制路径：${BIN_PATH}"
     echo ""
     echo "配置文件："
     echo "${CONFIG_DIR}/panel.json"
     echo "${CONFIG_DIR}/server.json"
     echo ""
     echo "首次安装后请先修改配置和证书，再运行："
-    echo "systemctl restart ${SERVICE_NAME}"
+    echo "singr config"
+    echo "singr restart"
 }
 
 main() {
@@ -428,7 +442,7 @@ main() {
     install_service
     install_management_script
 
-    log_info "SingR 安装完成，已设置开机自启。"
+    log_info "SingR 已设置开机自启。"
     print_usage
 }
 

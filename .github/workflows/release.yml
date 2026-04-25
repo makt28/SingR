@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example v0.1.1"
+        description: "Release version, for example v0.1.2"
         required: false
-        default: "v0.1.1"
+        default: "v0.1.2"
         type: string
 
 permissions:
@@ -79,10 +79,8 @@ jobs:
           cp README.md "${package_dir}/"
           cp release/poet/panel_anytls.json "${package_dir}/panel.json"
           cp release/poet/server_anytls.json "${package_dir}/server.json"
-          cp release/singr/install.sh "${package_dir}/install.sh"
-          cp release/singr/SingR.sh "${package_dir}/SingR.sh"
           cp release/singr/VERSION "${package_dir}/VERSION"
-          chmod +x "${package_dir}/singr" "${package_dir}/install.sh" "${package_dir}/SingR.sh"
+          chmod +x "${package_dir}/singr"
           (
             cd dist
             zip -9 -r "SingR-linux-${{ matrix.arch }}.zip" "SingR-linux-${{ matrix.arch }}"
@@ -134,16 +132,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp release/singr/install.sh dist/install.sh
-          cp release/singr/SingR.sh dist/SingR.sh
           cp release/singr/VERSION dist/VERSION
-          chmod +x dist/install.sh dist/SingR.sh
           git archive --format=tar.gz --prefix="SingR-${VERSION#v}/" \
             -o "dist/SingR-source-${VERSION}.tar.gz" HEAD
           (
             cd dist
-            sha256sum install.sh > install.sh.sha256
-            sha256sum SingR.sh > SingR.sh.sha256
             sha256sum VERSION > VERSION.sha256
             sha256sum "SingR-source-${VERSION}.tar.gz" > "SingR-source-${VERSION}.tar.gz.sha256"
           )
