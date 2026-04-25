@@ -37,6 +37,28 @@ SingR 会按旧 SSPanel V2ray 格式解析：
 
 ## 编译安装
 
+也可以使用安装脚本：
+
+```sh
+sudo bash release/singr/install.sh
+```
+
+脚本会优先使用当前源码目录下已编译好的 `sing-box`，没有二进制时会尝试从源码编译。也可以显式指定二进制：
+
+```sh
+sudo env SINGR_BINARY=/path/to/sing-box bash release/singr/install.sh
+```
+
+如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
+
+```sh
+sudo env SINGR_RELEASE_REPO=owner/repo bash release/singr/install.sh v0.1.0
+```
+
+脚本会安装到 `/usr/local/SingR/singr`，创建 `/usr/local/bin/singr` 软链接，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
+
+手动编译安装方式如下。
+
 克隆或上传源码后，在项目根目录执行：
 
 ```sh

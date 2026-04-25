@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
+
+APP_NAME="SingR"
+SERVICE_NAME="singr"
+BIN_NAME="singr"
+
+INSTALL_DIR="/usr/local/SingR"
+CONFIG_DIR="/etc/singr"
+CERT_DIR="${CONFIG_DIR}/certs"
+SYSTEMD_SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
+BIN_PATH="${INSTALL_DIR}/${BIN_NAME}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+CUR_DIR="$(pwd)"
+
+# Optional install sources:
+#   SINGR_BINARY=/path/to/sing-box-or-singr
+#   SINGR_RELEASE_URL=https://example.com/SingR-linux-amd64.tar.gz
+#   SINGR_RELEASE_REPO=owner/repo [version]
+SINGR_BINARY="${SINGR_BINARY:-}"
+SINGR_RELEASE_URL="${SINGR_RELEASE_URL:-}"
+SINGR_RELEASE_REPO="${SINGR_RELEASE_REPO:-}"
+SINGR_VERSION="${1:-}"
+
+log_info() {
+    echo -e "${green}$*${plain}"
+}
+
+log_warn() {
+    echo -e "${yellow}$*${plain}"
+}
+
+log_error() {
+    echo -e "${red}$*${plain}"
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+check_root() {
+    [[ "${EUID}" -ne 0 ]] && die "错误：必须使用 root 用户运行此脚本。"
+}
+
+detect_os() {
+    if [[ -f /etc/redhat-release ]]; then
+        release="centos"
+    elif grep -Eqi "debian" /etc/issue 2>/dev/null || grep -Eqi "debian" /proc/version 2>/dev/null; then
+        release="debian"
+    elif grep -Eqi "ubuntu" /etc/issue 2>/dev/null || grep -Eqi "ubuntu" /proc/version 2>/dev/null; then
+        release="ubuntu"
+    elif grep -Eqi "centos|red hat|redhat" /etc/issue 2>/dev/null || grep -Eqi "centos|red hat|redhat" /proc/version 2>/dev/null; then
+        release="centos"
+    else
+        die "未检测到支持的系统版本。"
+    fi
+
+    os_version=""
+    if [[ -f /etc/os-release ]]; then
+        os_version="$(awk -F'[= ."]' '/VERSION_ID/{print $3}' /etc/os-release)"
+    fi
+    if [[ -z "${os_version}" && -f /etc/lsb-release ]]; then
+        os_version="$(awk -F'[= ."]+' '/DISTRIB_RELEASE/{print $2}' /etc/lsb-release)"
+    fi
+
+    if [[ "${release}" == "centos" && -n "${os_version}" && "${os_version}" -le 6 ]]; then
+        die "请使用 CentOS 7 或更高版本。"
+    elif [[ "${release}" == "ubuntu" && -n "${os_version}" && "${os_version}" -lt 16 ]]; then
+        die "请使用 Ubuntu 16 或更高版本。"
+    elif [[ "${release}" == "debian" && -n "${os_version}" && "${os_version}" -lt 8 ]]; then
+        die "请使用 Debian 8 或更高版本。"
+    fi
+}
+
+detect_arch() {
+    local raw_arch
+    raw_arch="$(uname -m)"
+    case "${raw_arch}" in
+        x86_64 | x64 | amd64)
+            arch="amd64"
+            ;;
+        aarch64 | arm64)
+            arch="arm64"
+            ;;
+        armv7l | armv7)
+            arch="armv7"
+            ;;
+        s390x)
+            arch="s390x"
+            ;;
+        *)
+            die "不支持的 CPU 架构：${raw_arch}"
+            ;;
+    esac
+
+    if [[ "$(getconf WORD_BIT)" == "32" && "$(getconf LONG_BIT)" != "64" ]]; then
+        die "不支持 32 位系统，请使用 64 位系统。"
+    fi
+
+    echo "架构：${arch}"
+}
+
+install_base() {
+    if [[ "${release}" == "centos" ]]; then
+        yum install -y epel-release || true
+        yum install -y wget curl unzip tar ca-certificates
+    else
+        apt update -y
+        apt install -y wget curl unzip tar ca-certificates
+    fi
+}
+
+check_systemd() {
+    command -v systemctl >/dev/null 2>&1 || die "未检测到 systemctl，当前脚本仅支持 systemd 环境。"
+}
+
+copy_binary() {
+    local source_bin="$1"
+    [[ -f "${source_bin}" ]] || die "找不到二进制文件：${source_bin}"
+
+    mkdir -p "${INSTALL_DIR}"
+    install -m 755 "${source_bin}" "${BIN_PATH}"
+    ln -sf "${BIN_PATH}" "/usr/local/bin/${BIN_NAME}"
+}
+
+build_from_source() {
+    [[ -f "${PROJECT_DIR}/go.mod" && -d "${PROJECT_DIR}/cmd/sing-box" ]] || return 1
+    command -v go >/dev/null 2>&1 || return 1
+
+    log_info "检测到本地源码，开始编译 SingR..."
+    cd "${PROJECT_DIR}"
+    export GOTOOLCHAIN=local
+    make build
+    [[ -f "${PROJECT_DIR}/sing-box" ]] || die "编译完成后未找到 ${PROJECT_DIR}/sing-box"
+    copy_binary "${PROJECT_DIR}/sing-box"
+    cd "${CUR_DIR}"
+}
+
+latest_release_version() {
+    [[ -n "${SINGR_RELEASE_REPO}" ]] || die "未设置 SINGR_RELEASE_REPO，无法从 GitHub release 下载。"
+
+    curl -fsSL "https://api.github.com/repos/${SINGR_RELEASE_REPO}/releases/latest" |
+        grep '"tag_name":' |
+        sed -E 's/.*"([^"]+)".*/\1/' |
+        head -n 1
+}
+
+download_release() {
+    local tmp_dir archive version url candidate
+    tmp_dir="$(mktemp -d)"
+
+    if [[ -n "${SINGR_RELEASE_URL}" ]]; then
+        url="${SINGR_RELEASE_URL}"
+        log_info "开始下载 SingR：${url}"
+        archive="${tmp_dir}/singr-release"
+        curl -fL "${url}" -o "${archive}"
+    else
+        [[ -n "${SINGR_RELEASE_REPO}" ]] || return 1
+        if [[ -n "${SINGR_VERSION}" ]]; then
+            if [[ "${SINGR_VERSION}" == v* ]]; then
+                version="${SINGR_VERSION}"
+            else
+                version="v${SINGR_VERSION}"
+            fi
+        else
+            version="$(latest_release_version)"
+        fi
+        [[ -n "${version}" ]] || die "检测 SingR 最新版本失败，请手动指定版本或设置 SINGR_RELEASE_URL。"
+
+        log_info "检测到 SingR 版本：${version}"
+        for candidate in \
+            "SingR-linux-${arch}.tar.gz" \
+            "singr-linux-${arch}.tar.gz" \
+            "sing-box-linux-${arch}.tar.gz" \
+            "SingR-linux-${arch}.zip" \
+            "singr-linux-${arch}.zip" \
+            "sing-box-linux-${arch}.zip"; do
+            url="https://github.com/${SINGR_RELEASE_REPO}/releases/download/${version}/${candidate}"
+            archive="${tmp_dir}/${candidate}"
+            if curl -fL "${url}" -o "${archive}"; then
+                break
+            fi
+            rm -f "${archive}"
+        done
+        [[ -f "${archive}" ]] || die "下载 SingR ${version} 失败，请确认 release 文件名和架构。"
+    fi
+
+    case "${archive}" in
+        *.zip)
+            unzip -q "${archive}" -d "${tmp_dir}/extract"
+            ;;
+        *.tar.gz | *.tgz)
+            mkdir -p "${tmp_dir}/extract"
+            tar -xzf "${archive}" -C "${tmp_dir}/extract"
+            ;;
+        *)
+            mkdir -p "${tmp_dir}/extract"
+            cp "${archive}" "${tmp_dir}/extract/singr"
+            ;;
+    esac
+
+    local found_bin
+    found_bin="$(find "${tmp_dir}/extract" -type f \( -name "singr" -o -name "SingR" -o -name "sing-box" \) | head -n 1)"
+    [[ -n "${found_bin}" ]] || die "release 包中未找到 singr、SingR 或 sing-box 二进制。"
+    chmod +x "${found_bin}"
+    copy_binary "${found_bin}"
+    rm -rf "${tmp_dir}"
+}
+
+install_binary() {
+    if [[ -n "${SINGR_BINARY}" ]]; then
+        log_info "使用 SINGR_BINARY 安装：${SINGR_BINARY}"
+        copy_binary "${SINGR_BINARY}"
+        return
+    fi
+
+    if [[ -x "${PROJECT_DIR}/sing-box" ]]; then
+        log_info "使用本地已编译二进制：${PROJECT_DIR}/sing-box"
+        copy_binary "${PROJECT_DIR}/sing-box"
+        return
+    fi
+
+    if build_from_source; then
+        return
+    fi
+
+    download_release || die "未找到可安装的 SingR。请设置 SINGR_BINARY、在源码目录运行脚本，或设置 SINGR_RELEASE_REPO/SINGR_RELEASE_URL。"
+}
+
+install_config() {
+    mkdir -p "${CONFIG_DIR}" "${CERT_DIR}"
+
+    if [[ ! -f "${CONFIG_DIR}/panel.json" ]]; then
+        if [[ -f "${PROJECT_DIR}/release/poet/panel_anytls.json" ]]; then
+            cp "${PROJECT_DIR}/release/poet/panel_anytls.json" "${CONFIG_DIR}/panel.json"
+            log_info "已安装默认面板配置：${CONFIG_DIR}/panel.json"
+        else
+            cat >"${CONFIG_DIR}/panel.json" <<'EOF'
+{
+  "name": "connect old sspanel v2ray node and run it as anytls",
+  "nodes": [
+    {
+      "paneltype": "SSpanel",
+      "intag": "anytls-in",
+      "outtag": "anytls-out",
+      "apiconfig": {
+        "apihost": "https://your-sspanel.example.com",
+        "apikey": "your-apikey",
+        "nodeid": 1,
+        "nodetype": "V2ray",
+        "disablecustomconfig": true
+      }
+    }
+  ]
+}
+EOF
+            log_info "已生成默认面板配置：${CONFIG_DIR}/panel.json"
+        fi
+    else
+        log_warn "保留已有面板配置：${CONFIG_DIR}/panel.json"
+    fi
+
+    if [[ ! -f "${CONFIG_DIR}/server.json" ]]; then
+        if [[ -f "${PROJECT_DIR}/release/poet/server_anytls.json" ]]; then
+            cp "${PROJECT_DIR}/release/poet/server_anytls.json" "${CONFIG_DIR}/server.json"
+            log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
+        else
+            cat >"${CONFIG_DIR}/server.json" <<'EOF'
+{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true,
+    "output": "lumberjack",
+    "filename": "/var/log/singr.log",
+    "maxsize": 20,
+    "maxbackups": 5,
+    "maxage": 14
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": 14555,
+      "users": [],
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "certificate_path": "/etc/singr/certs/anytls.crt",
+        "key_path": "/etc/singr/certs/anytls.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "anytls-out"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": "anytls-in",
+        "outbound": "anytls-out"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}
+EOF
+            log_info "已生成默认 sing-box 配置：${CONFIG_DIR}/server.json"
+        fi
+    else
+        log_warn "保留已有 sing-box 配置：${CONFIG_DIR}/server.json"
+    fi
+}
+
+install_service() {
+    cat >"${SYSTEMD_SERVICE}" <<EOF
+[Unit]
+Description=SingR SSPanel backend
+After=network.target nss-lookup.target network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${BIN_PATH} run -c ${CONFIG_DIR}/server.json -p ${CONFIG_DIR}/panel.json
+Restart=on-failure
+RestartSec=10
+LimitAS=infinity
+LimitRSS=infinity
+LimitCORE=infinity
+LimitNOFILE=999999
+Environment="http_proxy="
+Environment="https_proxy="
+Environment="HTTP_PROXY="
+Environment="HTTPS_PROXY="
+Environment="ALL_PROXY="
+Environment="all_proxy="
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}"
+}
+
+print_usage() {
+    echo ""
+    echo "SingR 管理命令："
+    echo "------------------------------------------"
+    echo "systemctl start ${SERVICE_NAME}      启动 SingR"
+    echo "systemctl stop ${SERVICE_NAME}       停止 SingR"
+    echo "systemctl restart ${SERVICE_NAME}    重启 SingR"
+    echo "systemctl status ${SERVICE_NAME}     查看状态"
+    echo "journalctl -u ${SERVICE_NAME} -f     查看日志"
+    echo "${BIN_PATH} version               查看版本"
+    echo "------------------------------------------"
+    echo ""
+    echo "配置文件："
+    echo "${CONFIG_DIR}/panel.json"
+    echo "${CONFIG_DIR}/server.json"
+    echo ""
+    echo "首次安装后请先修改配置和证书，再运行："
+    echo "systemctl restart ${SERVICE_NAME}"
+}
+
+main() {
+    check_root
+    detect_os
+    detect_arch
+    check_systemd
+
+    log_info "开始安装 SingR"
+    install_base
+    install_binary
+    install_config
+    install_service
+
+    log_info "SingR 安装完成，已设置开机自启。"
+    print_usage
+}
+
+main "$@"
