@@ -51,7 +51,9 @@ die() {
 }
 
 check_root() {
-    [[ "${EUID}" -ne 0 ]] && die "错误：必须使用 root 用户运行此脚本。"
+    if [[ "${EUID}" -ne 0 ]]; then
+        die "错误：必须使用 root 用户运行此脚本。"
+    fi
 }
 
 detect_os() {
