@@ -293,11 +293,7 @@ EOF
     "disabled": false,
     "level": "info",
     "timestamp": true,
-    "output": "lumberjack",
-    "filename": "/var/log/singr.log",
-    "maxsize": 20,
-    "maxbackups": 5,
-    "maxage": 14
+    "output": "/var/log/singr.log"
   },
   "inbounds": [
     {

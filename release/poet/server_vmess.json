@@ -3,11 +3,7 @@
         "disabled": false,
         "level": "debug",
         "timestamp": true,
-        "output": "lumberjack",
-        "filename": "/var/log/sing-poet.log",
-        "maxsize": 20,
-        "maxbackups": 5,
-        "maxage": 14
+        "output": "/var/log/singr.log"
     },
     "dns": {
         "servers": [

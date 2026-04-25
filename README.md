@@ -52,7 +52,7 @@ sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.2
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.3
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
@@ -170,11 +170,7 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
     "disabled": false,
     "level": "info",
     "timestamp": true,
-    "output": "lumberjack",
-    "filename": "/var/log/singr.log",
-    "maxsize": 20,
-    "maxbackups": 5,
-    "maxage": 14
+    "output": "/var/log/singr.log"
   },
   "inbounds": [
     {
@@ -216,11 +212,11 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 
 启动时，如果面板节点被识别为 AnyTLS 兼容模式：
 
-- `listen_port` 会被 SSPanel 节点地址中的端口覆盖。
-- `tls.server_name` 会被 SSPanel 节点地址中的 `host=` 覆盖。
+- 如果 SSPanel 节点地址里解析到有效端口，`listen_port` 会被该端口覆盖。
+- 如果 SSPanel 节点地址里存在非空 `host=`，`tls.server_name` 会被该值覆盖。
 - 证书路径和私钥路径仍然来自本地 `server.json`，不会从面板获取。
 
-如果面板端口或 `host=` 改变，需要重启 SingR 才会更新监听端口或 SNI。
+也就是说，本地 JSON 可以先写默认值；只有面板对应字段非空、有效时才会替换本地值。如果面板端口或 `host=` 改变，需要重启 SingR 才会更新监听端口或 SNI。
 
 ## 准备 TLS 证书
 
