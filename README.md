@@ -52,7 +52,7 @@ sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.4
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.5
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
@@ -258,6 +258,8 @@ ss -lntp | grep singr
 ```text
 /var/log/singr.log
 ```
+
+`SingR log` 会先显示最近的 systemd journal，再跟随 `/var/log/singr.log`。流量上报、在线 IP 上报和用户同步日志由 sing-box logger 写入该文件；`journalctl -u singr` 主要能看到 systemd 和标准输出/错误日志。
 
 ## systemd 服务
 

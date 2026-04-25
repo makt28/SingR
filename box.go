@@ -403,7 +403,7 @@ func New(options Options) (*Box, error) {
 }
 
 func (s *Box) PreStart() error {
-	err := s.preStart()
+	err := s.preStart(false)
 	if err != nil {
 		// TODO: remove catch error
 		defer func() {
@@ -422,8 +422,6 @@ func (s *Box) PreStart() error {
 }
 
 func (s *Box) Start() error {
-	POET.Start()
-
 	err := s.start()
 	if err != nil {
 		// TODO: remove catch error
@@ -442,13 +440,21 @@ func (s *Box) Start() error {
 	return nil
 }
 
-func (s *Box) preStart() error {
+func (s *Box) preStart(startPanel bool) error {
 	monitor := taskmonitor.New(s.logger, C.StartTimeout)
 	monitor.Start("start logger")
 	err := s.logFactory.Start()
 	monitor.Finish()
 	if err != nil {
 		return E.Cause(err, "start logger")
+	}
+	if startPanel {
+		monitor.Start("start panel")
+		err = POET.Start()
+		monitor.Finish()
+		if err != nil {
+			return E.Cause(err, "start panel")
+		}
 	}
 	err = adapter.StartNamed(s.logger, adapter.StartStateInitialize, s.internalService) // cache-file clash-api v2ray-api
 	if err != nil {
@@ -466,7 +472,7 @@ func (s *Box) preStart() error {
 }
 
 func (s *Box) start() error {
-	err := s.preStart()
+	err := s.preStart(true)
 	if err != nil {
 		return err
 	}
@@ -505,6 +511,7 @@ func (s *Box) Close() error {
 		close(s.done)
 	}
 	var err error
+	POET.Stop()
 	for _, closeItem := range []struct {
 		name    string
 		service adapter.Lifecycle

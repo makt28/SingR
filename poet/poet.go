@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -18,6 +19,11 @@ import (
 	SS "github.com/sagernet/sing-box/poet/shortcuts"
 
 	"github.com/spf13/viper"
+)
+
+var (
+	panelAccess sync.Mutex
+	activePanel *panel.Panel
 )
 
 // type singPoet struct {
@@ -82,10 +88,26 @@ func Start() error {
 	p := panel.NewPanel(panelConfig)
 
 	p.Start()
-	defer p.Close()
+
+	panelAccess.Lock()
+	if activePanel != nil && activePanel.Running {
+		activePanel.Close()
+	}
+	activePanel = p
+	panelAccess.Unlock()
 
 	return nil
 
+}
+
+func Stop() {
+	panelAccess.Lock()
+	defer panelAccess.Unlock()
+	if activePanel == nil {
+		return
+	}
+	activePanel.Close()
+	activePanel = nil
 }
 
 // 设置日志

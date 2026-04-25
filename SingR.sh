@@ -12,6 +12,7 @@ BIN_PATH="${INSTALL_DIR}/singr"
 CONFIG_DIR="/etc/singr"
 PANEL_CONFIG="${CONFIG_DIR}/panel.json"
 SERVER_CONFIG="${CONFIG_DIR}/server.json"
+LOG_FILE="/var/log/singr.log"
 RELEASE_REPO="${SINGR_RELEASE_REPO:-makt28/SingR}"
 RELEASE_BRANCH="${SINGR_RELEASE_BRANCH:-main}"
 INSTALL_URL="https://raw.githubusercontent.com/${RELEASE_REPO}/${RELEASE_BRANCH}/install.sh"
@@ -167,7 +168,15 @@ disable() {
 }
 
 show_log() {
-    journalctl -u "${SERVICE_NAME}.service" -e --no-pager -f
+    if [[ -f "${LOG_FILE}" ]]; then
+        echo "===== systemd journal: ${SERVICE_NAME}.service ====="
+        journalctl -u "${SERVICE_NAME}.service" -n 80 --no-pager
+        echo "===== following ${LOG_FILE} ====="
+        tail -n 200 -F "${LOG_FILE}"
+    else
+        echo "未找到 ${LOG_FILE}，改为查看 systemd journal。"
+        journalctl -u "${SERVICE_NAME}.service" -e --no-pager -f
+    fi
     [[ $# == 0 ]] && before_show_menu
 }
 

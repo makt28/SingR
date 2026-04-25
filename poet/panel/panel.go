@@ -20,7 +20,7 @@ type Panel struct {
 	panelConfig *Config
 	Running     bool
 	//Service
-	Nodes []controller.Controller
+	Nodes []*controller.Controller
 }
 
 func NewPanel(panelConfig *Config) *Panel {
@@ -86,7 +86,7 @@ func (p *Panel) Start() {
 			}
 		}
 		controllerService := controller.New(ctx, *controllerConfig, inbound, apiClient, log)
-		p.Nodes = append(p.Nodes, *controllerService)
+		p.Nodes = append(p.Nodes, controllerService)
 
 		//set Contrl
 		ss.SetContrl(controllerService, inTag, outTag)
