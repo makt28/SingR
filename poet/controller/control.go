@@ -56,6 +56,11 @@ func (c *Controller) syncUserList() error {
 			}
 		}
 	}
+	for _, user := range *userInfo {
+		hash := c.buildUserHash(&user)
+		c.author.SetUserProfile(hash, user)
+		c.author.SetUserAliases(hash, user.UUID, user.Passwd, user.Email)
+	}
 
 	// update inbound server userList
 	// 1. 检查是否实现 UserRefresher 接口
@@ -88,12 +93,17 @@ func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapt
 	//每次 goroutine 会预先生成用户Map 以及 author.users
 
 	hash := metadata.User
-	meter, found := c.author.users.Load(hash)
+	user, found := c.author.LoadUser(hash)
 	if !found {
 		return nil, nil, fmt.Errorf("hash:%s is not in user map", hash)
 	}
+	if hash != user.hash {
+		c.log(fmt.Sprintf("traffic user alias mapped alias=%s canonical=%s UID=%d email=%s", hash, user.hash, user.UID, user.Email), "debug")
+	}
+	if user.MarkCounterAttached() {
+		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", user.UID, user.Email, user.hash, metadata.Inbound, metadata.Source.AddrString()), "info")
+	}
 
-	user := meter.(*User)
 	//add IP
 	user.AddIP(metadata.Source.AddrString())
 

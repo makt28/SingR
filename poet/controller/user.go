@@ -11,6 +11,8 @@ import (
 	// "sync/atomic"
 	"github.com/sagernet/sing/common/atomic"
 
+	"github.com/sagernet/sing-box/poet/api"
+
 	"golang.org/x/time/rate"
 )
 
@@ -32,8 +34,13 @@ type User struct {
 	hash string
 	UID  int
 
+	Email  string
+	UUID   string
+	Passwd string
+
 	ipTable     sync.Map
 	ipNum       atomic.Int32
+	counterSeen atomic.Bool
 	maxIPNum    int
 	limiterLock sync.RWMutex
 	sendLimiter *rate.Limiter
@@ -226,9 +233,14 @@ func (u *User) GetSpeed() (int64, int64) {
 	return u.sendSpeed.Load(), u.recvSpeed.Load()
 }
 
+func (u *User) MarkCounterAttached() bool {
+	return u.counterSeen.CompareAndSwap(false, true)
+}
+
 type Authenticator struct {
-	users sync.Map
-	ctx   context.Context
+	users   sync.Map
+	aliases sync.Map
+	ctx     context.Context
 }
 
 // func (a *Authenticator) AuthUser(hash string) (bool, statistic.User) {
@@ -261,7 +273,56 @@ func (a *Authenticator) DelUser(hash string) error {
 	}
 	meter.(*User).Close()
 	a.users.Delete(hash)
+	a.deleteAliases(hash)
 	return nil
+}
+
+func (a *Authenticator) LoadUser(hash string) (*User, bool) {
+	meter, found := a.users.Load(hash)
+	if found {
+		user, ok := meter.(*User)
+		return user, ok
+	}
+
+	canonicalHash, found := a.aliases.Load(hash)
+	if !found {
+		return nil, false
+	}
+	meter, found = a.users.Load(canonicalHash)
+	if !found {
+		return nil, false
+	}
+	user, ok := meter.(*User)
+	return user, ok
+}
+
+func (a *Authenticator) SetUserAliases(hash string, aliases ...string) {
+	a.deleteAliases(hash)
+	for _, alias := range aliases {
+		if alias == "" || alias == hash {
+			continue
+		}
+		a.aliases.Store(alias, hash)
+	}
+}
+
+func (a *Authenticator) deleteAliases(hash string) {
+	a.aliases.Range(func(key, value interface{}) bool {
+		if canonicalHash, ok := value.(string); ok && canonicalHash == hash {
+			a.aliases.Delete(key)
+		}
+		return true
+	})
+}
+
+func (a *Authenticator) SetUserProfile(hash string, userInfo api.UserInfo) {
+	user, found := a.LoadUser(hash)
+	if !found {
+		return
+	}
+	user.Email = userInfo.Email
+	user.UUID = userInfo.UUID
+	user.Passwd = userInfo.Passwd
 }
 
 // func (a *Authenticator) AddTraffic(hash string, send, recv uint64) error {

@@ -290,7 +290,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 
 		userTraffic = append(userTraffic, api.UserTraffic{
 			UID:      user.UID,
-			Email:    user.hash,
+			Email:    user.Email,
 			Upload:   up,
 			Download: down})
 
@@ -309,7 +309,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 	ipCounter := len(onlineUsers)
 	//report traffic
 	if userCounter > 0 {
-		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Upload, userTraffic[0].Download), "info")
+		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d email=%s user=%s upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Email, resetTrafficRecords[0].user.hash, userTraffic[0].Upload, userTraffic[0].Download), "info")
 		if err = c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
 			for _, record := range resetTrafficRecords {
 				record.user.RestoreTraffic(record.sent, record.recv)
