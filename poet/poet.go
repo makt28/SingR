@@ -91,7 +91,7 @@ func Start() error {
 // 设置日志
 func SetLogger(logFactory log.Factory) {
 	inst := SS.Singleton()
-	inst.Logger = logFactory.NewLogger("sing-poet")
+	inst.Logger = logFactory.NewLogger("singr")
 }
 
 // 设置 inbound

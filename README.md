@@ -55,7 +55,22 @@ sudo env SINGR_BINARY=/path/to/sing-box bash release/singr/install.sh
 sudo env SINGR_RELEASE_REPO=owner/repo bash release/singr/install.sh v0.1.0
 ```
 
-脚本会安装到 `/usr/local/SingR/singr`，创建 `/usr/local/bin/singr` 软链接，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
+正式发布后，也可以直接拉取最新版本安装：
+
+```sh
+sudo bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/release/singr/install.sh)
+```
+
+脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
+
+管理命令示例：
+
+```sh
+SingR status
+SingR log
+SingR update
+SingR restart
+```
 
 手动编译安装方式如下。
 

@@ -10,6 +10,8 @@ plain='\033[0m'
 APP_NAME="SingR"
 SERVICE_NAME="singr"
 BIN_NAME="singr"
+DEFAULT_RELEASE_REPO="makt28/SingR"
+DEFAULT_RELEASE_BRANCH="main"
 
 INSTALL_DIR="/usr/local/SingR"
 CONFIG_DIR="/etc/singr"
@@ -27,7 +29,8 @@ CUR_DIR="$(pwd)"
 #   SINGR_RELEASE_REPO=owner/repo [version]
 SINGR_BINARY="${SINGR_BINARY:-}"
 SINGR_RELEASE_URL="${SINGR_RELEASE_URL:-}"
-SINGR_RELEASE_REPO="${SINGR_RELEASE_REPO:-}"
+SINGR_RELEASE_REPO="${SINGR_RELEASE_REPO:-$DEFAULT_RELEASE_REPO}"
+SINGR_RELEASE_BRANCH="${SINGR_RELEASE_BRANCH:-$DEFAULT_RELEASE_BRANCH}"
 SINGR_VERSION="${1:-}"
 
 log_info() {
@@ -129,7 +132,6 @@ copy_binary() {
 
     mkdir -p "${INSTALL_DIR}"
     install -m 755 "${source_bin}" "${BIN_PATH}"
-    ln -sf "${BIN_PATH}" "/usr/local/bin/${BIN_NAME}"
 }
 
 build_from_source() {
@@ -146,8 +148,6 @@ build_from_source() {
 }
 
 latest_release_version() {
-    [[ -n "${SINGR_RELEASE_REPO}" ]] || die "未设置 SINGR_RELEASE_REPO，无法从 GitHub release 下载。"
-
     curl -fsSL "https://api.github.com/repos/${SINGR_RELEASE_REPO}/releases/latest" |
         grep '"tag_name":' |
         sed -E 's/.*"([^"]+)".*/\1/' |
@@ -161,10 +161,9 @@ download_release() {
     if [[ -n "${SINGR_RELEASE_URL}" ]]; then
         url="${SINGR_RELEASE_URL}"
         log_info "开始下载 SingR：${url}"
-        archive="${tmp_dir}/singr-release"
+        archive="${tmp_dir}/$(basename "${url}")"
         curl -fL "${url}" -o "${archive}"
     else
-        [[ -n "${SINGR_RELEASE_REPO}" ]] || return 1
         if [[ -n "${SINGR_VERSION}" ]]; then
             if [[ "${SINGR_VERSION}" == v* ]]; then
                 version="${SINGR_VERSION}"
@@ -223,6 +222,12 @@ install_binary() {
         return
     fi
 
+    if [[ -x "${SCRIPT_DIR}/singr" ]]; then
+        log_info "使用 release 包内二进制：${SCRIPT_DIR}/singr"
+        copy_binary "${SCRIPT_DIR}/singr"
+        return
+    fi
+
     if [[ -x "${PROJECT_DIR}/sing-box" ]]; then
         log_info "使用本地已编译二进制：${PROJECT_DIR}/sing-box"
         copy_binary "${PROJECT_DIR}/sing-box"
@@ -240,7 +245,10 @@ install_config() {
     mkdir -p "${CONFIG_DIR}" "${CERT_DIR}"
 
     if [[ ! -f "${CONFIG_DIR}/panel.json" ]]; then
-        if [[ -f "${PROJECT_DIR}/release/poet/panel_anytls.json" ]]; then
+        if [[ -f "${SCRIPT_DIR}/panel.json" ]]; then
+            cp "${SCRIPT_DIR}/panel.json" "${CONFIG_DIR}/panel.json"
+            log_info "已安装默认面板配置：${CONFIG_DIR}/panel.json"
+        elif [[ -f "${PROJECT_DIR}/release/poet/panel_anytls.json" ]]; then
             cp "${PROJECT_DIR}/release/poet/panel_anytls.json" "${CONFIG_DIR}/panel.json"
             log_info "已安装默认面板配置：${CONFIG_DIR}/panel.json"
         else
@@ -270,7 +278,10 @@ EOF
     fi
 
     if [[ ! -f "${CONFIG_DIR}/server.json" ]]; then
-        if [[ -f "${PROJECT_DIR}/release/poet/server_anytls.json" ]]; then
+        if [[ -f "${SCRIPT_DIR}/server.json" ]]; then
+            cp "${SCRIPT_DIR}/server.json" "${CONFIG_DIR}/server.json"
+            log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
+        elif [[ -f "${PROJECT_DIR}/release/poet/server_anytls.json" ]]; then
             cp "${PROJECT_DIR}/release/poet/server_anytls.json" "${CONFIG_DIR}/server.json"
             log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
         else
@@ -364,6 +375,24 @@ EOF
     systemctl enable "${SERVICE_NAME}"
 }
 
+install_management_script() {
+    local target="/usr/bin/SingR"
+    local lower="/usr/bin/singr"
+    local source_script="${PROJECT_DIR}/release/singr/SingR.sh"
+    local script_url="https://raw.githubusercontent.com/${SINGR_RELEASE_REPO}/${SINGR_RELEASE_BRANCH}/release/singr/SingR.sh"
+
+    if [[ -f "${SCRIPT_DIR}/SingR.sh" ]]; then
+        install -m 755 "${SCRIPT_DIR}/SingR.sh" "${target}"
+    elif [[ -f "${source_script}" ]]; then
+        install -m 755 "${source_script}" "${target}"
+    else
+        curl -fsSL "${script_url}" -o "${target}" || die "下载管理脚本失败：${script_url}"
+        chmod +x "${target}"
+    fi
+
+    ln -sf "${target}" "${lower}"
+}
+
 print_usage() {
     echo ""
     echo "SingR 管理命令："
@@ -395,6 +424,7 @@ main() {
     install_binary
     install_config
     install_service
+    install_management_script
 
     log_info "SingR 安装完成，已设置开机自启。"
     print_usage

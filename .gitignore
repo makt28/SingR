@@ -18,6 +18,7 @@
 .DS_Store
 /config.d/
 /venv/
+/.cache/
 CLAUDE.md
 AGENTS.md
 /.claude/
