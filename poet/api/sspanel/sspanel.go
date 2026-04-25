@@ -483,6 +483,11 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 		effectiveTransport = "tcp"
 	}
 
+	trafficRate := float64(1)
+	if nodeInfoResponse.TrafficRate > 0 {
+		trafficRate = nodeInfoResponse.TrafficRate
+	}
+
 	// Create GeneralNodeInfo
 	nodeInfo := &api.NodeInfo{
 		NodeType:          nodeType,
@@ -499,6 +504,7 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 		VlessFlow:         c.VlessFlow,
 		ServiceName:       serviceName,
 		Header:            header,
+		TrafficRate:       trafficRate,
 		RelayServer:       relayServer,
 		RelayPort:         uint32(relayPort),
 	}

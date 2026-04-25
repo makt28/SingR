@@ -279,11 +279,15 @@ func (c *Controller) userInfoMonitor() (err error) {
 		})
 
 		var up, down int64
-		if c.nodeInfo.TrafficRate == 1 {
+		rate := c.nodeInfo.TrafficRate
+		if rate <= 0 {
+			rate = 1
+		}
+		if rate == 1 {
 			up, down = sent, recv
 		} else {
-			up = int64(c.nodeInfo.TrafficRate * float64(sent))
-			down = int64(c.nodeInfo.TrafficRate * float64(recv))
+			up = int64(rate * float64(sent))
+			down = int64(rate * float64(recv))
 		}
 
 		// c.log(fmt.Sprintf("get traffic user:%s sent:%d up:%d recv:%d down:%d rate:%f", user.hash, sent, up, recv, down, c.nodeInfo.TrafficRate), "debug")
