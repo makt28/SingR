@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example v0.1.0"
+        description: "Release version, for example v0.1.1"
         required: false
-        default: "v0.1.0"
+        default: "v0.1.1"
         type: string
 
 permissions:
@@ -129,6 +129,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Add release helper assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp release/singr/install.sh dist/install.sh
+          cp release/singr/SingR.sh dist/SingR.sh
+          cp release/singr/VERSION dist/VERSION
+          chmod +x dist/install.sh dist/SingR.sh
+          git archive --format=tar.gz --prefix="SingR-${VERSION#v}/" \
+            -o "dist/SingR-source-${VERSION}.tar.gz" HEAD
+          (
+            cd dist
+            sha256sum install.sh > install.sh.sha256
+            sha256sum SingR.sh > SingR.sh.sha256
+            sha256sum VERSION > VERSION.sha256
+            sha256sum "SingR-source-${VERSION}.tar.gz" > "SingR-source-${VERSION}.tar.gz.sha256"
+          )
 
       - name: Publish release
         shell: bash
