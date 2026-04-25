@@ -300,11 +300,11 @@ EOF
       "type": "anytls",
       "tag": "anytls-in",
       "listen": "::",
-      "listen_port": 14555,
+      "listen_port": 0,
       "users": [],
       "tls": {
         "enabled": true,
-        "server_name": "example.com",
+        "server_name": "",
         "certificate_path": "/etc/singr/certs/anytls.crt",
         "key_path": "/etc/singr/certs/anytls.key"
       }

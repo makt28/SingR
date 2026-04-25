@@ -114,6 +114,15 @@ func (u *User) AddTraffic(sent, recv int64) {
 	// atomic.AddUint64(&u.recv, uint64(recv))
 }
 
+func (u *User) RestoreTraffic(sent, recv int64) {
+	if sent != 0 {
+		u.sent.Add(sent)
+	}
+	if recv != 0 {
+		u.recv.Add(recv)
+	}
+}
+
 func (u *User) SetSpeedLimit(send, recv int64) {
 	u.limiterLock.Lock()
 	defer u.limiterLock.Unlock()

@@ -255,6 +255,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// Get User traffic
 	var userTraffic []api.UserTraffic
 	var onlineUsers []api.OnlineUser
+	type resetTrafficRecord struct {
+		user *User
+		sent int64
+		recv int64
+	}
+	var resetTrafficRecords []resetTrafficRecord
 	userArr := c.author.ListUsers()
 	if len(userArr) == 0 {
 		c.log("traffic zero online user", "info")
@@ -266,6 +272,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 		if sent == 0 && recv == 0 {
 			continue
 		}
+		resetTrafficRecords = append(resetTrafficRecords, resetTrafficRecord{
+			user: user,
+			sent: sent,
+			recv: recv,
+		})
 
 		var up, down int64
 		if c.nodeInfo.TrafficRate == 1 {
@@ -298,7 +309,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 	ipCounter := len(onlineUsers)
 	//report traffic
 	if userCounter > 0 {
+		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Upload, userTraffic[0].Download), "info")
 		if err = c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
+			for _, record := range resetTrafficRecords {
+				record.user.RestoreTraffic(record.sent, record.recv)
+			}
 			c.log(fmt.Sprintf("report traffic err:%v", err.Error()), "error")
 		}
 	}

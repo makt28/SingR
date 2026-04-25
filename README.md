@@ -52,7 +52,7 @@ sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.3
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.4
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
@@ -177,11 +177,11 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
       "type": "anytls",
       "tag": "anytls-in",
       "listen": "::",
-      "listen_port": 14555,
+      "listen_port": 0,
       "users": [],
       "tls": {
         "enabled": true,
-        "server_name": "example.com",
+        "server_name": "",
         "certificate_path": "/etc/singr/certs/anytls.crt",
         "key_path": "/etc/singr/certs/anytls.key"
       }
