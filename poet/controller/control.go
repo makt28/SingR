@@ -11,74 +11,64 @@ import (
 )
 
 func (c *Controller) syncUserList() error {
-	//get list
 	userInfo, err := c.apiClient.GetUserList()
 	if err != nil {
-		//api.UserNotModified
 		if err.Error() == api.UserNotModified {
 			c.log("GetUserList: 304 UserNotModified", "info")
 			return nil
 		}
-
 		return err
 	}
 
-	//获得 更新两张 用户map表
-	added, deleted := c.compareUsersMapReDeleted(&c.usersMap, userInfo)
-	adLen, deLen := len(added), len(deleted)
-	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d", adLen, deLen), "info")
+	nextMap, added, deleted := diffUsers(c.usersMap, *userInfo, c.buildUserHash)
+	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d", len(added), len(deleted)), "info")
 
-	if deLen > 0 {
-		for hash := range deleted {
-			c.log(fmt.Sprintf("DeleteUser: %s", hash), "debug")
-			err := c.author.DelUser(hash)
-			if err != nil {
-				c.log(fmt.Sprintf("failed deleteUser: %s %v", hash, err.Error()), "error")
-				//return err
+	// Dump traffic for to-be-deleted users before removing them; if the
+	// report fails, keep the users this cycle so the unreported bytes
+	// aren't lost. Next sync will retry.
+	if len(deleted) > 0 {
+		if err := c.dumpTrafficForDeleted(deleted); err != nil {
+			c.log(fmt.Sprintf("dump traffic before delete failed, deferring deletion: %v", err), "error")
+			for _, hash := range deleted {
+				if u, ok := c.usersMap[hash]; ok {
+					nextMap[hash] = u
+				}
 			}
+			deleted = nil
 		}
 	}
-	if adLen > 0 {
-		var uid int
-		for hash := range added {
-			if user, ok := c.usersMap[hash]; ok {
-				uid = user.UID
-			} else {
-				c.log(fmt.Sprintf("usersMap none hash: %s", hash), "error")
-				continue
-			}
 
-			// c.log(fmt.Sprintf("AddUser: %s UID: %d", hash, uid), "debug")
-			err := c.author.AddUser(hash, uid)
-			if err != nil {
-				c.log(fmt.Sprintf("failed addUser: %s %v", hash, err.Error()), "error")
-				//return err
-			}
+	for _, hash := range deleted {
+		c.log(fmt.Sprintf("DeleteUser: %s", hash), "debug")
+		if err := c.author.DelUser(hash); err != nil {
+			c.log(fmt.Sprintf("failed deleteUser: %s %v", hash, err.Error()), "error")
 		}
 	}
+	for _, hash := range added {
+		u, ok := nextMap[hash]
+		if !ok {
+			c.log(fmt.Sprintf("usersMap none hash: %s", hash), "error")
+			continue
+		}
+		if err := c.author.AddUser(hash, u.UID); err != nil {
+			c.log(fmt.Sprintf("failed addUser: %s %v", hash, err.Error()), "error")
+		}
+	}
+
+	c.usersMap = nextMap
+
 	for _, user := range *userInfo {
 		hash := c.buildUserHash(&user)
 		c.author.SetUserProfile(hash, user)
 		c.author.SetUserAliases(hash, user.UUID, user.Passwd, user.Email)
 	}
 
-	// update inbound server userList
-	// 1. 检查是否实现 UserRefresher 接口
 	in := *c.inbound
 	refresher, ok := in.(adapter.PInbound)
 	if !ok {
 		c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
 		return errors.New("inbound type does not support user refresh")
 	}
-
-	// // 2. 构建适合该类型的用户数据
-	// users, err := c.BuildUsers(c.nodeInfo, userInfo)
-	// if err != nil {
-	// 	c.log(fmt.Sprintf("Failed to build users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-	// 	return err
-	// }
-
-	// 3. 刷新用户
 	if err := refresher.RefreshUsers(userInfo, c.nodeInfo); err != nil {
 		c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
 		return err
@@ -88,10 +78,61 @@ func (c *Controller) syncUserList() error {
 	return nil
 }
 
+// dumpTrafficForDeleted reports any pending bytes for users that are about
+// to be removed. On report failure the bytes are restored to the user's
+// counters so the next regular cycle can retry, and the caller is expected
+// to defer deletion.
+func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
+	type pending struct {
+		user *User
+		sent int64
+		recv int64
+	}
+	var pendings []pending
+	var report []api.UserTraffic
+	rate := c.nodeInfo.TrafficRate
+	if rate <= 0 {
+		rate = 1
+	}
+	for _, hash := range deleted {
+		u, found := c.author.LoadUser(hash)
+		if !found {
+			continue
+		}
+		sent, recv := u.ResetTraffic()
+		if sent == 0 && recv == 0 {
+			continue
+		}
+		var up, down int64
+		if rate == 1 {
+			up, down = sent, recv
+		} else {
+			up = int64(rate * float64(sent))
+			down = int64(rate * float64(recv))
+		}
+		pendings = append(pendings, pending{user: u, sent: sent, recv: recv})
+		report = append(report, api.UserTraffic{
+			UID:      u.UID,
+			Email:    u.Email,
+			Upload:   up,
+			Download: down,
+		})
+	}
+	if len(report) == 0 {
+		return nil
+	}
+	c.log(fmt.Sprintf("dumping %d deleted users' traffic before removal", len(report)), "info")
+	if err := c.apiClient.ReportUserTraffic(&report); err != nil {
+		for _, p := range pendings {
+			p.user.RestoreTraffic(p.sent, p.recv)
+		}
+		return err
+	}
+	return nil
+}
+
 // 记录流量
 func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapter.InboundContext) (send, recv *atomic.Int64, err error) {
-	//每次 goroutine 会预先生成用户Map 以及 author.users
-
 	hash := metadata.User
 	user, found := c.author.LoadUser(hash)
 	if !found {
@@ -104,78 +145,38 @@ func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapt
 		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", user.UID, user.Email, user.hash, metadata.Inbound, metadata.Source.AddrString()), "info")
 	}
 
-	//add IP
 	user.AddIP(metadata.Source.AddrString())
 
-	//pointer
 	sendPtr, recvPtr := user.GetTrafficPointer()
 	return sendPtr, recvPtr, nil
 }
 
-// 返回需要删除的 hash map
-func (c *Controller) compareUsersMapReDeleted(old *map[string]*api.UserInfo, new *[]api.UserInfo) (added, deleted map[string]int) {
-	olen := len(*old)
-	nlen := len(*new)
-	if olen == 0 && nlen == 0 {
-		return nil, nil
-	}
-
-	// fmt.Printf("compare olen:%d nlen:%d\n", olen, nlen)
-
-	deleted = make(map[string]int)
-	oldMap := *old
-	for hash := range oldMap {
-		deleted[hash] = 1
-	}
-
-	//新用户列表 空, 删除全部
-	if nlen == 0 {
-		// fmt.Printf("compare nlen=0 deleted:%d\n", len(deleted))
-		return nil, deleted
-	}
-
-	//循环新用户列表
-	added = make(map[string]int)
-	for _, user := range *new {
-		// 1. slice元素是数组元素引用,取址后都是同一块内存
-		// 2. for range默认取地址,多个迭代变量指向同一内存
-		// 3. 应该在遍历时进行值拷贝,使每个迭代变量隔离
-		// Go语言中的切片遍历需要注意这一点,以避免修改都作用在同一内存上的问题
-
-		hash := c.buildUserHash(&user)
-		// fmt.Printf("compare user hash:%s\n", hash)
-
-		//老map为空 added+1 deleted=0
-		if olen == 0 {
-			added[hash] = 1
-			u := user //赋值之前 进行值拷贝
-			oldMap[hash] = &u
-			// fmt.Printf("compare olen=0 added:%d\n", len(added))
+// diffUsers is a pure function: it does not mutate inputs. It returns a
+// fresh next-state map plus the lists of hashes added and deleted relative
+// to old. Duplicate hashes inside newList are dropped (first-wins).
+func diffUsers(
+	old map[string]*api.UserInfo,
+	newList []api.UserInfo,
+	hashFn func(*api.UserInfo) string,
+) (next map[string]*api.UserInfo, added []string, deleted []string) {
+	next = make(map[string]*api.UserInfo, len(newList))
+	for i := range newList {
+		// Take a value copy so storing &u doesn't alias the loop variable
+		// or the slice element memory.
+		u := newList[i]
+		hash := hashFn(&u)
+		if _, dup := next[hash]; dup {
 			continue
 		}
-
-		//判断map
-		if _, ok := oldMap[hash]; ok {
-			// 存在key
-			delete(deleted, hash)
-			// fmt.Printf("compare hash exists deleted: %s\n", hash)
-		} else {
-			// 不存在key
-			added[hash] = 1
-			u := user //赋值之前 进行值拷贝
-			oldMap[hash] = &u
-			// fmt.Printf("compare added hash: %s\n", hash)
+		next[hash] = &u
+		if _, ok := old[hash]; !ok {
+			added = append(added, hash)
 		}
 	}
-
-	//删除 多余的kv
-	if len(deleted) > 0 {
-		// fmt.Printf("compare len(deleted)>0 deleted:%d\n", len(deleted))
-		for hash := range deleted {
-			delete(oldMap, hash)
-			// fmt.Printf("compare deleted hash: %s\n", hash)
+	for hash := range old {
+		if _, ok := next[hash]; !ok {
+			deleted = append(deleted, hash)
 		}
 	}
-
-	return added, deleted
+	return next, added, deleted
 }

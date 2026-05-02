@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -16,6 +17,7 @@ import (
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/ping"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/atomic"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -33,6 +35,11 @@ var (
 	_ adapter.DirectRouteOutbound  = (*Outbound)(nil)
 )
 
+// firstHitCap bounds the per-outbound (user, destHost) memo so a long-running
+// process doesn't accumulate unbounded entries. Once the cap is reached every
+// further connection is logged at debug level only.
+const firstHitCap = 16384
+
 type Outbound struct {
 	outbound.Adapter
 	ctx            context.Context
@@ -41,7 +48,13 @@ type Outbound struct {
 	domainStrategy C.DomainStrategy
 	fallbackDelay  time.Duration
 	isEmpty        bool
-	// loopBack *loopBackDetector
+
+	// firstHitSeen memoizes (user, destination-host) pairs we've already
+	// logged at Info. Subsequent connections in the same pair fall through
+	// to Debug, which keeps the log volume bounded under load while still
+	// surfacing "what does this user reach" at a glance.
+	firstHitSeen  sync.Map
+	firstHitCount atomic.Int64
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DirectOutboundOptions) (adapter.Outbound, error) {
@@ -67,7 +80,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		fallbackDelay:  time.Duration(options.FallbackDelay),
 		dialer:         outboundDialer.(dialer.ParallelInterfaceDialer),
 		isEmpty:        reflect.DeepEqual(options.DialerOptions, option.DialerOptions{UDPFragmentDefault: true}),
-		// loopBack:       newLoopBackDetector(router),
 	}
 	//nolint:staticcheck
 	if options.ProxyProtocol != 0 {
@@ -76,22 +88,54 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	return outbound, nil
 }
 
+// shouldLogFirstHit returns true exactly once for each (user, destHost) pair
+// observed on this outbound (until firstHitCap is reached). Caller is
+// expected to log at Info on true and Debug otherwise.
+func (h *Outbound) shouldLogFirstHit(user string, dest M.Socksaddr) bool {
+	key := user + "|" + dest.AddrString()
+	if _, ok := h.firstHitSeen.Load(key); ok {
+		return false
+	}
+	if h.firstHitCount.Load() >= firstHitCap {
+		return false
+	}
+	if _, loaded := h.firstHitSeen.LoadOrStore(key, struct{}{}); loaded {
+		return false
+	}
+	h.firstHitCount.Add(1)
+	return true
+}
+
+// logConn emits the per-connection outbound line. It picks Info for the very
+// first hit of a (user, destHost) pair and Debug otherwise, keeping the
+// production log readable without going dark.
+func (h *Outbound) logConn(ctx context.Context, network string, destination M.Socksaddr) {
+	user := ""
+	if md := adapter.ContextFrom(ctx); md != nil {
+		user = md.User
+	}
+	var msg string
+	switch network {
+	case N.NetworkTCP:
+		msg = "outbound connection to "
+	case N.NetworkUDP:
+		msg = "outbound packet connection to "
+	default:
+		return
+	}
+	if h.shouldLogFirstHit(user, destination) {
+		h.logger.InfoContext(ctx, msg, destination)
+	} else {
+		h.logger.DebugContext(ctx, msg, destination)
+	}
+}
+
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	network = N.NetworkName(network)
-	switch network {
-	case N.NetworkTCP:
-		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-	case N.NetworkUDP:
-		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	}
-	/*conn, err := h.dialer.DialContext(ctx, network, destination)
-	if err != nil {
-		return nil, err
-	}
-	return h.loopBack.NewConn(conn), nil*/
+	h.logConn(ctx, network, destination)
 	return h.dialer.DialContext(ctx, network, destination)
 }
 
@@ -99,12 +143,11 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	h.logger.InfoContext(ctx, "outbound packet connection")
+	h.logConn(ctx, N.NetworkUDP, destination)
 	conn, err := h.dialer.ListenPacket(ctx, destination)
 	if err != nil {
 		return nil, err
 	}
-	// conn = h.loopBack.NewPacketConn(bufio.NewPacketConn(conn), destination)
 	return conn, nil
 }
 
@@ -123,12 +166,7 @@ func (h *Outbound) DialParallel(ctx context.Context, network string, destination
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	network = N.NetworkName(network)
-	switch network {
-	case N.NetworkTCP:
-		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-	case N.NetworkUDP:
-		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	}
+	h.logConn(ctx, network, destination)
 	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), nil, nil, nil, h.fallbackDelay)
 }
 
@@ -137,12 +175,7 @@ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, dest
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	network = N.NetworkName(network)
-	switch network {
-	case N.NetworkTCP:
-		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-	case N.NetworkUDP:
-		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	}
+	h.logConn(ctx, network, destination)
 	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
 }
 
@@ -150,7 +183,7 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	h.logger.InfoContext(ctx, "outbound packet connection")
+	h.logConn(ctx, N.NetworkUDP, destination)
 	conn, newDestination, err := dialer.ListenSerialNetworkPacket(ctx, h.dialer, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
 	if err != nil {
 		return nil, netip.Addr{}, err
@@ -161,18 +194,3 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
 func (h *Outbound) IsEmpty() bool {
 	return h.isEmpty
 }
-
-/*func (h *Outbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	if h.loopBack.CheckConn(metadata.Source.AddrPort(), M.AddrPortFromNet(conn.LocalAddr())) {
-		return E.New("reject loopback connection to ", metadata.Destination)
-	}
-	return NewConnection(ctx, h, conn, metadata)
-}
-
-func (h *Outbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
-	if h.loopBack.CheckPacketConn(metadata.Source.AddrPort(), M.AddrPortFromNet(conn.LocalAddr())) {
-		return E.New("reject loopback packet connection to ", metadata.Destination)
-	}
-	return NewPacketConnection(ctx, h, conn, metadata)
-}
-*/

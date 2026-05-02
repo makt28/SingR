@@ -5,6 +5,16 @@
         "timestamp": true,
         "output": "/var/log/singr.log"
     },
+    "dns": {
+        "servers": [
+            {
+                "tag": "google",
+                "type": "udp",
+                "server": "8.8.8.8"
+            }
+        ],
+        "strategy": "prefer_ipv6"
+    },
     "inbounds": [
         {
             "type": "anytls",
@@ -23,11 +33,13 @@
     "outbounds": [
         {
             "type": "direct",
-            "tag": "anytls-out"
+            "tag": "anytls-out",
+            "domain_strategy": "prefer_ipv6"
         },
         {
             "type": "direct",
-            "tag": "direct"
+            "tag": "direct",
+            "domain_strategy": "prefer_ipv6"
         }
     ],
     "route": {
@@ -38,6 +50,6 @@
             }
         ],
         "final": "direct",
-        "auto_detect_interface": true
+        "auto_detect_interface": false
     }
 }

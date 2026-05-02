@@ -64,11 +64,16 @@ func New(ctx context.Context, config Config, inbound *adapter.Inbound, apiClient
 		ctx:    ctx,
 		logger: logger,
 	}
-	if author, err := NewAuthenticator(ctx); err == nil {
-		controller.author = author
-	} else {
-		logger.Panic("err author init fail!")
+	author, err := NewAuthenticator(ctx)
+	if err != nil {
+		// NewAuthenticator currently never returns an error, but if it ever
+		// does we must abort: the controller is unusable without the
+		// authenticator (every Add/Del/Load user call would nil-deref).
+		// logger.Panic only logs at panic level, so use the real builtin.
+		logger.Error("err author init fail: ", err)
+		panic("singr: failed to initialize authenticator: " + err.Error())
 	}
+	controller.author = author
 
 	return controller
 }
@@ -219,10 +224,15 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	//TODO
 	//c.apiClient.GetNodeRule();
 
-	// If nodeInfo changed
+	// If nodeInfo changed, ask the inbound to hot-reload its panel-derived
+	// settings (port, SNI). The inbound is responsible for diffing and
+	// no-op'ing if nothing actually changed.
 	if nodeInfoChanged {
-		//disable change inbound
-		nodeInfoChanged = false
+		if configurable, ok := (*c.inbound).(adapter.PStartupConfigurableInbound); ok {
+			if err := configurable.ConfigureFromPanelNode(c.nodeInfo); err != nil {
+				c.log(fmt.Sprintf("nodeInfoMonitor>>ConfigureFromPanelNode %v", err), "error")
+			}
+		}
 	}
 
 	return nil
