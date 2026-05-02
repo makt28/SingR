@@ -52,7 +52,7 @@ sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.7
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.1.8
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
@@ -62,6 +62,8 @@ sudo bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install
 ```
 
 脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
+
+> 0.1.8 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、给 `direct` 出站加 `domain_strategy: prefer_ipv6`、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4）。
 
 `SingR` 和 `singr` 两个管理命令等价，大小写都可以。
 
@@ -172,6 +174,12 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
     "timestamp": true,
     "output": "/var/log/singr.log"
   },
+  "dns": {
+    "servers": [
+      { "tag": "google", "type": "udp", "server": "8.8.8.8" }
+    ],
+    "strategy": "prefer_ipv6"
+  },
   "inbounds": [
     {
       "type": "anytls",
@@ -190,11 +198,13 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
   "outbounds": [
     {
       "type": "direct",
-      "tag": "anytls-out"
+      "tag": "anytls-out",
+      "domain_strategy": "prefer_ipv6"
     },
     {
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct",
+      "domain_strategy": "prefer_ipv6"
     }
   ],
   "route": {
@@ -205,7 +215,7 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
       }
     ],
     "final": "direct",
-    "auto_detect_interface": true
+    "auto_detect_interface": false
   }
 }
 ```
@@ -216,7 +226,15 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 - 如果 SSPanel 节点地址里存在非空 `host=`，`tls.server_name` 会被该值覆盖。
 - 证书路径和私钥路径仍然来自本地 `server.json`，不会从面板获取。
 
-也就是说，本地 JSON 可以先写默认值；只有面板对应字段非空、有效时才会替换本地值。如果面板端口或 `host=` 改变，需要重启 SingR 才会更新监听端口或 SNI。
+也就是说，本地 JSON 可以先写默认值；只有面板对应字段非空、有效时才会替换本地值。
+
+从 0.1.8 起，面板的 `port` 和 `host=` 改动支持运行中热更新：监听端口变化时会先在新端口起 listener、成功后才关掉旧端口（失败自动回滚保留旧 listener）；SNI 变化只重建 TLS、不重启 listener。日志里会出现 `anytls listener hot-reloaded to port ...` 或 `anytls TLS hot-reloaded with SNI ...`。**证书材料、入站类型、路由规则仍然不会被热更新**。
+
+### 出口 IPv6
+
+默认配置里的 `direct` 出站都设了 `domain_strategy: prefer_ipv6`，并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
+
+`auto_detect_interface` 在服务器端建议保持 `false`，它是给 client/TUN 场景用的；开着会把 outbound socket 强行绑到默认网卡，并在某些 IPv6-only 目的地下失效。
 
 ## 准备 TLS 证书
 
@@ -329,8 +347,9 @@ u<用户ID>
 
 已支持：
 
-- 新增和删除用户热更新。
+- 新增和删除用户热更新。删除用户前会先把累计流量上报到面板；上报失败会保留用户与字节，下一轮重试，避免计费丢失。
 - 已有用户的 UUID/password 变化热更新。
+- 节点 `port` / TLS SNI (`host=`) 运行中热更新（先起新 listener 再关老 listener，失败回滚）。
 - 流量上报到 `/mod_mu/users/traffic?node_id=<nodeid>`。
 - 在线 IP 上报到 `/mod_mu/users/aliveip?node_id=<nodeid>`。
 
@@ -340,7 +359,7 @@ u<用户ID>
 - 设备数限制字段会解析，但连接准入路径仍需按部署重新确认。
 - `relay_server` 和 `relay_port` 不会自动创建出站和路由。
 - 不会从面板动态创建缺失的入站；主配置必须先声明对应 `intag` 的入站。
-- 不支持运行中热切换入站类型、监听端口或 TLS SNI。
+- 不支持运行中热切换入站类型；TLS 证书材料也仍然只在启动时加载。
 
 ## 测试
 
@@ -366,7 +385,15 @@ SINGR_SSPANEL_CONFIG=/etc/singr/panel.json \
 - SSPanel 节点地址是否包含 `ws` 和 `path=/anytls`。
 - `/etc/singr/server.json` 是否声明了 `type: "anytls"` 的入站。
 - 入站 `tag` 是否等于 `/etc/singr/panel.json` 里的 `intag`。
-- SingR 是否已经重启。端口和 SNI 只在启动时应用。
+- 0.1.8 起 port/SNI 支持热更新，但首次启动仍需要面板返回有效 `port`；如果日志里有 `invalid anytls listen port from panel` 说明面板返回了 0 或越界值。
+
+### 节点出口没有 IPv6
+
+检查：
+
+- 服务器本身能否 `curl -6 ifconfig.co`。如果服务器没有 v6 GUA，无论 SingR 怎么配都没用。
+- `server.json` 的 `direct` 出站是否有 `domain_strategy: prefer_ipv6`，`dns` 块是否带 `strategy: prefer_ipv6`，`route.auto_detect_interface` 是否为 `false`。0.1.8 起 `singr update` 会自动迁移老配置，迁移前的备份在 `/etc/singr/server.json.bak.<时间戳>`。
+- 如果是从老版本升级上来的，第一次 `singr update` 后必须 `singr restart`。
 
 ### 面板连接失败
 
