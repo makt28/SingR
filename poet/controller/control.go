@@ -37,6 +37,7 @@ func (c *Controller) syncUserList() error {
 		}
 	}
 	runtimeUsers := usersFromMap(nextMap)
+	deltaAddedChangedUsers := usersForHashes(nextMap, append(added, changed...))
 	shouldRefreshRuntimeUsers := len(added) > 0 || len(deleted) > 0 || len(changed) > 0
 	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d changed: %d total: %d", len(added), len(deleted), len(changed), len(runtimeUsers)), "info")
 
@@ -81,6 +82,22 @@ func (c *Controller) syncUserList() error {
 
 	if shouldRefreshRuntimeUsers {
 		in := *c.inbound
+		if incremental, ok := in.(adapter.PIncrementalUserInbound); ok {
+			if len(deleted) > 0 {
+				if err := incremental.RemoveUsers(deleted); err != nil {
+					c.log(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+					return err
+				}
+			}
+			if len(deltaAddedChangedUsers) > 0 {
+				if err := incremental.AddUsers(&deltaAddedChangedUsers, c.nodeInfo); err != nil {
+					c.log(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+					return err
+				}
+			}
+			return nil
+		}
+
 		refresher, ok := in.(adapter.PInbound)
 		if !ok {
 			c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
@@ -213,6 +230,18 @@ func usersFromMap(users map[string]*api.UserInfo) []api.UserInfo {
 	result := make([]api.UserInfo, 0, len(users))
 	for _, user := range users {
 		if user == nil {
+			continue
+		}
+		result = append(result, *user)
+	}
+	return result
+}
+
+func usersForHashes(users map[string]*api.UserInfo, hashes []string) []api.UserInfo {
+	result := make([]api.UserInfo, 0, len(hashes))
+	for _, hash := range hashes {
+		user, ok := users[hash]
+		if !ok || user == nil {
 			continue
 		}
 		result = append(result, *user)

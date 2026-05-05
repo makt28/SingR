@@ -23,8 +23,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	anytls "github.com/anytls/sing-anytls"
-	"github.com/anytls/sing-anytls/padding"
+	anytls "github.com/makt28/sing-anytls"
+	"github.com/makt28/sing-anytls/padding"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
