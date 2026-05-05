@@ -20,8 +20,7 @@ func (c *Controller) syncUserList() error {
 		return err
 	}
 
-	nextMap, added, deleted := diffUsers(c.usersMap, *userInfo, c.buildUserHash)
-	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d", len(added), len(deleted)), "info")
+	nextMap, added, deleted, changed := diffUsers(c.usersMap, *userInfo, c.buildUserHash)
 
 	// Dump traffic for to-be-deleted users before removing them; if the
 	// report fails, keep the users this cycle so the unreported bytes
@@ -37,6 +36,9 @@ func (c *Controller) syncUserList() error {
 			deleted = nil
 		}
 	}
+	runtimeUsers := usersFromMap(nextMap)
+	shouldRefreshRuntimeUsers := len(added) > 0 || len(deleted) > 0 || len(changed) > 0
+	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d changed: %d total: %d", len(added), len(deleted), len(changed), len(runtimeUsers)), "info")
 
 	for _, hash := range deleted {
 		c.log(fmt.Sprintf("DeleteUser: %s", hash), "debug")
@@ -57,24 +59,39 @@ func (c *Controller) syncUserList() error {
 
 	c.usersMap = nextMap
 
-	for _, user := range *userInfo {
-		hash := c.buildUserHash(&user)
-		c.author.SetUserProfile(hash, user)
-		c.author.SetUserAliases(hash, user.UUID, user.Passwd, user.Email)
+	// Only refresh profile/aliases for users whose material changed or were
+	// just added. At 2000 users it's wasteful to rewrite every author entry
+	// when nothing about that user has changed.
+	for _, hash := range added {
+		u, ok := nextMap[hash]
+		if !ok || u == nil {
+			continue
+		}
+		c.author.SetUserProfile(hash, *u)
+		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
+	}
+	for _, hash := range changed {
+		u, ok := nextMap[hash]
+		if !ok || u == nil {
+			continue
+		}
+		c.author.SetUserProfile(hash, *u)
+		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
 	}
 
-	in := *c.inbound
-	refresher, ok := in.(adapter.PInbound)
-	if !ok {
-		c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
-		return errors.New("inbound type does not support user refresh")
-	}
-	if err := refresher.RefreshUsers(userInfo, c.nodeInfo); err != nil {
-		c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-		return err
+	if shouldRefreshRuntimeUsers {
+		in := *c.inbound
+		refresher, ok := in.(adapter.PInbound)
+		if !ok {
+			c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
+			return errors.New("inbound type does not support user refresh")
+		}
+		if err := refresher.RefreshUsers(&runtimeUsers, c.nodeInfo); err != nil {
+			c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+			return err
+		}
 	}
 
-	c.log(fmt.Sprintf("final UsersMap: %d \tuserInfo: %d ", len(c.usersMap), len(*userInfo)), "info")
 	return nil
 }
 
@@ -90,10 +107,6 @@ func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
 	}
 	var pendings []pending
 	var report []api.UserTraffic
-	rate := c.nodeInfo.TrafficRate
-	if rate <= 0 {
-		rate = 1
-	}
 	for _, hash := range deleted {
 		u, found := c.author.LoadUser(hash)
 		if !found {
@@ -103,13 +116,7 @@ func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
 		if sent == 0 && recv == 0 {
 			continue
 		}
-		var up, down int64
-		if rate == 1 {
-			up, down = sent, recv
-		} else {
-			up = int64(rate * float64(sent))
-			down = int64(rate * float64(recv))
-		}
+		up, down := trafficForSSPanel(sent, recv)
 		pendings = append(pendings, pending{user: u, sent: sent, recv: recv})
 		report = append(report, api.UserTraffic{
 			UID:      u.UID,
@@ -131,6 +138,12 @@ func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
 	return nil
 }
 
+func trafficForSSPanel(sent, recv int64) (up, down int64) {
+	// Old SSPanel/XrayR semantics report raw transfer bytes. The panel owns
+	// node traffic_rate accounting, so multiplying here double-charges users.
+	return sent, recv
+}
+
 // 记录流量
 func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapter.InboundContext) (send, recv *atomic.Int64, err error) {
 	hash := metadata.User
@@ -142,7 +155,7 @@ func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapt
 		c.log(fmt.Sprintf("traffic user alias mapped alias=%s canonical=%s UID=%d email=%s", hash, user.hash, user.UID, user.Email), "debug")
 	}
 	if user.MarkCounterAttached() {
-		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", user.UID, user.Email, user.hash, metadata.Inbound, metadata.Source.AddrString()), "info")
+		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", user.UID, user.Email, user.hash, metadata.Inbound, metadata.Source.AddrString()), "debug")
 	}
 
 	user.AddIP(metadata.Source.AddrString())
@@ -152,13 +165,13 @@ func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapt
 }
 
 // diffUsers is a pure function: it does not mutate inputs. It returns a
-// fresh next-state map plus the lists of hashes added and deleted relative
-// to old. Duplicate hashes inside newList are dropped (first-wins).
+// fresh next-state map plus the lists of hashes added, deleted, and changed
+// relative to old. Duplicate hashes inside newList are dropped (first-wins).
 func diffUsers(
 	old map[string]*api.UserInfo,
 	newList []api.UserInfo,
 	hashFn func(*api.UserInfo) string,
-) (next map[string]*api.UserInfo, added []string, deleted []string) {
+) (next map[string]*api.UserInfo, added []string, deleted []string, changed []string) {
 	next = make(map[string]*api.UserInfo, len(newList))
 	for i := range newList {
 		// Take a value copy so storing &u doesn't alias the loop variable
@@ -169,8 +182,10 @@ func diffUsers(
 			continue
 		}
 		next[hash] = &u
-		if _, ok := old[hash]; !ok {
+		if oldUser, ok := old[hash]; !ok {
 			added = append(added, hash)
+		} else if oldUser == nil || userMaterialChanged(*oldUser, u) {
+			changed = append(changed, hash)
 		}
 	}
 	for hash := range old {
@@ -178,5 +193,29 @@ func diffUsers(
 			deleted = append(deleted, hash)
 		}
 	}
-	return next, added, deleted
+	return next, added, deleted, changed
+}
+
+// userMaterialChanged reports whether the fields that actually affect
+// authentication, accounting or limits have changed. Other fields (e.g.
+// AlterID, Method, Flow) are ignored to avoid panel-side flicker forcing
+// pointless full RefreshUsers rebuilds.
+func userMaterialChanged(a, b api.UserInfo) bool {
+	return a.UUID != b.UUID ||
+		a.Passwd != b.Passwd ||
+		a.Email != b.Email ||
+		a.Port != b.Port ||
+		a.SpeedLimit != b.SpeedLimit ||
+		a.DeviceLimit != b.DeviceLimit
+}
+
+func usersFromMap(users map[string]*api.UserInfo) []api.UserInfo {
+	result := make([]api.UserInfo, 0, len(users))
+	for _, user := range users {
+		if user == nil {
+			continue
+		}
+		result = append(result, *user)
+	}
+	return result
 }

@@ -40,26 +40,26 @@ type APIClient struct {
 	access              sync.Mutex
 	version             string
 	eTags               map[string]string
+	expiredWarned       bool
 }
+
+type noopRestyLogger struct{}
+
+func (noopRestyLogger) Errorf(format string, v ...interface{}) {}
+func (noopRestyLogger) Warnf(format string, v ...interface{})  {}
+func (noopRestyLogger) Debugf(format string, v ...interface{}) {}
 
 // New create api instance
 func New(apiConfig *api.Config) *APIClient {
 	client := resty.New()
 
-	client.SetRetryCount(3)
+	client.SetRetryCount(0)
+	client.SetLogger(noopRestyLogger{})
 	if apiConfig.Timeout > 0 {
 		client.SetTimeout(time.Duration(apiConfig.Timeout) * time.Second)
 	} else {
 		client.SetTimeout(5 * time.Second)
 	}
-	client.OnError(func(req *resty.Request, err error) {
-		var v *resty.ResponseError
-		if errors.As(err, &v) {
-			// v.Response contains the last response from the server
-			// v.Err contains the original error
-			log.Print(v.Err)
-		}
-	})
 
 	client.SetBaseURL(apiConfig.APIHost)
 	// Create Key for each requests
@@ -111,6 +111,9 @@ func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (
 	if err != nil {
 		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
 	}
+	if res == nil {
+		return nil, fmt.Errorf("request %s failed: empty response", c.assembleURL(path))
+	}
 
 	if res.StatusCode() > 400 {
 		body := res.Body()
@@ -148,11 +151,11 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		ForceContentType("application/json").
 		Get(path)
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
+	if err == nil && res != nil && res.StatusCode() == 304 {
 		return nil, errors.New(api.NodeNotModified)
 	}
 
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["node"] {
+	if err == nil && res != nil && res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["node"] {
 		c.eTags["node"] = res.Header().Get("ETag")
 	}
 
@@ -175,8 +178,9 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	}
 
 	if c.DisableCustomConfig || isExpired {
-		if isExpired {
+		if isExpired && !c.expiredWarned {
 			log.Print("The panel version is expired, it is recommended to update immediately")
+			c.expiredWarned = true
 		}
 
 		switch normalizeNodeType(c.NodeType) {
@@ -217,11 +221,11 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		ForceContentType("application/json").
 		Get(path)
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
+	if err == nil && res != nil && res.StatusCode() == 304 {
 		return nil, errors.New(api.UserNotModified)
 	}
 
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["users"] {
+	if err == nil && res != nil && res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["users"] {
 		c.eTags["users"] = res.Header().Get("ETag")
 	}
 
@@ -338,11 +342,11 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 		Get(path)
 
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
+	if err == nil && res != nil && res.StatusCode() == 304 {
 		return nil, errors.New(api.RuleNotModified)
 	}
 
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["rules"] {
+	if err == nil && res != nil && res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["rules"] {
 		c.eTags["rules"] = res.Header().Get("ETag")
 	}
 
