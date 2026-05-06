@@ -1,10 +1,12 @@
 package sspanel
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -53,12 +55,29 @@ func (noopRestyLogger) Debugf(format string, v ...interface{}) {}
 func New(apiConfig *api.Config) *APIClient {
 	client := resty.New()
 
-	client.SetRetryCount(0)
+	// Retry only on connection-level errors (DNS / TCP refused / RST).
+	// Skip timeouts and HTTP responses (incl. 5xx): those are the
+	// "panel may have already processed" gray zone, retrying there
+	// causes the panel to count the same delta multiple times.
+	client.SetRetryCount(3)
+	client.AddRetryCondition(func(_ *resty.Response, err error) bool {
+		if err == nil {
+			return false
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return false
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return false
+		}
+		return true
+	})
 	client.SetLogger(noopRestyLogger{})
 	if apiConfig.Timeout > 0 {
 		client.SetTimeout(time.Duration(apiConfig.Timeout) * time.Second)
 	} else {
-		client.SetTimeout(5 * time.Second)
+		client.SetTimeout(20 * time.Second)
 	}
 
 	client.SetBaseURL(apiConfig.APIHost)

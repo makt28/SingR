@@ -265,12 +265,6 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// Get User traffic
 	var userTraffic []api.UserTraffic
 	var onlineUsers []api.OnlineUser
-	type resetTrafficRecord struct {
-		user *User
-		sent int64
-		recv int64
-	}
-	var resetTrafficRecords []resetTrafficRecord
 	userArr := c.author.ListUsers()
 	if len(userArr) == 0 {
 		c.log("traffic zero online user", "info")
@@ -282,11 +276,6 @@ func (c *Controller) userInfoMonitor() (err error) {
 		if sent == 0 && recv == 0 {
 			continue
 		}
-		resetTrafficRecords = append(resetTrafficRecords, resetTrafficRecord{
-			user: user,
-			sent: sent,
-			recv: recv,
-		})
 
 		up, down := trafficForSSPanel(sent, recv)
 
@@ -313,12 +302,16 @@ func (c *Controller) userInfoMonitor() (err error) {
 	ipCounter := len(onlineUsers)
 	//report traffic
 	if userCounter > 0 {
-		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d email=%s user=%s upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Email, resetTrafficRecords[0].user.hash, userTraffic[0].Upload, userTraffic[0].Download), "info")
+		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d email=%s upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Email, userTraffic[0].Upload, userTraffic[0].Download), "info")
+		// On failure, the bytes captured by ResetTraffic are intentionally
+		// discarded. Restoring them caused a quadratic over-report blowup
+		// when the panel processed the request but the client saw a
+		// timeout / connection error: each subsequent cycle would
+		// re-include the same bytes, and the panel would re-add them.
+		// Bounded under-reporting (1 cycle's bytes lost) is preferred
+		// over unbounded over-reporting.
 		if err = c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
-			for _, record := range resetTrafficRecords {
-				record.user.RestoreTraffic(record.sent, record.recv)
-			}
-			c.log(fmt.Sprintf("report traffic err:%v", err.Error()), "error")
+			c.log(fmt.Sprintf("report traffic err:%v (discarding %d records)", err.Error(), userCounter), "error")
 		}
 	}
 	//report online users

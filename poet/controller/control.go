@@ -22,18 +22,14 @@ func (c *Controller) syncUserList() error {
 
 	nextMap, added, deleted, changed := diffUsers(c.usersMap, *userInfo, c.buildUserHash)
 
-	// Dump traffic for to-be-deleted users before removing them; if the
-	// report fails, keep the users this cycle so the unreported bytes
-	// aren't lost. Next sync will retry.
+	// Dump traffic for to-be-deleted users before removing them. On
+	// failure the bytes are intentionally discarded (same rationale as
+	// userInfoMonitor) and the deletion proceeds — keeping the user
+	// alive and re-reporting next cycle would re-introduce the
+	// quadratic over-report blowup.
 	if len(deleted) > 0 {
 		if err := c.dumpTrafficForDeleted(deleted); err != nil {
-			c.log(fmt.Sprintf("dump traffic before delete failed, deferring deletion: %v", err), "error")
-			for _, hash := range deleted {
-				if u, ok := c.usersMap[hash]; ok {
-					nextMap[hash] = u
-				}
-			}
-			deleted = nil
+			c.log(fmt.Sprintf("dump traffic before delete failed, discarding bytes: %v", err), "error")
 		}
 	}
 	runtimeUsers := usersFromMap(nextMap)
@@ -113,16 +109,9 @@ func (c *Controller) syncUserList() error {
 }
 
 // dumpTrafficForDeleted reports any pending bytes for users that are about
-// to be removed. On report failure the bytes are restored to the user's
-// counters so the next regular cycle can retry, and the caller is expected
-// to defer deletion.
+// to be removed. On report failure the bytes are discarded (no restore) —
+// see the rationale in userInfoMonitor.
 func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
-	type pending struct {
-		user *User
-		sent int64
-		recv int64
-	}
-	var pendings []pending
 	var report []api.UserTraffic
 	for _, hash := range deleted {
 		u, found := c.author.LoadUser(hash)
@@ -134,7 +123,6 @@ func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
 			continue
 		}
 		up, down := trafficForSSPanel(sent, recv)
-		pendings = append(pendings, pending{user: u, sent: sent, recv: recv})
 		report = append(report, api.UserTraffic{
 			UID:      u.UID,
 			Email:    u.Email,
@@ -147,9 +135,6 @@ func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
 	}
 	c.log(fmt.Sprintf("dumping %d deleted users' traffic before removal", len(report)), "info")
 	if err := c.apiClient.ReportUserTraffic(&report); err != nil {
-		for _, p := range pendings {
-			p.user.RestoreTraffic(p.sent, p.recv)
-		}
 		return err
 	}
 	return nil
