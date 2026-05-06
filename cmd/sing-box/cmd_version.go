@@ -6,13 +6,14 @@ import (
 	"runtime/debug"
 
 	C "github.com/sagernet/sing-box/constant"
+	poetConstant "github.com/sagernet/sing-box/poet/constant"
 
 	"github.com/spf13/cobra"
 )
 
 var commandVersion = &cobra.Command{
 	Use:   "version",
-	Short: "Print current version of sing-box",
+	Short: "Print current version of SingR",
 	Run:   printVersion,
 	Args:  cobra.NoArgs,
 }
@@ -26,10 +27,11 @@ func init() {
 
 func printVersion(cmd *cobra.Command, args []string) {
 	if nameOnly {
-		os.Stdout.WriteString(C.Version + "\n")
+		os.Stdout.WriteString(poetConstant.Version + "\n")
 		return
 	}
-	version := "sing-box version " + C.Version + "\n\n"
+	version := poetConstant.Name + " version " + poetConstant.Version + "\n"
+	version += "sing-box core version " + C.Version + "\n\n"
 	version += "Environment: " + runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH + "\n"
 
 	var tags string

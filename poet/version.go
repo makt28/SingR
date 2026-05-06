@@ -16,7 +16,7 @@ func ShowVersion() {
 	output := fmt.Sprintf("\n\t%s version %s\nIntro: %s\n", strings.ToUpper(constant.Name), constant.Version, constant.Intro)
 	output += "Licensed under GNU General Public License version 3\nGitHub Repository:\thttps://github.com/makt28/SingR\n"
 
-	version := "\n\tsing-box version " + C.Version + "\n"
+	version := "\n\tsing-box core version " + C.Version + "\n"
 	version += "Environment: " + runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH + "\n"
 
 	var tags string

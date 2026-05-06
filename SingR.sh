@@ -206,7 +206,6 @@ update_shell() {
 
 show_version() {
     if [[ -x "${BIN_PATH}" ]]; then
-        echo -n "${APP_NAME} 版本："
         "${BIN_PATH}" version
     else
         echo -e "${red}未找到二进制：${BIN_PATH}${plain}"
