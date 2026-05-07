@@ -2,6 +2,8 @@ package anytls
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -263,7 +265,11 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		tlsConn, err := tls.ServerHandshake(ctx, conn, tlsCfg)
 		if err != nil {
 			N.CloseOnHandshakeFailure(conn, onClose, err)
-			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			if isExpectedAnyTLSHandshakeFailure(err) {
+				h.logger.DebugContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			} else {
+				h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			}
 			return
 		}
 		conn = tlsConn
@@ -273,6 +279,16 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 	}
+}
+
+func isExpectedAnyTLSHandshakeFailure(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) || E.IsClosedOrCanceled(err) {
+		return true
+	}
+	message := err.Error()
+	return strings.Contains(message, "first record does not look like a TLS handshake") ||
+		strings.Contains(message, "record header error") ||
+		strings.Contains(message, "client sent an HTTP request to an HTTPS server")
 }
 
 type inboundHandler Inbound
