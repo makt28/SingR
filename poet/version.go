@@ -50,6 +50,36 @@ func ShowVersion() {
 	os.Stdout.WriteString(output + version)
 }
 
+func VersionLogLine() string {
+	line := fmt.Sprintf("%s version %s; sing-box core version %s; environment %s %s/%s", constant.Name, constant.Version, C.Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	var tags string
+	var revision string
+
+	debugInfo, loaded := debug.ReadBuildInfo()
+	if loaded {
+		for _, setting := range debugInfo.Settings {
+			switch setting.Key {
+			case "-tags":
+				tags = setting.Value
+			case "vcs.revision":
+				revision = setting.Value
+			}
+		}
+	}
+	if tags != "" {
+		line += "; tags " + tags
+	}
+	if revision != "" {
+		line += "; revision " + revision
+	}
+	if C.CGO_ENABLED {
+		line += "; cgo enabled"
+	} else {
+		line += "; cgo disabled"
+	}
+	return line
+}
+
 // func getGitLastTag() (string, error) {
 // 	cmd := exec.Command("git", "describe", "--tags", "--abbrev=0")
 // 	output, err := cmd.Output()

@@ -455,6 +455,7 @@ func (s *Box) preStart(startPanel bool) error {
 		if err != nil {
 			return E.Cause(err, "start panel")
 		}
+		s.logger.Info(POET.VersionLogLine())
 	}
 	err = adapter.StartNamed(s.logger, adapter.StartStateInitialize, s.internalService) // cache-file clash-api v2ray-api
 	if err != nil {

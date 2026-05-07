@@ -89,6 +89,7 @@ update_singr() {
     bash <(curl -fsSL "${INSTALL_URL}") "${version}"
     if [[ $? == 0 ]]; then
         restart 0
+        show_version 0
         echo -e "${green}更新完成${plain}"
     fi
     [[ $# == 0 ]] && before_show_menu

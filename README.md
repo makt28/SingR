@@ -52,7 +52,7 @@ sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.2.2
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.2.3
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
@@ -63,7 +63,7 @@ sudo bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install
 
 脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
 
-> 0.2.2 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、给 `direct` 出站加 `domain_strategy: prefer_ipv6`、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4）。
+> 0.2.3 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、给 `direct` 出站加 `domain_strategy: prefer_ipv6`、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4）。
 
 `SingR` 和 `singr` 两个管理命令等价，大小写都可以。
 
@@ -228,7 +228,7 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 
 也就是说，本地 JSON 可以先写默认值；只有面板对应字段非空、有效时才会替换本地值。
 
-从 0.2.2 起，面板的 `port` 和 `host=` 改动支持运行中热更新：监听端口变化时会先在新端口起 listener、成功后才关掉旧端口（失败自动回滚保留旧 listener）；SNI 变化只重建 TLS、不重启 listener。日志里会出现 `anytls listener hot-reloaded to port ...` 或 `anytls TLS hot-reloaded with SNI ...`。**证书材料、入站类型、路由规则仍然不会被热更新**。
+从 0.2.3 起，面板的 `port` 和 `host=` 改动支持运行中热更新：监听端口变化时会先在新端口起 listener、成功后才关掉旧端口（失败自动回滚保留旧 listener）；SNI 变化只重建 TLS、不重启 listener。日志里会出现 `anytls listener hot-reloaded to port ...` 或 `anytls TLS hot-reloaded with SNI ...`。**证书材料、入站类型、路由规则仍然不会被热更新**。
 
 ### 出口 IPv6
 
@@ -385,14 +385,14 @@ SINGR_SSPANEL_CONFIG=/etc/singr/panel.json \
 - SSPanel 节点地址是否包含 `ws` 和 `path=/anytls`。
 - `/etc/singr/server.json` 是否声明了 `type: "anytls"` 的入站。
 - 入站 `tag` 是否等于 `/etc/singr/panel.json` 里的 `intag`。
-- 0.2.2 起 port/SNI 支持热更新，但首次启动仍需要面板返回有效 `port`；如果日志里有 `invalid anytls listen port from panel` 说明面板返回了 0 或越界值。
+- 0.2.3 起 port/SNI 支持热更新，但首次启动仍需要面板返回有效 `port`；如果日志里有 `invalid anytls listen port from panel` 说明面板返回了 0 或越界值。
 
 ### 节点出口没有 IPv6
 
 检查：
 
 - 服务器本身能否 `curl -6 ifconfig.co`。如果服务器没有 v6 GUA，无论 SingR 怎么配都没用。
-- `server.json` 的 `direct` 出站是否有 `domain_strategy: prefer_ipv6`，`dns` 块是否带 `strategy: prefer_ipv6`，`route.auto_detect_interface` 是否为 `false`。0.2.2 起 `singr update` 会自动迁移老配置，迁移前的备份在 `/etc/singr/server.json.bak.<时间戳>`。
+- `server.json` 的 `direct` 出站是否有 `domain_strategy: prefer_ipv6`，`dns` 块是否带 `strategy: prefer_ipv6`，`route.auto_detect_interface` 是否为 `false`。0.2.3 起 `singr update` 会自动迁移老配置，迁移前的备份在 `/etc/singr/server.json.bak.<时间戳>`。
 - 如果是从老版本升级上来的，第一次 `singr update` 后必须 `singr restart`。
 
 ### 面板连接失败

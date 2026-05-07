@@ -130,10 +130,21 @@ check_systemd() {
 
 copy_binary() {
     local source_bin="$1"
+    local version_output
     [[ -f "${source_bin}" ]] || die "找不到二进制文件：${source_bin}"
 
     mkdir -p "${INSTALL_DIR}"
     install -m 755 "${source_bin}" "${BIN_PATH}"
+    version_output="$(mktemp)"
+    if ! "${BIN_PATH}" version >"${version_output}" 2>&1; then
+        local output
+        output="$(cat "${version_output}" 2>/dev/null || true)"
+        rm -f "${version_output}"
+        die "安装后的二进制无法执行 version 命令：${output}"
+    fi
+    log_info "已安装二进制版本："
+    sed 's/^/  /' "${version_output}"
+    rm -f "${version_output}"
 }
 
 build_from_source() {
