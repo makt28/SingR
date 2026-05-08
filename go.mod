@@ -21,7 +21,7 @@ require (
 	github.com/libdns/alidns v1.0.6
 	github.com/libdns/cloudflare v0.2.2
 	github.com/logrusorgru/aurora v2.0.3+incompatible
-	github.com/makt28/sing-anytls v0.0.0-20260505154255-e10aa1d4db0f
+	github.com/makt28/sing-anytls v0.0.0-20260508075853-86be3f016e4d
 	github.com/mdlayher/netlink v1.9.0
 	github.com/metacubex/utls v1.8.4
 	github.com/mholt/acmez/v3 v3.1.6
