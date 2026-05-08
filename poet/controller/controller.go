@@ -270,9 +270,19 @@ func (c *Controller) userInfoMonitor() (err error) {
 		c.log("traffic zero online user", "info")
 		return nil
 	}
+	debug := os.Getenv("SINGR_TRAFFIC_DEBUG") == "1"
+	var sumSent, sumRecv int64
+	if debug {
+		c.log(fmt.Sprintf("[TRAFFIC] userInfoMonitor begin, ListUsers count=%d", len(userArr)), "debug")
+	}
 	for _, user := range userArr {
 		// 获取用户流量
 		sent, recv := user.ResetTraffic()
+		if debug && (sent != 0 || recv != 0) {
+			c.log(fmt.Sprintf("[TRAFFIC] pre-report user UID=%d hash=%s email=%s sent=%d recv=%d", user.UID, user.Hash(), user.Email, sent, recv), "debug")
+			sumSent += sent
+			sumRecv += recv
+		}
 		if sent == 0 && recv == 0 {
 			continue
 		}
@@ -300,6 +310,9 @@ func (c *Controller) userInfoMonitor() (err error) {
 
 	userCounter := len(userTraffic)
 	ipCounter := len(onlineUsers)
+	if debug {
+		c.log(fmt.Sprintf("[TRAFFIC] userInfoMonitor sums sumSent=%d sumRecv=%d records=%d", sumSent, sumRecv, userCounter), "debug")
+	}
 	//report traffic
 	if userCounter > 0 {
 		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d email=%s upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Email, userTraffic[0].Upload, userTraffic[0].Download), "info")

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -336,6 +337,11 @@ func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 	}
 	postData := &PostData{Data: data}
 	path := "/mod_mu/users/traffic"
+	if os.Getenv("SINGR_TRAFFIC_DEBUG") == "1" {
+		if body, mErr := json.Marshal(postData); mErr == nil {
+			log.Printf("[TRAFFIC] ReportUserTraffic body: %s", string(body))
+		}
+	}
 	res, err := c.client.R().
 		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
 		SetBody(postData).

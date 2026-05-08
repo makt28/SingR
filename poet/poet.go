@@ -124,6 +124,29 @@ func SetInboud(in *adapter.Inbound, tag string) {
 // 设置 outbound
 // func SetOutbound() {}
 
+// trafficDebug is enabled by SINGR_TRAFFIC_DEBUG=1 and turns on per-conn /
+// per-user / per-report logs that let us verify byte accounting against
+// ground truth in sim. Off in production = zero overhead.
+var trafficDebug = os.Getenv("SINGR_TRAFFIC_DEBUG") == "1"
+
+func TrafficDebug() bool { return trafficDebug }
+
+type loggingConn struct {
+	net.Conn
+	perRead  *atomic.Int64
+	perWrite *atomic.Int64
+	tag      string
+	closed   atomic.Bool
+}
+
+func (c *loggingConn) Close() error {
+	err := c.Conn.Close()
+	if c.closed.CompareAndSwap(false, true) {
+		SS.Singleton().Logger.Debug(fmt.Sprintf("[TRAFFIC] conn close %s read=%d write=%d", c.tag, c.perRead.Load(), c.perWrite.Load()))
+	}
+	return err
+}
+
 // 计费
 func RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) net.Conn {
 	var readCounter []*atomic.Int64
@@ -144,14 +167,20 @@ func RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.Inbou
 	readCounter = append(readCounter, sendPtr)
 	writeCounter = append(writeCounter, recvPtr)
 
+	if trafficDebug {
+		perRead := &atomic.Int64{}
+		perWrite := &atomic.Int64{}
+		readCounter = append(readCounter, perRead)
+		writeCounter = append(writeCounter, perWrite)
+		tag := fmt.Sprintf("user=%s inbound=%s src=%s dst=%s", metadata.User, metadata.Inbound, metadata.Source.AddrString(), metadata.Destination.AddrString())
+		ss.Logger.Debug(fmt.Sprintf("[TRAFFIC] conn wrap %s sendPtrPre=%d recvPtrPre=%d", tag, sendPtr.Load(), recvPtr.Load()))
+		wrapped := bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
+		return &loggingConn{Conn: wrapped, perRead: perRead, perWrite: perWrite, tag: tag}
+	}
+
 	return bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
 }
 func RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) N.PacketConn {
-	var readCounter []*atomic.Int64       //统计读取的总字节数
-	var readPacketCounter []*atomic.Int64 //统计读取的数据包数量
-	var writeCounter []*atomic.Int64
-	var writePacketCounter []*atomic.Int64
-
 	ss := SS.Singleton()
 	contrl := ss.GetContrlWithInTag(metadata.Inbound)
 	if contrl == nil {
@@ -165,23 +194,7 @@ func RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata ada
 		return conn
 	}
 
-	readCounter = append(readCounter, sendPtr)
-	writeCounter = append(writeCounter, recvPtr)
-
-	// 修改部分：只有当计数器大于0时，才创建一个值为1的新计数器并添加到包计数器切片中
-	if sendPtr != nil && sendPtr.Load() > 0 {
-		readCounter := &atomic.Int64{}
-		readCounter.Store(1) // 设置初始值为1
-		readPacketCounter = append(readPacketCounter, readCounter)
-	}
-
-	if recvPtr != nil && recvPtr.Load() > 0 {
-		writeCounter := &atomic.Int64{}
-		writeCounter.Store(1) // 设置初始值为1
-		writePacketCounter = append(writePacketCounter, writeCounter)
-	}
-
-	return bufio.NewInt64CounterPacketConn(conn, readCounter, readPacketCounter, writeCounter, writePacketCounter)
+	return bufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{sendPtr}, nil, []*atomic.Int64{recvPtr}, nil)
 }
 
 // debug
