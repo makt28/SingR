@@ -12,9 +12,12 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
+	"github.com/sagernet/sing-box/poet/controller"
 	"github.com/sagernet/sing-box/poet/panel"
 	SS "github.com/sagernet/sing-box/poet/shortcuts"
 
@@ -147,6 +150,72 @@ func (c *loggingConn) Close() error {
 	return err
 }
 
+// rateLimitedConn wraps a net.Conn with a per-direction token bucket. It
+// is layered OUTSIDE bufio.NewInt64CounterConn so that the limiter waits
+// happen after the bytes are already counted — the limiter only paces
+// the caller, it never under-reports. user.WaitN with a nil limiter
+// returns immediately, so non-limited users have ~zero overhead per
+// Read/Write (one map-free RLock).
+type rateLimitedConn struct {
+	net.Conn
+	user *controller.User
+	ctx  context.Context
+}
+
+func (c *rateLimitedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		// Bytes from client → outbound = upload from the user's perspective.
+		_ = c.user.WaitN(c.ctx, n, 0)
+	}
+	return n, err
+}
+
+func (c *rateLimitedConn) Write(b []byte) (int, error) {
+	if len(b) > 0 {
+		// Bytes from outbound → client = download from the user's perspective.
+		_ = c.user.WaitN(c.ctx, 0, len(b))
+	}
+	return c.Conn.Write(b)
+}
+
+// rateLimitedPacketConn wraps a PacketConn the same way for UDP. Without
+// this, an unlimited UDP path can fully bypass per-user speed control.
+type rateLimitedPacketConn struct {
+	N.PacketConn
+	user *controller.User
+	ctx  context.Context
+}
+
+func (c *rateLimitedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	dest, err := c.PacketConn.ReadPacket(buffer)
+	if buffer.Len() > 0 {
+		_ = c.user.WaitN(c.ctx, buffer.Len(), 0)
+	}
+	return dest, err
+}
+
+func (c *rateLimitedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if buffer.Len() > 0 {
+		_ = c.user.WaitN(c.ctx, 0, buffer.Len())
+	}
+	return c.PacketConn.WritePacket(buffer, destination)
+}
+
+// blockedConn is returned by RoutedConnection when an audit rule rejects
+// the destination. The underlying conn is closed up front; any further
+// Read/Write surfaces a sentinel error so the dispatcher unwinds cleanly
+// without dialing the outbound and pumping bytes.
+type blockedConn struct {
+	net.Conn
+	reason error
+}
+
+func (c *blockedConn) Read(b []byte) (int, error)  { return 0, c.reason }
+func (c *blockedConn) Write(b []byte) (int, error) { return 0, c.reason }
+
+var errAuditBlocked = fmt.Errorf("singr: connection blocked by audit rule")
+
 // 计费
 func RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) net.Conn {
 	var readCounter []*atomic.Int64
@@ -159,7 +228,7 @@ func RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.Inbou
 		return conn
 	}
 
-	sendPtr, recvPtr, err := contrl.LoadOrCreateUserCounter(ctx, metadata)
+	sendPtr, recvPtr, user, err := contrl.LoadOrCreateUserCounter(ctx, metadata)
 	if err != nil {
 		ss.Logger.Warn(fmt.Sprintf("RecordUserTraffic: inbound:%s user:%s counter pointer not found", metadata.Inbound, metadata.User))
 		return conn
@@ -167,6 +236,20 @@ func RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.Inbou
 	readCounter = append(readCounter, sendPtr)
 	writeCounter = append(writeCounter, recvPtr)
 
+	// Audit (TCP only; UDP destinations are usually IPs not FQDNs).
+	// Match against the destination FQDN; on hit, close the inbound
+	// conn immediately and surface a sentinel error to downstream
+	// dispatch. The DetectResult is recorded inside MatchAudit and
+	// reported by userInfoMonitor.
+	if metadata.Destination.IsFqdn() {
+		if matched, ruleID := contrl.MatchAudit(user.UID, metadata.Destination.Fqdn); matched {
+			ss.Logger.Info(fmt.Sprintf("audit blocked UID=%d host=%s ruleID=%d", user.UID, metadata.Destination.Fqdn, ruleID))
+			_ = conn.Close()
+			return &blockedConn{Conn: conn, reason: errAuditBlocked}
+		}
+	}
+
+	var wrapped net.Conn
 	if trafficDebug {
 		perRead := &atomic.Int64{}
 		perWrite := &atomic.Int64{}
@@ -174,11 +257,15 @@ func RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.Inbou
 		writeCounter = append(writeCounter, perWrite)
 		tag := fmt.Sprintf("user=%s inbound=%s src=%s dst=%s", metadata.User, metadata.Inbound, metadata.Source.AddrString(), metadata.Destination.AddrString())
 		ss.Logger.Debug(fmt.Sprintf("[TRAFFIC] conn wrap %s sendPtrPre=%d recvPtrPre=%d", tag, sendPtr.Load(), recvPtr.Load()))
-		wrapped := bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
-		return &loggingConn{Conn: wrapped, perRead: perRead, perWrite: perWrite, tag: tag}
+		counted := bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
+		wrapped = &loggingConn{Conn: counted, perRead: perRead, perWrite: perWrite, tag: tag}
+	} else {
+		wrapped = bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
 	}
 
-	return bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
+	// Layer the rate limiter outside the counter so counters are
+	// authoritative — limiter waits do not affect what got counted.
+	return &rateLimitedConn{Conn: wrapped, user: user, ctx: ctx}
 }
 func RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) N.PacketConn {
 	ss := SS.Singleton()
@@ -188,13 +275,14 @@ func RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata ada
 		return conn
 	}
 
-	sendPtr, recvPtr, err := contrl.LoadOrCreateUserCounter(ctx, metadata)
+	sendPtr, recvPtr, user, err := contrl.LoadOrCreateUserCounter(ctx, metadata)
 	if err != nil {
 		ss.Logger.Warn(fmt.Sprintf("RecordPacketTraffic: inbound:%s user:%s counter pointer not found", metadata.Inbound, metadata.User))
 		return conn
 	}
 
-	return bufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{sendPtr}, nil, []*atomic.Int64{recvPtr}, nil)
+	counted := bufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{sendPtr}, nil, []*atomic.Int64{recvPtr}, nil)
+	return &rateLimitedPacketConn{PacketConn: counted, user: user, ctx: ctx}
 }
 
 // debug

@@ -66,6 +66,7 @@ func (c *Controller) syncUserList() error {
 		}
 		c.author.SetUserProfile(hash, *u)
 		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
+		c.applyUserSpeedLimit(hash, u.SpeedLimit)
 	}
 	for _, hash := range changed {
 		u, ok := nextMap[hash]
@@ -74,6 +75,7 @@ func (c *Controller) syncUserList() error {
 		}
 		c.author.SetUserProfile(hash, *u)
 		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
+		c.applyUserSpeedLimit(hash, u.SpeedLimit)
 	}
 
 	if shouldRefreshRuntimeUsers {
@@ -146,24 +148,81 @@ func trafficForSSPanel(sent, recv int64) (up, down int64) {
 	return sent, recv
 }
 
+// determineRate mirrors XrayR `common/limiter` `determineRate`: SSPanel's
+// "node speed limit" is NOT a shared node-wide bucket — it's a per-user
+// fallback / ceiling. Each user gets their own limiter with rate equal
+// to:
+//
+//	node=0, user=0  → 0  (no limit)
+//	node=0, user=X  → X  (user-specific)
+//	node=X, user=0  → X  (node default applied per user)
+//	node=X, user=Y  → min(X, Y)
+//
+// Keeping bug-for-bug parity with XrayR avoids surprising operators who
+// migrate from XrayR to SingR and expect the same panel field semantics.
+func determineRate(nodeLimit, userLimit uint64) uint64 {
+	if nodeLimit == 0 || userLimit == 0 {
+		if nodeLimit > userLimit {
+			return nodeLimit
+		}
+		return userLimit
+	}
+	if nodeLimit < userLimit {
+		return nodeLimit
+	}
+	return userLimit
+}
+
+// applyUserSpeedLimit installs (or clears) the per-user limiter using
+// the XrayR `determineRate` rule. Called for added / changed users in
+// syncUserList and (via refreshAllSpeedLimits) when nodeInfo.SpeedLimit
+// changes.
+func (c *Controller) applyUserSpeedLimit(hash string, userLimit uint64) {
+	nodeLimit := uint64(0)
+	if c.nodeInfo != nil {
+		nodeLimit = c.nodeInfo.SpeedLimit
+	}
+	c.author.SetUserSpeedLimit(hash, determineRate(nodeLimit, userLimit))
+}
+
+// refreshAllSpeedLimits recomputes every existing user's limiter against
+// the current nodeInfo.SpeedLimit. Cheap O(N) walk; only called from
+// nodeInfoMonitor when the node speed limit actually changed.
+func (c *Controller) refreshAllSpeedLimits() {
+	if c.usersMap == nil {
+		return
+	}
+	for hash, u := range c.usersMap {
+		if u == nil {
+			continue
+		}
+		c.applyUserSpeedLimit(hash, u.SpeedLimit)
+	}
+}
+
 // 记录流量
-func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapter.InboundContext) (send, recv *atomic.Int64, err error) {
+//
+// Returns the user's send/recv counter pointers along with the User
+// pointer itself so the caller (poet.RoutedConnection) can additionally
+// wrap with a rate-limit conn that calls user.WaitN. Callers that only
+// need counters can ignore the user return.
+func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapter.InboundContext) (send, recv *atomic.Int64, user *User, err error) {
 	hash := metadata.User
-	user, found := c.author.LoadUser(hash)
+	u, found := c.author.LoadUser(hash)
 	if !found {
-		return nil, nil, fmt.Errorf("hash:%s is not in user map", hash)
+		return nil, nil, nil, fmt.Errorf("hash:%s is not in user map", hash)
 	}
-	if hash != user.hash {
-		c.log(fmt.Sprintf("traffic user alias mapped alias=%s canonical=%s UID=%d email=%s", hash, user.hash, user.UID, user.Email), "debug")
+	if hash != u.hash {
+		c.log(fmt.Sprintf("traffic user alias mapped alias=%s canonical=%s UID=%d email=%s", hash, u.hash, u.UID, u.Email), "debug")
 	}
-	if user.MarkCounterAttached() {
-		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", user.UID, user.Email, user.hash, metadata.Inbound, metadata.Source.AddrString()), "debug")
+	if u.MarkCounterAttached() {
+		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", u.UID, u.Email, u.hash, metadata.Inbound, metadata.Source.AddrString()), "debug")
 	}
 
-	user.AddIP(metadata.Source.AddrString())
+	u.AddIP(metadata.Source.AddrString())
 
-	sendPtr, recvPtr := user.GetTrafficPointer()
-	return sendPtr, recvPtr, nil
+	sendPtr, recvPtr := u.GetTrafficPointer()
+	return sendPtr, recvPtr, u, nil
 }
 
 // diffUsers is a pure function: it does not mutate inputs. It returns a

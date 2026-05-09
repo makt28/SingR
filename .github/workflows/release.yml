@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example v0.2.5"
+        description: "Release version, for example v0.3.0"
         required: false
-        default: "v0.2.5"
+        default: "v0.3.0"
         type: string
 
 permissions:
@@ -104,10 +104,7 @@ jobs:
     needs:
       - build
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set version
+      - name: Resolve version
         shell: bash
         run: |
           set -euo pipefail
@@ -115,16 +112,15 @@ jobs:
             VERSION="${GITHUB_REF_NAME}"
           else
             VERSION="${{ inputs.version }}"
-            if [[ -z "${VERSION}" ]]; then
-              VERSION="v$(cat release/singr/VERSION)"
-            fi
+          fi
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::Could not resolve release version (no tag, no workflow input)"
+            exit 1
           fi
           if [[ "${VERSION}" != v* ]]; then
             VERSION="v${VERSION}"
           fi
-          SINGR_VERSION="${VERSION#v}"
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "SINGR_VERSION=${SINGR_VERSION}" >> "${GITHUB_ENV}"
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -132,23 +128,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Add release helper assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf '%s\n' "${SINGR_VERSION}" > dist/VERSION
-          git archive --format=tar.gz --prefix="SingR-${VERSION#v}/" \
-            -o "dist/SingR-source-${VERSION}.tar.gz" HEAD
-          (
-            cd dist
-            sha256sum VERSION > VERSION.sha256
-            sha256sum "SingR-source-${VERSION}.tar.gz" > "SingR-source-${VERSION}.tar.gz.sha256"
-          )
-
       - name: Publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if ! gh release view "${VERSION}" >/dev/null 2>&1; then

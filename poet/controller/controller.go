@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -39,9 +41,35 @@ type Controller struct {
 	author *Authenticator
 	ctx    context.Context
 
+	// Audit / detect rules pulled from SSPanel `/mod_mu/func/detect_rules`.
+	// Stored as an atomic pointer so RoutedConnection's match path is
+	// lock-free; nodeInfoMonitor swaps the slice atomically when the
+	// panel returns a new ETag.
+	detectRules atomic.Pointer[[]api.DetectRule]
+	// detectResults accumulates audit hits between report cycles. The
+	// dedup map keys (uid, ruleID) → expiry time so a single user
+	// scanning across hosts that all match the same rule does not
+	// produce thousands of identical reports.
+	detectMu       sync.Mutex
+	detectResults  []api.DetectResult
+	detectDedup    map[detectKey]time.Time
+	detectGetWarns int
+
 	// environment = development testing staging production
 	env string
 }
+
+// detectKey identifies a unique (user, rule) pair for audit dedup.
+type detectKey struct {
+	UID    int
+	RuleID int
+}
+
+// detectDedupTTL is the cooldown window during which repeat hits of the
+// same (uid, ruleID) are suppressed. 60 s mirrors XrayR's de-facto
+// behavior of "one report per cycle" at the typical 60 s report
+// interval.
+const detectDedupTTL = 60 * time.Second
 
 type periodicTask struct {
 	tag string
@@ -61,8 +89,9 @@ func New(ctx context.Context, config Config, inbound *adapter.Inbound, apiClient
 		startAt: time.Now(),
 		inbound: inbound,
 
-		ctx:    ctx,
-		logger: logger,
+		ctx:         ctx,
+		logger:      logger,
+		detectDedup: make(map[detectKey]time.Time),
 	}
 	author, err := NewAuthenticator(ctx)
 	if err != nil {
@@ -212,6 +241,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		return errors.New("server port must > 0")
 	}
 	//new Node Info
+	prevNodeSpeedLimit := uint64(0)
+	if c.nodeInfo != nil {
+		prevNodeSpeedLimit = c.nodeInfo.SpeedLimit
+	}
 	c.nodeInfo = newNodeInfo
 
 	// Update User
@@ -221,8 +254,19 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		return nil
 	}
 
-	//TODO
-	//c.apiClient.GetNodeRule();
+	// If the node-wide speed limit changed, recompute every user's limiter
+	// against the new value. syncUserList already reapplies limiters for
+	// added/changed users; this catches everyone else. Cheap O(N).
+	if newNodeInfo.SpeedLimit != prevNodeSpeedLimit {
+		c.log(fmt.Sprintf("node speed limit changed %d -> %d Bps; refreshing %d users", prevNodeSpeedLimit, newNodeInfo.SpeedLimit, len(c.usersMap)), "info")
+		c.refreshAllSpeedLimits()
+	}
+
+	// Refresh audit rule list. RuleNotModified / network errors are
+	// non-fatal — keep whatever we had. A panel without `/mod_mu/func/detect_rules`
+	// will return an error here on every cycle; we log once at debug so
+	// it doesn't dominate logs.
+	c.refreshDetectRules()
 
 	// If nodeInfo changed, ask the inbound to hot-reload its panel-derived
 	// settings (port, SNI). The inbound is responsible for diffing and
@@ -266,11 +310,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 	var userTraffic []api.UserTraffic
 	var onlineUsers []api.OnlineUser
 	userArr := c.author.ListUsers()
+	debug := os.Getenv("SINGR_TRAFFIC_DEBUG") == "1"
 	if len(userArr) == 0 {
 		c.log("traffic zero online user", "info")
-		return nil
+		// Fall through so accumulated audit hits still get reported.
 	}
-	debug := os.Getenv("SINGR_TRAFFIC_DEBUG") == "1"
 	var sumSent, sumRecv int64
 	if debug {
 		c.log(fmt.Sprintf("[TRAFFIC] userInfoMonitor begin, ListUsers count=%d", len(userArr)), "debug")
@@ -335,8 +379,107 @@ func (c *Controller) userInfoMonitor() (err error) {
 	}
 	c.log(fmt.Sprintf("userInfoMonitor>>ReportUserOnline userCounter:%d ipCounter:%d", userCounter, ipCounter), "info")
 
-	// TODO
-	// if err = c.apiClient.ReportIllegal(detectResult); err != nil {
+	// Drain accumulated audit hits and report them. On failure the slice
+	// is intentionally discarded — keeping it would let one persistently
+	// failing panel grow the buffer unboundedly, and audit dedup already
+	// suppresses repeats within `detectDedupTTL` so dropping a cycle's
+	// worth is bounded.
+	if hits := c.drainDetectResults(); len(hits) > 0 {
+		c.log(fmt.Sprintf("reporting %d audit hits", len(hits)), "info")
+		if err = c.apiClient.ReportIllegal(&hits); err != nil {
+			c.log(fmt.Sprintf("report illegal err:%v (discarding %d records)", err.Error(), len(hits)), "error")
+		}
+	}
 
 	return nil
+}
+
+// refreshDetectRules pulls the latest audit rules from the panel and
+// atomically swaps `c.detectRules`. RuleNotModified preserves the
+// existing list. Other errors are logged once at debug (then suppressed)
+// so a panel that doesn't expose the endpoint doesn't dominate logs.
+func (c *Controller) refreshDetectRules() {
+	rules, err := c.apiClient.GetNodeRule()
+	if err != nil {
+		if err.Error() == api.RuleNotModified {
+			return
+		}
+		if c.detectGetWarns == 0 {
+			c.log(fmt.Sprintf("GetNodeRule failed (suppressing further warnings): %v", err), "debug")
+		}
+		c.detectGetWarns++
+		return
+	}
+	c.detectGetWarns = 0
+	if rules == nil {
+		empty := []api.DetectRule{}
+		c.detectRules.Store(&empty)
+		return
+	}
+	c.detectRules.Store(rules)
+}
+
+// MatchAudit checks `host` against the active rule list and, on a match,
+// records a `DetectResult{UID, RuleID}` for the next ReportIllegal cycle.
+// Returns (matched, ruleID). Repeats of the same (uid, ruleID) within
+// detectDedupTTL are recorded as matched but not re-appended.
+//
+// host should be the connection's destination FQDN (metadata.Destination.Fqdn).
+// IP-only destinations are not matched (XrayR audit semantics: rules are
+// regexes meant for hostnames / SNIs).
+func (c *Controller) MatchAudit(uid int, host string) (bool, int) {
+	if host == "" {
+		return false, 0
+	}
+	rulesPtr := c.detectRules.Load()
+	if rulesPtr == nil {
+		return false, 0
+	}
+	rules := *rulesPtr
+	for i := range rules {
+		if rules[i].Pattern == nil {
+			continue
+		}
+		if rules[i].Pattern.MatchString(host) {
+			c.recordDetect(uid, rules[i].ID)
+			return true, rules[i].ID
+		}
+	}
+	return false, 0
+}
+
+func (c *Controller) recordDetect(uid, ruleID int) {
+	now := time.Now()
+	key := detectKey{UID: uid, RuleID: ruleID}
+
+	c.detectMu.Lock()
+	defer c.detectMu.Unlock()
+
+	if exp, ok := c.detectDedup[key]; ok && now.Before(exp) {
+		return
+	}
+	c.detectDedup[key] = now.Add(detectDedupTTL)
+	c.detectResults = append(c.detectResults, api.DetectResult{UID: uid, RuleID: ruleID})
+
+	// Bound dedup map growth: walk and prune expired entries every time
+	// the map grows past 4096. Cheap because the loop is O(N) and amortizes
+	// against insert frequency.
+	if len(c.detectDedup) > 4096 {
+		for k, exp := range c.detectDedup {
+			if now.After(exp) {
+				delete(c.detectDedup, k)
+			}
+		}
+	}
+}
+
+func (c *Controller) drainDetectResults() []api.DetectResult {
+	c.detectMu.Lock()
+	defer c.detectMu.Unlock()
+	if len(c.detectResults) == 0 {
+		return nil
+	}
+	out := c.detectResults
+	c.detectResults = nil
+	return out
 }
