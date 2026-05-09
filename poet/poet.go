@@ -150,12 +150,18 @@ func (c *loggingConn) Close() error {
 	return err
 }
 
-// rateLimitedConn wraps a net.Conn with a per-direction token bucket. It
-// is layered OUTSIDE bufio.NewInt64CounterConn so that the limiter waits
-// happen after the bytes are already counted — the limiter only paces
-// the caller, it never under-reports. user.WaitN with a nil limiter
-// returns immediately, so non-limited users have ~zero overhead per
-// Read/Write (one map-free RLock).
+// rateLimitedConn wraps a net.Conn with the user's SHARED token bucket
+// (XrayR semantics: one bucket gated by both directions, so up+down
+// compete for the same budget). It is layered OUTSIDE
+// bufio.NewInt64CounterConn so that the limiter waits happen after the
+// bytes are already counted — the limiter only paces the caller, it
+// never under-reports. user.WaitN with a nil limiter returns
+// immediately, so non-limited users have ~zero overhead per Read/Write
+// (one RLock).
+//
+// Each individual byte transits the inbound conn exactly once (Read xor
+// Write), so a single byte never double-charges the bucket. Read =
+// upload, Write = download.
 type rateLimitedConn struct {
 	net.Conn
 	user *controller.User
@@ -165,22 +171,21 @@ type rateLimitedConn struct {
 func (c *rateLimitedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
-		// Bytes from client → outbound = upload from the user's perspective.
-		_ = c.user.WaitN(c.ctx, n, 0)
+		_ = c.user.WaitN(c.ctx, n)
 	}
 	return n, err
 }
 
 func (c *rateLimitedConn) Write(b []byte) (int, error) {
 	if len(b) > 0 {
-		// Bytes from outbound → client = download from the user's perspective.
-		_ = c.user.WaitN(c.ctx, 0, len(b))
+		_ = c.user.WaitN(c.ctx, len(b))
 	}
 	return c.Conn.Write(b)
 }
 
-// rateLimitedPacketConn wraps a PacketConn the same way for UDP. Without
-// this, an unlimited UDP path can fully bypass per-user speed control.
+// rateLimitedPacketConn wraps a PacketConn the same way for UDP using
+// the same shared bucket. Without this, an unlimited UDP path can fully
+// bypass per-user speed control.
 type rateLimitedPacketConn struct {
 	N.PacketConn
 	user *controller.User
@@ -190,14 +195,14 @@ type rateLimitedPacketConn struct {
 func (c *rateLimitedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	dest, err := c.PacketConn.ReadPacket(buffer)
 	if buffer.Len() > 0 {
-		_ = c.user.WaitN(c.ctx, buffer.Len(), 0)
+		_ = c.user.WaitN(c.ctx, buffer.Len())
 	}
 	return dest, err
 }
 
 func (c *rateLimitedPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	if buffer.Len() > 0 {
-		_ = c.user.WaitN(c.ctx, 0, buffer.Len())
+		_ = c.user.WaitN(c.ctx, buffer.Len())
 	}
 	return c.PacketConn.WritePacket(buffer, destination)
 }

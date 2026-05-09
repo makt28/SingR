@@ -483,3 +483,30 @@ func (c *Controller) drainDetectResults() []api.DetectResult {
 	c.detectResults = nil
 	return out
 }
+
+// Author returns the controller's authenticator. Exposed for end-to-end
+// tests in sim/ that need to register users / observe runtime state
+// without driving the full panel sync loop.
+func (c *Controller) Author() *Authenticator { return c.author }
+
+// SetNodeInfo replaces the controller's view of the panel node info.
+// Production code receives this through Start() / nodeInfoMonitor;
+// tests use this to install a node config (esp. SpeedLimit) without
+// running the full sync loop.
+func (c *Controller) SetNodeInfo(info *api.NodeInfo) { c.nodeInfo = info }
+
+// SetDetectRules atomically replaces the controller's audit rule list.
+// Production: refreshDetectRules calls this from nodeInfoMonitor with
+// rules pulled from /mod_mu/func/detect_rules. Tests: bypass the panel
+// pull by installing rules directly.
+func (c *Controller) SetDetectRules(rules []api.DetectRule) {
+	c.detectRules.Store(&rules)
+}
+
+// DrainDetectResults removes and returns all accumulated audit hits.
+// userInfoMonitor calls this once per cycle to feed ReportIllegal;
+// tests call it to inspect what was recorded by RoutedConnection's
+// audit-block path.
+func (c *Controller) DrainDetectResults() []api.DetectResult {
+	return c.drainDetectResults()
+}

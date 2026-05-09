@@ -42,9 +42,16 @@ type User struct {
 	ipNum       atomic.Int32
 	counterSeen atomic.Bool
 	maxIPNum    int
+
+	// limiter is a SINGLE token bucket shared across both directions.
+	// XrayR/SSPanel semantics: `node_speedlimit` and per-user
+	// `SpeedLimit` describe the user's TOTAL bandwidth, not per-
+	// direction. Wrapping inbound conn Read (upload) and Write
+	// (download) against the same bucket means simultaneous up+down
+	// competes for the same budget — same end-user experience as
+	// XrayR. nil = unlimited.
 	limiterLock sync.RWMutex
-	sendLimiter *rate.Limiter
-	recvLimiter *rate.Limiter
+	limiter     *rate.Limiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -105,48 +112,32 @@ func (u *User) GetIPLimit() int {
 	return u.maxIPNum
 }
 
-func (u *User) AddTraffic(sent, recv int64) {
-	u.limiterLock.RLock()
-	defer u.limiterLock.RUnlock()
-
-	if u.sendLimiter != nil && sent >= 0 {
-		u.sendLimiter.WaitN(u.ctx, int(sent))
-	} else if u.recvLimiter != nil && recv >= 0 {
-		u.recvLimiter.WaitN(u.ctx, int(recv))
-	}
-
-	u.sent.Add(sent)
-	u.recv.Add(recv)
-	// atomic.AddUint64(&u.sent, uint64(sent))
-	// atomic.AddUint64(&u.recv, uint64(recv))
-}
-
-// WaitN blocks until the user's per-direction rate limiters allow `sent`
-// upload bytes and `recv` download bytes. It does NOT mutate the byte
-// counters — counter accounting is handled by `bufio.NewInt64CounterConn`
-// wrapped underneath the rate-limited conn in poet.RoutedConnection.
+// WaitN blocks until the user's shared rate limiter allows `n` bytes.
+// It does NOT mutate the byte counters — counter accounting is handled
+// by `bufio.NewInt64CounterConn` wrapped underneath the rate-limited
+// conn in poet.RoutedConnection.
+//
+// Both directions share one bucket (XrayR semantics): a user with
+// SpeedLimit=10 MB/s can do 10 MB/s in one direction OR 5+5 MB/s split,
+// not 10+10 MB/s.
 //
 // A nil limiter (limit == 0 → unlimited) returns immediately. A WaitN
 // larger than the limiter burst is split into burst-sized chunks so the
-// `golang.org/x/time/rate` rejection of `n > burst` does not surface to
-// the caller.
-func (u *User) WaitN(ctx context.Context, sent, recv int) error {
+// `golang.org/x/time/rate` rejection of `n > burst` does not surface
+// to the caller (this is stricter than XrayR, which silently drops the
+// limiter for oversized buffers — see CLAUDE.md).
+func (u *User) WaitN(ctx context.Context, n int) error {
+	if n <= 0 {
+		return nil
+	}
 	u.limiterLock.RLock()
-	send := u.sendLimiter
-	receive := u.recvLimiter
+	l := u.limiter
 	u.limiterLock.RUnlock()
 
-	if send != nil && sent > 0 {
-		if err := waitChunked(ctx, send, sent); err != nil {
-			return err
-		}
+	if l == nil {
+		return nil
 	}
-	if receive != nil && recv > 0 {
-		if err := waitChunked(ctx, receive, recv); err != nil {
-			return err
-		}
-	}
-	return nil
+	return waitChunked(ctx, l, n)
 }
 
 func waitChunked(ctx context.Context, l *rate.Limiter, n int) error {
@@ -167,38 +158,33 @@ func waitChunked(ctx context.Context, l *rate.Limiter, n int) error {
 	return nil
 }
 
-// SetSpeedLimit installs new per-direction rate limiters. send / recv are
-// bytes per second; <= 0 disables that direction. Burst matches XrayR
-// semantics (`int(limit)` ≈ one second of bytes) so a single TCP buffer
-// (≤ 64 KiB in practice) does not need chunking unless the user limit is
-// below 64 KiB/s.
-func (u *User) SetSpeedLimit(send, recv int64) {
+// SetSpeedLimit installs the user's shared rate limiter. bytesPerSec is
+// the user's TOTAL bandwidth (up + down compete for the same bucket).
+// <= 0 disables limiting (clears the bucket). Burst is `int(limit)` ≈
+// one second of bytes (XrayR parity), so a single TCP buffer (≤ 64 KiB
+// in practice) does not need chunking unless the user limit is below
+// 64 KiB/s.
+func (u *User) SetSpeedLimit(bytesPerSec int64) {
 	u.limiterLock.Lock()
 	defer u.limiterLock.Unlock()
 
-	if send <= 0 {
-		u.sendLimiter = nil
-	} else {
-		u.sendLimiter = rate.NewLimiter(rate.Limit(send), int(send))
+	if bytesPerSec <= 0 {
+		u.limiter = nil
+		return
 	}
-	if recv <= 0 {
-		u.recvLimiter = nil
-	} else {
-		u.recvLimiter = rate.NewLimiter(rate.Limit(recv), int(recv))
-	}
+	u.limiter = rate.NewLimiter(rate.Limit(bytesPerSec), int(bytesPerSec))
 }
 
-func (u *User) GetSpeedLimit() (send, recv int) {
+// GetSpeedLimit returns the user's current effective rate limit in
+// bytes/second, or 0 if unlimited.
+func (u *User) GetSpeedLimit() int {
 	u.limiterLock.RLock()
 	defer u.limiterLock.RUnlock()
 
-	if u.sendLimiter != nil {
-		send = int(u.sendLimiter.Limit())
+	if u.limiter == nil {
+		return 0
 	}
-	if u.recvLimiter != nil {
-		recv = int(u.recvLimiter.Limit())
-	}
-	return
+	return int(u.limiter.Limit())
 }
 
 func (u *User) Hash() string {
@@ -367,16 +353,28 @@ func (a *Authenticator) SetUserProfile(hash string, userInfo api.UserInfo) {
 	user.Passwd = userInfo.Passwd
 }
 
-// SetUserSpeedLimit installs the same rate on both directions for the
-// user identified by the canonical hash. rate is bytes per second; 0
-// removes any existing limiter. Returns false if the user is not in the
-// authenticator (e.g. just deleted).
+// SetUserSpeedLimit installs the user's shared rate limiter (one bucket
+// across both directions, XrayR semantics). bytesPerSec is the user's
+// total bandwidth in B/s; 0 removes any existing limiter. Returns
+// false if the user is not in the authenticator (e.g. just deleted).
 func (a *Authenticator) SetUserSpeedLimit(hash string, bytesPerSec uint64) bool {
 	user, found := a.LoadUser(hash)
 	if !found {
 		return false
 	}
-	user.SetSpeedLimit(int64(bytesPerSec), int64(bytesPerSec))
+	user.SetSpeedLimit(int64(bytesPerSec))
+	return true
+}
+
+// SetUserDeviceLimit installs the user's per-IP device limit (max
+// distinct source IPs that can be tracked concurrently). 0 disables
+// the limit. Returns false if the user is not in the authenticator.
+func (a *Authenticator) SetUserDeviceLimit(hash string, maxDevices int) bool {
+	user, found := a.LoadUser(hash)
+	if !found {
+		return false
+	}
+	user.SetIPLimit(maxDevices)
 	return true
 }
 

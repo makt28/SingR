@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"sync"
 	"testing"
@@ -47,9 +48,9 @@ func TestSyncUserListAppliesPerUserSpeedLimit(t *testing.T) {
 
 	expected := map[int]int{1: 50, 2: 30, 3: 50}
 	for _, u := range c.author.ListUsers() {
-		send, recv := u.GetSpeedLimit()
-		if send != expected[u.UID] || recv != expected[u.UID] {
-			t.Errorf("UID=%d send=%d recv=%d; want %d/%d", u.UID, send, recv, expected[u.UID], expected[u.UID])
+		got := u.GetSpeedLimit()
+		if got != expected[u.UID] {
+			t.Errorf("UID=%d limit=%d; want %d", u.UID, got, expected[u.UID])
 		}
 	}
 }
@@ -71,19 +72,19 @@ func TestRefreshAllSpeedLimitsOnNodeRateChange(t *testing.T) {
 
 	expected := map[int]int{1: 500, 2: 500}
 	for _, u := range c.author.ListUsers() {
-		send, _ := u.GetSpeedLimit()
-		if send != expected[u.UID] {
-			t.Errorf("UID=%d send=%d; want %d", u.UID, send, expected[u.UID])
+		got := u.GetSpeedLimit()
+		if got != expected[u.UID] {
+			t.Errorf("UID=%d limit=%d; want %d", u.UID, got, expected[u.UID])
 		}
 	}
 }
 
 func TestUserWaitNZeroLimiterIsNoop(t *testing.T) {
 	user := &User{}
-	user.SetSpeedLimit(0, 0)
+	user.SetSpeedLimit(0)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err := user.WaitN(ctx, 1<<20, 1<<20); err != nil {
+	if err := user.WaitN(ctx, 1<<20); err != nil {
 		t.Fatalf("WaitN with zero limit returned err: %v", err)
 	}
 }
@@ -92,13 +93,13 @@ func TestUserWaitNHonorsBurstChunking(t *testing.T) {
 	user := &User{}
 	// 1 MB/s rate, burst = 1 MB. Asking for 4 MB should chunk into 4
 	// burst-sized waits and complete in a few seconds.
-	user.SetSpeedLimit(1<<20, 1<<20)
+	user.SetSpeedLimit(1 << 20)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	if err := user.WaitN(ctx, 4<<20, 0); err != nil {
+	if err := user.WaitN(ctx, 4<<20); err != nil {
 		t.Fatalf("WaitN failed: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -106,6 +107,84 @@ func TestUserWaitNHonorsBurstChunking(t *testing.T) {
 	// 1 MB burst → ~3 s after the initial burst is consumed. Allow slack.
 	if elapsed < 2*time.Second || elapsed > 5*time.Second {
 		t.Errorf("WaitN(4MiB) elapsed=%v; expected ~3s", elapsed)
+	}
+}
+
+// TestSharedBucketAcrossDirections is the regression test for the
+// XrayR-vs-SingR semantic alignment in 0.3.0: a single bucket gates
+// up + down combined, not per-direction. With limit 1 MiB/s and burst
+// 1 MiB, drawing 1 MiB on "upload" then 1 MiB on "download" must take
+// ~1 second total — both directions consume from the same bucket.
+func TestSharedBucketAcrossDirections(t *testing.T) {
+	user := &User{}
+	user.SetSpeedLimit(1 << 20)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := user.WaitN(ctx, 1<<20); err != nil { // upload 1 MiB
+		t.Fatalf("first WaitN: %v", err)
+	}
+	if err := user.WaitN(ctx, 1<<20); err != nil { // download 1 MiB
+		t.Fatalf("second WaitN: %v", err)
+	}
+	elapsed := time.Since(start)
+	// One bucket: first WaitN drains the burst (instant), second WaitN
+	// must wait ~1 s for tokens to refill. With two independent buckets
+	// (the OLD behavior) this would complete in ~0 s and the test would
+	// fail.
+	if elapsed < 800*time.Millisecond {
+		t.Errorf("two-direction WaitN elapsed=%v; expected ≥ ~1s — bucket may not be shared", elapsed)
+	}
+}
+
+func TestDeviceLimitDisabledByDefault(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, SpeedLimit: 0, DeviceLimit: 2}}
+	c, _ := newSpeedLimitTestController(t, &api.NodeInfo{NodeID: 1, NodeType: C.TypeAnyTLS}, users)
+	c.config = &Config{} // EnableDeviceLimit defaults to false
+
+	if err := c.syncUserList(); err != nil {
+		t.Fatal(err)
+	}
+
+	users2 := c.author.ListUsers()
+	if len(users2) != 1 {
+		t.Fatalf("got %d users; want 1", len(users2))
+	}
+	if got := users2[0].GetIPLimit(); got != 0 {
+		t.Errorf("IPLimit=%d; want 0 (device limit must NOT be applied when EnableDeviceLimit=false)", got)
+	}
+	// And every AddIP call should succeed regardless of count.
+	for i := 0; i < 5; i++ {
+		ip := fmt.Sprintf("10.0.0.%d", i)
+		if !users2[0].AddIP(ip) {
+			t.Errorf("AddIP(%s) rejected with EnableDeviceLimit=false", ip)
+		}
+	}
+}
+
+func TestDeviceLimitEnforcedWhenEnabled(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, SpeedLimit: 0, DeviceLimit: 2}}
+	c, _ := newSpeedLimitTestController(t, &api.NodeInfo{NodeID: 1, NodeType: C.TypeAnyTLS}, users)
+	c.config = &Config{EnableDeviceLimit: true}
+
+	if err := c.syncUserList(); err != nil {
+		t.Fatal(err)
+	}
+
+	user := c.author.ListUsers()[0]
+	if got := user.GetIPLimit(); got != 2 {
+		t.Errorf("IPLimit=%d; want 2", got)
+	}
+	if !user.AddIP("10.0.0.1") {
+		t.Errorf("first IP rejected")
+	}
+	if !user.AddIP("10.0.0.2") {
+		t.Errorf("second IP rejected")
+	}
+	if user.AddIP("10.0.0.3") {
+		t.Errorf("third IP should be rejected (limit=2)")
 	}
 }
 

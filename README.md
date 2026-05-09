@@ -52,7 +52,7 @@ sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.3.0
+sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.3.1
 ```
 
 正式发布后，也可以直接拉取最新版本安装：

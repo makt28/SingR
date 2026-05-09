@@ -66,7 +66,7 @@ func (c *Controller) syncUserList() error {
 		}
 		c.author.SetUserProfile(hash, *u)
 		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
-		c.applyUserSpeedLimit(hash, u.SpeedLimit)
+		c.ApplyUserLimits(hash, *u)
 	}
 	for _, hash := range changed {
 		u, ok := nextMap[hash]
@@ -75,7 +75,7 @@ func (c *Controller) syncUserList() error {
 		}
 		c.author.SetUserProfile(hash, *u)
 		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
-		c.applyUserSpeedLimit(hash, u.SpeedLimit)
+		c.ApplyUserLimits(hash, *u)
 	}
 
 	if shouldRefreshRuntimeUsers {
@@ -173,21 +173,31 @@ func determineRate(nodeLimit, userLimit uint64) uint64 {
 	return userLimit
 }
 
-// applyUserSpeedLimit installs (or clears) the per-user limiter using
-// the XrayR `determineRate` rule. Called for added / changed users in
-// syncUserList and (via refreshAllSpeedLimits) when nodeInfo.SpeedLimit
-// changes.
-func (c *Controller) applyUserSpeedLimit(hash string, userLimit uint64) {
+// ApplyUserLimits installs (or clears) the per-user shared speed
+// limiter using the XrayR `determineRate` rule, and — only when the
+// operator opted in via Config.EnableDeviceLimit — the per-user device
+// limit. Called for added / changed users in syncUserList and (via
+// refreshAllSpeedLimits) when nodeInfo.SpeedLimit changes.
+//
+// Exported so end-to-end tests in sim/ can drive limit installation
+// without going through the full panel-sync loop.
+func (c *Controller) ApplyUserLimits(hash string, info api.UserInfo) {
 	nodeLimit := uint64(0)
 	if c.nodeInfo != nil {
 		nodeLimit = c.nodeInfo.SpeedLimit
 	}
-	c.author.SetUserSpeedLimit(hash, determineRate(nodeLimit, userLimit))
+	c.author.SetUserSpeedLimit(hash, determineRate(nodeLimit, info.SpeedLimit))
+
+	if c.config != nil && c.config.EnableDeviceLimit {
+		c.author.SetUserDeviceLimit(hash, info.DeviceLimit)
+	}
 }
 
 // refreshAllSpeedLimits recomputes every existing user's limiter against
 // the current nodeInfo.SpeedLimit. Cheap O(N) walk; only called from
-// nodeInfoMonitor when the node speed limit actually changed.
+// nodeInfoMonitor when the node speed limit actually changed. Device
+// limits are NOT refreshed here — they only change when the user
+// material itself changes, which goes through the syncUserList diff.
 func (c *Controller) refreshAllSpeedLimits() {
 	if c.usersMap == nil {
 		return
@@ -196,7 +206,7 @@ func (c *Controller) refreshAllSpeedLimits() {
 		if u == nil {
 			continue
 		}
-		c.applyUserSpeedLimit(hash, u.SpeedLimit)
+		c.ApplyUserLimits(hash, *u)
 	}
 }
 
