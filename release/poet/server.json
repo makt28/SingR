@@ -1,0 +1,80 @@
+{
+    "log": {
+        "disabled": false,
+        "level": "info",
+        "timestamp": true,
+        "output": "/var/log/singr.log"
+    },
+    "dns": {
+        "servers": [
+            {
+                "tag": "google",
+                "type": "udp",
+                "server": "8.8.8.8"
+            }
+        ],
+        "strategy": "prefer_ipv6"
+    },
+    "inbounds": [
+        {
+            "type": "anytls",
+            "tag": "anytls-in",
+            "listen": "::",
+            "listen_port": 0,
+            "users": [],
+            "tls": {
+                "enabled": true,
+                "server_name": "",
+                "certificate_path": "/etc/singr/certs/anytls.crt",
+                "key_path": "/etc/singr/certs/anytls.key"
+            }
+        },
+        {
+            "type": "hysteria2",
+            "tag": "hysteria2-in",
+            "listen": "::",
+            "listen_port": 0,
+            "users": [],
+            "up_mbps": 0,
+            "down_mbps": 0,
+            "ignore_client_bandwidth": false,
+            "tls": {
+                "enabled": true,
+                "server_name": "",
+                "certificate_path": "/etc/singr/certs/hysteria2.crt",
+                "key_path": "/etc/singr/certs/hysteria2.key"
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "anytls-out",
+            "domain_strategy": "prefer_ipv6"
+        },
+        {
+            "type": "direct",
+            "tag": "hysteria2-out",
+            "domain_strategy": "prefer_ipv6"
+        },
+        {
+            "type": "direct",
+            "tag": "direct",
+            "domain_strategy": "prefer_ipv6"
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "inbound": "anytls-in",
+                "outbound": "anytls-out"
+            },
+            {
+                "inbound": "hysteria2-in",
+                "outbound": "hysteria2-out"
+            }
+        ],
+        "final": "direct",
+        "auto_detect_interface": false
+    }
+}

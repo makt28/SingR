@@ -294,6 +294,9 @@ EOF
         if [[ -f "${SCRIPT_DIR}/server.json" ]]; then
             cp "${SCRIPT_DIR}/server.json" "${CONFIG_DIR}/server.json"
             log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
+        elif [[ -f "${PROJECT_DIR}/release/poet/server.json" ]]; then
+            cp "${PROJECT_DIR}/release/poet/server.json" "${CONFIG_DIR}/server.json"
+            log_info "已安装默认 sing-box 配置（anytls + hysteria2 超集）：${CONFIG_DIR}/server.json"
         elif [[ -f "${PROJECT_DIR}/release/poet/server_anytls.json" ]]; then
             cp "${PROJECT_DIR}/release/poet/server_anytls.json" "${CONFIG_DIR}/server.json"
             log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
@@ -329,12 +332,33 @@ EOF
         "certificate_path": "/etc/singr/certs/anytls.crt",
         "key_path": "/etc/singr/certs/anytls.key"
       }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-in",
+      "listen": "::",
+      "listen_port": 0,
+      "users": [],
+      "up_mbps": 0,
+      "down_mbps": 0,
+      "ignore_client_bandwidth": false,
+      "tls": {
+        "enabled": true,
+        "server_name": "",
+        "certificate_path": "/etc/singr/certs/hysteria2.crt",
+        "key_path": "/etc/singr/certs/hysteria2.key"
+      }
     }
   ],
   "outbounds": [
     {
       "type": "direct",
       "tag": "anytls-out",
+      "domain_strategy": "prefer_ipv6"
+    },
+    {
+      "type": "direct",
+      "tag": "hysteria2-out",
       "domain_strategy": "prefer_ipv6"
     },
     {
@@ -348,6 +372,10 @@ EOF
       {
         "inbound": "anytls-in",
         "outbound": "anytls-out"
+      },
+      {
+        "inbound": "hysteria2-in",
+        "outbound": "hysteria2-out"
       }
     ],
     "final": "direct",
@@ -355,7 +383,7 @@ EOF
   }
 }
 EOF
-            log_info "已生成默认 sing-box 配置：${CONFIG_DIR}/server.json"
+            log_info "已生成默认 sing-box 配置（anytls + hysteria2 超集）：${CONFIG_DIR}/server.json"
         fi
     else
         log_warn "保留已有 sing-box 配置：${CONFIG_DIR}/server.json"
