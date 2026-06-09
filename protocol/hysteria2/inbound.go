@@ -94,12 +94,22 @@ func buildComponents(ctx context.Context, logger log.ContextLogger, options opti
 	}
 	var salamanderPassword string
 	if options.Obfs != nil {
-		if options.Obfs.Password == "" {
-			return nil, nil, nil, E.New("missing obfs password")
-		}
 		switch options.Obfs.Type {
 		case hysteria2.ObfsTypeSalamander:
+			// SingR divergence from upstream (which errors on an empty obfs
+			// password): an empty password falls back to the TLS SNI
+			// (server_name). The panel delivers the SNI via host=, so this
+			// lets SSPanel effectively drive the node-wide-shared obfs secret
+			// without a dedicated field. An explicit password wins. Clients
+			// must use the same value as their obfs password.
+			//
+			// Note: because obfs is rebuilt with the service, the SNI-derived
+			// password follows an SNI hot-reload; an explicit password stays
+			// fixed.
 			salamanderPassword = options.Obfs.Password
+			if salamanderPassword == "" && options.TLS != nil {
+				salamanderPassword = options.TLS.ServerName
+			}
 		default:
 			return nil, nil, nil, E.New("unknown obfs type: ", options.Obfs.Type)
 		}

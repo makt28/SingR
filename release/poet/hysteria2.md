@@ -47,26 +47,35 @@ certificate that covers it:
 Unlike AnyTLS, hysteria2 requires TLS. If you use a self-signed certificate,
 clients must trust it or enable insecure verification.
 
-## obfs (optional, anti-DPI)
+## obfs (anti-DPI, on by default via SNI)
 
 `obfs` (salamander) scrambles UDP packets so the traffic does not look like
-plain QUIC. It is **off by default**. The obfs password is a single
-node-wide shared secret (NOT per-user), so the panel cannot deliver it.
-
-If you need it, set the same password on both ends. A convenient trick is to
-reuse the SNI as the obfs password (the panel already delivers `host`):
+plain QUIC. The obfs password is a single node-wide shared secret (NOT
+per-user). The default template ships the obfs block with an **empty
+password**:
 
 ```json
-"obfs": {
-  "type": "salamander",
-  "password": "xxxx.com"
-}
+"obfs": { "type": "salamander", "password": "" }
 ```
 
-and have the subscription template emit
-`obfs=salamander&obfs-password=xxxx.com`. Note this is weaker obfuscation
-than a random secret. Leave obfs off unless your network actively
-fingerprints/blocks QUIC.
+Rule (SingR-specific):
+
+- **empty `password` → falls back to the TLS SNI** (`server_name`, i.e. the
+  panel's `host=`). This lets SSPanel "deliver" the shared obfs secret for
+  free via the SNI it already sends.
+- **non-empty `password` → that value is used verbatim.**
+- **remove the whole `obfs` block → obfs disabled.** (An empty password is
+  "on, using SNI", not "off".)
+
+Because obfs is rebuilt together with the QUIC service, the SNI-derived
+password follows an SNI hot-reload; an explicit password stays fixed.
+
+> Once obfs is on, **every client must use the same obfs** or it cannot
+> connect at all (an obfs mismatch is a total failure, not a downgrade).
+> The subscription template must emit
+> `obfs=salamander&obfs-password=<sni-or-your-value>`. SNI-as-obfs is weaker
+> than a random secret; for stronger obfuscation set an explicit random
+> password on both ends (but then the panel can't help deliver it).
 
 ## Bandwidth
 

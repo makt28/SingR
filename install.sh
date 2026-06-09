@@ -342,6 +342,10 @@ EOF
       "up_mbps": 0,
       "down_mbps": 0,
       "ignore_client_bandwidth": false,
+      "obfs": {
+        "type": "salamander",
+        "password": ""
+      },
       "tls": {
         "enabled": true,
         "server_name": "",
