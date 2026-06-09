@@ -16,6 +16,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	POET "github.com/sagernet/sing-box/poet"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -122,11 +123,54 @@ func readConfigAndMerge() (option.Options, error) {
 	return mergedOptions, nil
 }
 
+// filterInboundsByPanel keeps only the inbounds referenced by a node's
+// InTag in the poet panel config (-p). This lets a single static
+// server.json carry a superset of inbounds (e.g. both anytls and
+// hysteria2) while only the protocols actually present in panel.json are
+// instantiated — the unused ones are never created, so they need no
+// certificate and bind no port.
+//
+// SingR-specific behavior (not in upstream sing-box): be careful on
+// resync. It is best-effort and gated on -p being set:
+//   - no -p           → no filtering (vanilla sing-box behavior).
+//   - panel unreadable → keep all inbounds; POET.Start surfaces the error.
+//   - panel has no usable InTag → keep all inbounds.
+//   - otherwise        → drop inbounds whose tag is not referenced. If
+//     that leaves zero, POET.Start fails with "no Node with InTag found",
+//     which is the correct signal that server.json and panel.json disagree.
+func filterInboundsByPanel(options option.Options) option.Options {
+	if poetConfigPath == "" {
+		return options
+	}
+	panelConfig, err := POET.LoadPanelConfig(poetConfigPath)
+	if err != nil || panelConfig == nil {
+		return options
+	}
+	wanted := make(map[string]bool)
+	for _, node := range panelConfig.NodesConfig {
+		if node != nil && node.InTag != "" {
+			wanted[node.InTag] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return options
+	}
+	filtered := make([]option.Inbound, 0, len(options.Inbounds))
+	for _, inbound := range options.Inbounds {
+		if wanted[inbound.Tag] {
+			filtered = append(filtered, inbound)
+		}
+	}
+	options.Inbounds = filtered
+	return options
+}
+
 func create() (*box.Box, context.CancelFunc, error) {
 	options, err := readConfigAndMerge()
 	if err != nil {
 		return nil, nil, err
 	}
+	options = filterInboundsByPanel(options)
 	if disableColor {
 		if options.Log == nil {
 			options.Log = &option.LogOptions{}

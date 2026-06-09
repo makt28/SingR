@@ -2,30 +2,47 @@
 
 SingR 是基于 sing-box 的 SSPanel 后端，面向旧版 SSPanel `/mod_mu` 接口。
 
-它的主要用途是：在 SSPanel 里继续把节点配置成 `V2ray`，但当节点地址使用旧格式 WebSocket 并带有 `path=/anytls` 时，SingR 会把这个节点作为 sing-box `anytls` 入站运行。
+它的主要用途是：在 SSPanel 里继续把节点配置成 `V2ray`，但通过节点地址里的 `path` 别名，把节点作为 sing-box 的 **AnyTLS** 或 **Hysteria2** 入站运行：
+
+- `path=/anytls` → AnyTLS 入站（TCP）
+- `path=/hy2` → Hysteria2 入站（QUIC/UDP）
+
+两种协议共用同一套用户同步、流量上报、限速、审计逻辑；面板侧两种节点除了 `path` 和 `intag`/`outtag` 之外没有区别（节点类型都保持 `V2ray`）。
 
 ## 工作方式
 
-SSPanel 节点地址示例：
+SSPanel 节点地址示例（AnyTLS）：
 
 ```text
 sa.example.com;14555;0;ws;;path=/anytls|host=example.com|relay_server=relay.example.com|relay_port=42132
+```
+
+Hysteria2 只需把 `path` 换成 `hy2`：
+
+```text
+sa.example.com;14555;0;ws;;path=/hy2|host=example.com
 ```
 
 SingR 会按旧 SSPanel V2ray 格式解析：
 
 - `14555` 作为监听端口。
 - `ws` 表示旧版 WebSocket 传输模式。
-- `path=/anytls` 或 `path=anytls` 会触发 AnyTLS 兼容模式。
-- `host=example.com` 会作为 AnyTLS TLS `server_name`。
+- `path=/anytls`（或 `anytls`）触发 AnyTLS 兼容模式；`path=/hy2`（或 `hy2`）触发 Hysteria2 兼容模式。
+- `host=example.com` 会作为 TLS `server_name`。
 - `relay_server` 和 `relay_port` 会被解析保存，但当前不会自动生成 relay 出站或路由。
 
-触发 AnyTLS 兼容模式后：
+触发兼容模式后：
 
 - 面板节点类型仍可保持为 `V2ray`。
-- SingR 内部有效节点类型会变为 `anytls`。
+- SingR 内部有效节点类型会变为 `anytls` 或 `hysteria2`。
 - 用户认证密码优先使用 SSPanel 用户的 `uuid`，为空时才回退到 `passwd`。
-- 流量和在线 IP 仍会上报到旧 SSPanel `/mod_mu` 接口。
+- 用户运行时名固定为 `u<用户ID>`；流量和在线 IP 仍会上报到旧 SSPanel `/mod_mu` 接口。
+
+### 一份 server.json 同时支持两种协议
+
+默认的 `/etc/singr/server.json` 是一个**超集**，同时声明了 `anytls-in` 和 `hysteria2-in` 两个入站。启动时 SingR 只会真正创建 **`panel.json` 里被引用到的那些入站**（按 `intag` 过滤），没用到的协议入站根本不会创建，也就不需要证书、不占端口。
+
+也就是说：**切换 / 增加协议只改 `panel.json`，不用动 `server.json`**。`panel.json` 里有 AnyTLS 节点就起 AnyTLS，有 Hysteria2 节点就起 Hysteria2，两个都有就都起（多节点共存，见下）。
 
 ## 环境要求
 
@@ -101,8 +118,10 @@ sudo mkdir -p /etc/singr/certs /var/log
 
 ```sh
 sudo cp release/poet/panel_anytls.json /etc/singr/panel.json
-sudo cp release/poet/server_anytls.json /etc/singr/server.json
+sudo cp release/poet/server.json /etc/singr/server.json
 ```
+
+`release/poet/server.json` 是 anytls + hysteria2 的超集；`panel.json` 决定实际启用哪个（见上文「一份 server.json 同时支持两种协议」）。只想跑 anytls 的话，`panel_anytls.json` 即可；要跑 hysteria2 用 `panel_hysteria2.json`。
 
 ## 配置 SSPanel 节点
 
@@ -153,18 +172,42 @@ sa.example.com;14555;0;ws;;path=/anytls|host=example.com|relay_server=relay.exam
 字段说明：
 
 - `paneltype`：旧 SSPanel 使用 `SSpanel`。
-- `intag`：必须和 sing-box 主配置里的入站 `tag` 一致。
+- `intag`：必须和 sing-box 主配置里的入站 `tag` 一致（AnyTLS 用 `anytls-in`，Hysteria2 用 `hysteria2-in`）。
 - `outtag`：对应路由使用的出站 `tag`。
 - `apihost`：SSPanel 地址，不要以 `/mod_mu` 结尾。
 - `apikey`：面板 API Key。
 - `nodeid`：SSPanel 节点 ID。
-- `nodetype`：保持为 `V2ray`。
+- `nodetype`：保持为 `V2ray`（AnyTLS / Hysteria2 都是）。
+
+Hysteria2 节点只是把 `intag`/`outtag` 换成 `hysteria2-in`/`hysteria2-out`，其余字段一样（`nodeid` 当然是各自面板节点的 ID）。
+
+### 多节点 / 多协议共存
+
+`nodes` 是数组，一个 SingR 进程可以同时跑多个节点，甚至混协议。例如同机同时跑一个 AnyTLS 和一个 Hysteria2 节点：
+
+```json
+{
+  "name": "singr",
+  "nodes": [
+    {
+      "paneltype": "SSpanel", "intag": "anytls-in", "outtag": "anytls-out",
+      "apiconfig": { "apihost": "https://panel.example.com", "apikey": "key", "nodeid": 1, "nodetype": "V2ray", "disablecustomconfig": true }
+    },
+    {
+      "paneltype": "SSpanel", "intag": "hysteria2-in", "outtag": "hysteria2-out",
+      "apiconfig": { "apihost": "https://panel.example.com", "apikey": "key", "nodeid": 2, "nodetype": "V2ray", "disablecustomconfig": true }
+    }
+  ]
+}
+```
+
+注意：**`nodes` 里的每个节点都必须是面板上真实存在、能拉取到信息的节点**。只要有任意一个节点拉取失败，整个进程会退出。所以默认只放你实际在用的节点，要加再加。
 
 SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`，兼容 XrayR v0.9.0 的旧接口行为。
 
 ## 配置 sing-box 入站
 
-编辑 `/etc/singr/server.json`。AnyTLS 模式下必须提前声明一个 `anytls` 入站，`tag` 要和 `panel.json` 的 `intag` 一致：
+默认的 `/etc/singr/server.json` 是 **anytls + hysteria2 超集**，两个入站都声明好，`tag` 分别是 `anytls-in` / `hysteria2-in`，和 `panel.json` 的 `intag` 对应。**实际只创建被 `panel.json` 引用到的入站**，没用到的那个不会创建、不需要证书、不占端口：
 
 ```json
 {
@@ -193,6 +236,22 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
         "certificate_path": "/etc/singr/certs/anytls.crt",
         "key_path": "/etc/singr/certs/anytls.key"
       }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-in",
+      "listen": "::",
+      "listen_port": 0,
+      "users": [],
+      "up_mbps": 0,
+      "down_mbps": 0,
+      "ignore_client_bandwidth": false,
+      "tls": {
+        "enabled": true,
+        "server_name": "",
+        "certificate_path": "/etc/singr/certs/hysteria2.crt",
+        "key_path": "/etc/singr/certs/hysteria2.key"
+      }
     }
   ],
   "outbounds": [
@@ -203,16 +262,19 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
     },
     {
       "type": "direct",
+      "tag": "hysteria2-out",
+      "domain_strategy": "prefer_ipv6"
+    },
+    {
+      "type": "direct",
       "tag": "direct",
       "domain_strategy": "prefer_ipv6"
     }
   ],
   "route": {
     "rules": [
-      {
-        "inbound": "anytls-in",
-        "outbound": "anytls-out"
-      }
+      { "inbound": "anytls-in", "outbound": "anytls-out" },
+      { "inbound": "hysteria2-in", "outbound": "hysteria2-out" }
     ],
     "final": "direct",
     "auto_detect_interface": false
@@ -220,7 +282,9 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 }
 ```
 
-启动时，如果面板节点被识别为 AnyTLS 兼容模式：
+> 这个「只创建被引用的入站」是 SingR 行为，要带 `-p`（panel 配置）才生效；不带 `-p` 就是原版 sing-box，所有入站都创建。如果 `panel.json` 引用了 `server.json` 里不存在的 `intag`，那个节点会被跳过，全部跳过则进程报错退出。
+
+启动时，如果面板节点被识别为 AnyTLS / Hysteria2 兼容模式：
 
 - 如果 SSPanel 节点地址里解析到有效端口，`listen_port` 会被该端口覆盖。
 - 如果 SSPanel 节点地址里存在非空 `host=`，`tls.server_name` 会被该值覆盖。
@@ -228,13 +292,44 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 
 也就是说，本地 JSON 可以先写默认值；只有面板对应字段非空、有效时才会替换本地值。
 
-从 0.2.5 起，面板的 `port` 和 `host=` 改动支持运行中热更新：监听端口变化时会先在新端口起 listener、成功后才关掉旧端口（失败自动回滚保留旧 listener）；SNI 变化只重建 TLS、不重启 listener。日志里会出现 `anytls listener hot-reloaded to port ...` 或 `anytls TLS hot-reloaded with SNI ...`。**证书材料、入站类型、路由规则仍然不会被热更新**。
+从 0.2.5 起，面板的 `port` 和 `host=` 改动支持运行中热更新。
+
+- AnyTLS：端口变化时先在新端口起 listener、成功后才关旧端口（失败自动回滚）；SNI 变化只重建 TLS、不重启 listener。日志 `anytls listener hot-reloaded to port ...` / `anytls TLS hot-reloaded with SNI ...`。
+- Hysteria2：因为 TLS 焊在 QUIC service 里，端口/SNI 变化会**重建整个 service**并把当前用户表重新灌进去（端口变化先起新后关旧；同端口仅 SNI 变化要先关旧再起新，有极短重启窗口）。日志 `hysteria2 listener hot-reloaded to port ...` / `hysteria2 TLS hot-reloaded with SNI ...`。
+
+**两种协议的证书材料、入站类型、路由规则、obfs/带宽/masquerade 都不会被热更新。**
 
 ### 出口 IPv6
 
 默认配置里的 `direct` 出站都设了 `domain_strategy: prefer_ipv6`，并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
 
 `auto_detect_interface` 在服务器端建议保持 `false`，它是给 client/TUN 场景用的；开着会把 outbound socket 强行绑到默认网卡，并在某些 IPv6-only 目的地下失效。
+
+## Hysteria2 专属说明
+
+Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发不了，只能写在本地 `server.json`：
+
+- **必须 TLS**。Hysteria2 没有明文模式，证书放在 `hysteria2-in` 的 `tls` 里。自签证书时客户端要开允许不安全。
+- **obfs（抗 DPI，默认开启，用 SNI 当密码）**。它把 UDP 包打乱让流量不像裸 QUIC，密码是**全节点共享的一个值**（不是 per-user）。默认模板里 obfs 块就写好了，`password` 留空：
+
+  ```json
+  "obfs": { "type": "salamander", "password": "" }
+  ```
+
+  规则:**`password` 留空 → 自动用 TLS SNI(`server_name`,即面板下发的 `host=`)当 obfs 密码;写了具体值 → 用写的那个。** 这样 SSPanel 不用额外字段也能"顺带"下发 obfs 密码。
+
+  ⚠️ **obfs 开着,所有客户端就必须带相同 obfs**,否则连不上(obfs 不匹配 = 彻底连不上,不是降级)。订阅里要同步带 `obfs=salamander&obfs-password=<SNI 或你写的值>`。**完全不想用 obfs,就把整个 `obfs` 块删掉**(删掉才是关闭;留着空密码是"用 SNI 开启")。
+- **带宽 `up_mbps` / `down_mbps`**：`0` = 不限 / 让客户端自报（走 BBR 或 Brutal）。面板的 `node_speedlimit` 仍然独立生效（每用户限速叠加在 Hysteria2 自身拥塞控制之上）。
+- **端口跳跃（可选，纯运维，代码不管）**。Hysteria2 进程只绑 1 个 UDP 端口；端口跳跃是用防火墙把一段端口 NAT 到真实端口实现的：
+
+  ```sh
+  iptables  -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
+  ip6tables -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
+  ```
+
+  `<真实端口>` 就是面板下发的那个监听端口。然后订阅地址写成区间，例如 `hysteria2://<uuid>@host:40000-60000/?sni=...`。范围别和真实端口或其它服务冲突；如果前面已有中转（如 nyanpass）在做端口跳跃，就别在落地再加这条 NAT，让跳跃只由一层负责。
+
+更详细的部署示例见 [release/poet/hysteria2.md](release/poet/hysteria2.md)。
 
 ## 准备 TLS 证书
 
@@ -247,6 +342,8 @@ sudo chmod 600 /etc/singr/certs/anytls.key
 ```
 
 证书应覆盖 SSPanel 节点地址中的 `host=` 值。没有可信证书时可以临时使用自签证书，但客户端必须允许不安全证书或信任该证书。
+
+Hysteria2 节点同理，证书放到 `hysteria2-in` 配置里指定的路径（默认 `/etc/singr/certs/hysteria2.crt` / `.key`）。两个协议可以指向同一张证书，只要它覆盖各自的 SNI。
 
 ## 启动
 
@@ -327,13 +424,15 @@ Environment="all_proxy="
 
 ## 客户端配置要点
 
-AnyTLS 客户端需要：
+AnyTLS / Hysteria2 客户端都需要：
 
 - 服务器地址：你的节点域名。
-- 端口：SSPanel 节点地址中的端口。
+- 端口：SSPanel 节点地址中的端口（Hysteria2 开了端口跳跃则填区间，如 `40000-60000`）。
 - SNI：SSPanel 节点地址中的 `host=` 值；没有 `host=` 时使用本地 `server.json` 的 `tls.server_name`。
 - 密码：SSPanel 用户的 `uuid`。
 - TLS：生产环境使用可信证书；自签证书测试时开启允许不安全证书。
+
+Hysteria2 额外：协议选 `hysteria2`；**默认服务端开着 obfs(用 SNI 当密码)**,客户端必须填 `obfs=salamander` + `obfs-password=<SNI 值>`(或服务端写死的那个值),否则连不上;带宽(up/down)由客户端自填,不影响连通。
 
 ## 用户同步和上报
 
@@ -345,21 +444,21 @@ u<用户ID>
 
 例如用户 ID `40493` 会显示为 `u40493`。
 
-已支持：
+已支持（AnyTLS 和 Hysteria2 共用同一套逻辑）：
 
-- 新增和删除用户热更新。删除用户前会先把累计流量上报到面板；上报失败会保留用户与字节，下一轮重试，避免计费丢失。
+- 新增和删除用户热更新（增量）。删除用户前会先把累计流量上报到面板。
 - 已有用户的 UUID/password 变化热更新。
-- 节点 `port` / TLS SNI (`host=`) 运行中热更新（先起新 listener 再关老 listener，失败回滚）。
+- 节点 `port` / TLS SNI (`host=`) 运行中热更新（AnyTLS 换 listener；Hysteria2 重建 QUIC service 并回灌用户表）。
 - 流量上报到 `/mod_mu/users/traffic?node_id=<nodeid>`。
 - 在线 IP 上报到 `/mod_mu/users/aliveip?node_id=<nodeid>`。
+- 多节点 / 多协议共存（`panel.json` 的 `nodes` 数组）。
+- `server.json` 写成 anytls + hysteria2 超集，按 `panel.json` 引用的 `intag` 只创建需要的入站。
 
 当前未完整接管：
 
-- 节点和用户限速只解析，当前未接入完整限速路径。
-- 设备数限制字段会解析，但连接准入路径仍需按部署重新确认。
 - `relay_server` 和 `relay_port` 不会自动创建出站和路由。
-- 不会从面板动态创建缺失的入站；主配置必须先声明对应 `intag` 的入站。
-- 不支持运行中热切换入站类型；TLS 证书材料也仍然只在启动时加载。
+- 不会从面板动态创建缺失的入站；`server.json` 必须先声明对应 `intag` 的入站（超集默认已含 anytls/hysteria2 两个）。
+- 不支持运行中热切换入站类型；TLS 证书材料、obfs、带宽、masquerade、端口跳跃 NAT 也仍然只在启动 / 运维时配置，不随面板热更新。
 
 ## 测试
 
@@ -382,10 +481,11 @@ SINGR_SSPANEL_CONFIG=/etc/singr/panel.json \
 
 检查：
 
-- SSPanel 节点地址是否包含 `ws` 和 `path=/anytls`。
-- `/etc/singr/server.json` 是否声明了 `type: "anytls"` 的入站。
-- 入站 `tag` 是否等于 `/etc/singr/panel.json` 里的 `intag`。
-- 0.2.5 起 port/SNI 支持热更新，但首次启动仍需要面板返回有效 `port`；如果日志里有 `invalid anytls listen port from panel` 说明面板返回了 0 或越界值。
+- SSPanel 节点地址是否包含 `ws` 和 `path=/anytls`（或 `path=/hy2`）。
+- `/etc/singr/server.json` 是否声明了对应的入站（`type: "anytls"` 或 `type: "hysteria2"`）。
+- 入站 `tag` 是否等于 `/etc/singr/panel.json` 里的 `intag`（超集模式下：`panel.json` 没引用的入站不会创建，这是预期行为）。
+- 首次启动需要面板返回有效 `port`；日志里 `invalid anytls listen port from panel` / `invalid hysteria2 listen port from panel` 说明面板返回了 0 或越界值。
+- Hysteria2 是 UDP,用 `ss -lunp | grep singr`(注意是 `-u`)查监听;端口跳跃只是 NAT,进程仍只绑那个真实端口。
 
 ### 节点出口没有 IPv6
 

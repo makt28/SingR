@@ -73,6 +73,18 @@ func getConfig(cfgFile string) *viper.Viper {
 }
 
 // 服务开始
+// LoadPanelConfig reads and parses a poet panel config file. Exported so
+// the sing-box run command can inspect the referenced inbound tags before
+// constructing the box (see filterInboundsByPanel in cmd_run.go).
+func LoadPanelConfig(cfgFile string) (*panel.Config, error) {
+	config := getConfig(cfgFile)
+	panelConfig := &panel.Config{}
+	if err := config.Unmarshal(panelConfig); err != nil {
+		return nil, fmt.Errorf("parse config file %v failed: %s ", cfgFile, err)
+	}
+	return panelConfig, nil
+}
+
 func Start() error {
 	ShowVersion()
 
@@ -82,10 +94,9 @@ func Start() error {
 		os.Exit(1)
 	}
 
-	config := getConfig(cc.(string))
-	panelConfig := &panel.Config{}
-	if err := config.Unmarshal(panelConfig); err != nil {
-		return fmt.Errorf("parse config file %v failed: %s ", cc, err)
+	panelConfig, err := LoadPanelConfig(cc.(string))
+	if err != nil {
+		return err
 	}
 
 	p := panel.NewPanel(panelConfig)

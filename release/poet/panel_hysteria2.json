@@ -1,0 +1,17 @@
+{
+    "name": "connect old sspanel v2ray node and run it as hysteria2",
+    "nodes": [
+        {
+            "paneltype": "SSpanel",
+            "intag": "hysteria2-in",
+            "outtag": "hysteria2-out",
+            "apiconfig": {
+                "apihost": "https://your-sspanel.example.com",
+                "apikey": "your-apikey",
+                "nodeid": 1,
+                "nodetype": "V2ray",
+                "disablecustomconfig": true
+            }
+        }
+    ]
+}

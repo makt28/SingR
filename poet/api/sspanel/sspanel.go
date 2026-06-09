@@ -162,6 +162,13 @@ func isAnyTLSAlias(transportProtocol, path string) bool {
 	return strings.EqualFold(strings.TrimSpace(transportProtocol), "ws") && normalizeAnyTLSPath(path) == "anytls"
 }
 
+// isHysteria2Alias detects a panel-side vmess/ws node whose path is "hy2",
+// used to drive a hysteria2 inbound through SSPanel (which has no native
+// hysteria2 node type). Mirrors the AnyTLS alias trick.
+func isHysteria2Alias(transportProtocol, path string) bool {
+	return strings.EqualFold(strings.TrimSpace(transportProtocol), "ws") && normalizeAnyTLSPath(path) == "hy2"
+}
+
 // GetNodeInfo will pull NodeInfo Config from ssPanel
 func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	path := fmt.Sprintf("/mod_mu/nodes/%d/info", c.NodeID)
@@ -510,6 +517,9 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 	if isAnyTLSAlias(transportProtocol, path) {
 		nodeType = "anytls"
 		effectiveTransport = "tcp"
+	} else if isHysteria2Alias(transportProtocol, path) {
+		nodeType = "hysteria2"
+		effectiveTransport = "udp"
 	}
 
 	trafficRate := float64(1)
@@ -836,6 +846,9 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		if isAnyTLSAlias(transportProtocol, nodeConfig.Path) {
 			nodeType = "anytls"
 			transportProtocol = "tcp"
+		} else if isHysteria2Alias(transportProtocol, nodeConfig.Path) {
+			nodeType = "hysteria2"
+			transportProtocol = "udp"
 		}
 	case "trojan":
 		enableTLS = true
