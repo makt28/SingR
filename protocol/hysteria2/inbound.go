@@ -2,13 +2,10 @@ package hysteria2
 
 import (
 	"context"
-	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -66,11 +63,13 @@ type Inbound struct {
 	// options is the current effective option set (guarded by reloadMu).
 	options option.Hysteria2InboundOptions
 
-	// listener/tlsConfig/service are the live components. They are swapped
-	// under reloadMu during a hot reload. service is additionally guarded by
-	// usersMu so the panel user-refresh path always sees a consistent
-	// pointer when applying deltas.
-	listener  *listener.Listener
+	// listener/tlsConfig/service are the live components, swapped under
+	// reloadMu during a hot reload. `listener` is an atomic value because the
+	// connection accept path (NewConnectionEx / NewPacketConnectionEx) reads
+	// it locklessly while a reload may be replacing it. `service` is
+	// additionally guarded by usersMu so the panel user-refresh path always
+	// sees a consistent pointer when applying deltas.
+	listener  atomic.TypedValue[*listener.Listener]
 	tlsConfig tls.ServerConfig
 	service   *hysteria2.Service[string]
 
@@ -203,7 +202,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	h.tlsConfig = tlsConfig
-	h.listener = lis
+	h.listener.Store(lis)
 	h.service = service
 
 	// Seed any users defined statically in the config file (SingR normally
@@ -284,20 +283,28 @@ func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 
 	// Pre-Start: just stash; Start will bring the components up.
 	if !h.started.Load() {
-		oldTLS, oldListener := h.tlsConfig, h.listener
+		oldTLS, oldListener := h.tlsConfig, h.listener.Load()
 		h.usersMu.Lock()
 		h.applyUsersLocked(newService)
 		h.service = newService
 		h.usersMu.Unlock()
 		h.tlsConfig = newTLS
-		h.listener = newListener
+		h.listener.Store(newListener)
 		h.options = newOpts
 		_ = common.Close(oldListener, oldTLS)
 		return nil
 	}
 
 	// Post-Start live rebuild.
-	oldTLS, oldListener, oldService := h.tlsConfig, h.listener, h.service
+	oldTLS, oldListener, oldService := h.tlsConfig, h.listener.Load(), h.service
+
+	// Fill the new service with the current users BEFORE starting it, so it
+	// never serves on a live port with an empty user table (which would fail
+	// all auth during the rebuild window — for an SNI-only change the old
+	// service is closed first, so that window has no fallback).
+	h.usersMu.Lock()
+	h.applyUsersLocked(newService)
+	h.usersMu.Unlock()
 
 	if !portChanged {
 		// Same UDP port: free it before binding the new listener.
@@ -315,12 +322,15 @@ func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 		return E.Cause(err, "start reloaded hysteria2 listener on port ", newOpts.ListenPort)
 	}
 
+	// Re-apply under lock to absorb any user delta that landed during the
+	// build/start window, and swap the live service in the same critical
+	// section so subsequent panel user ops hit newService.
 	h.usersMu.Lock()
 	h.applyUsersLocked(newService)
 	h.service = newService
 	h.usersMu.Unlock()
 	h.tlsConfig = newTLS
-	h.listener = newListener
+	h.listener.Store(newListener)
 	h.options = newOpts
 
 	if portChanged {
@@ -368,7 +378,7 @@ func closeComponents(tlsConfig tls.ServerConfig, lis *listener.Listener, service
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
-	lis := h.listener
+	lis := h.listener.Load()
 	var metadata adapter.InboundContext
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
@@ -389,7 +399,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 
 func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
-	lis := h.listener
+	lis := h.listener.Load()
 	var metadata adapter.InboundContext
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
@@ -414,7 +424,7 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 	}
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
-	if err := startComponents(h.tlsConfig, h.listener, h.service); err != nil {
+	if err := startComponents(h.tlsConfig, h.listener.Load(), h.service); err != nil {
 		return err
 	}
 	h.started.Store(true)
@@ -424,18 +434,5 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 func (h *Inbound) Close() error {
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
-	return closeComponents(h.tlsConfig, h.listener, h.service)
-}
-
-// isExpectedHysteria2HandshakeFailure classifies pre-auth QUIC/TLS noise so
-// it can be logged at debug instead of error. Some relay/probe paths open a
-// connection that never completes the hysteria2 auth; that is not a server
-// fault. Real post-auth errors still surface at error from the service.
-func isExpectedHysteria2HandshakeFailure(err error) bool {
-	if errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) || E.IsClosedOrCanceled(err) {
-		return true
-	}
-	message := err.Error()
-	return strings.Contains(message, "first record does not look like a TLS handshake") ||
-		strings.Contains(message, "no recent network activity")
+	return closeComponents(h.tlsConfig, h.listener.Load(), h.service)
 }
