@@ -238,6 +238,13 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	// Hold reloadMu so a concurrent ConfigureFromPanelNode (the panel
+	// monitor goroutine starts before the box brings inbounds up) cannot
+	// take the pre-Start path and swap listener/tlsConfig out from under
+	// us mid-Start. Mirrors the hysteria2 inbound, whose Start does the
+	// same.
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
 	if h.tlsConfig != nil {
 		err := h.tlsConfig.Start()
 		if err != nil {

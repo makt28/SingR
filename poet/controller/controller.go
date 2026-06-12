@@ -55,6 +55,18 @@ type Controller struct {
 	detectDedup    map[detectKey]time.Time
 	detectGetWarns int
 
+	// reloadPending is set when ConfigureFromPanelNode fails so the next
+	// nodeInfoMonitor tick retries even if the panel answers 304
+	// NodeNotModified. Without it a transient reload failure (port
+	// briefly occupied, UDP socket not yet released) would never be
+	// retried — the `nodeInfoChanged` gate stays false under 304s — and
+	// an inbound stuck on stale config (or fully down, for hysteria2's
+	// SNI-only rebuild which closes the old service before starting the
+	// new one) would stay that way until the panel data happens to
+	// change. Only touched from the nodeInfoMonitor goroutine; no lock
+	// needed.
+	reloadPending bool
+
 	// environment = development testing staging production
 	env string
 }
@@ -268,13 +280,20 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	// it doesn't dominate logs.
 	c.refreshDetectRules()
 
-	// If nodeInfo changed, ask the inbound to hot-reload its panel-derived
-	// settings (port, SNI). The inbound is responsible for diffing and
-	// no-op'ing if nothing actually changed.
-	if nodeInfoChanged {
+	// If nodeInfo changed — or a previous reload attempt failed — ask the
+	// inbound to hot-reload its panel-derived settings (port, SNI). The
+	// inbound is responsible for diffing and no-op'ing if nothing actually
+	// changed. A failed reload leaves the inbound's own options
+	// uncommitted, so retrying with the same nodeInfo re-detects the diff
+	// and re-attempts the swap; reloadPending keeps that retry alive
+	// across 304 NodeNotModified cycles.
+	if nodeInfoChanged || c.reloadPending {
 		if configurable, ok := (*c.inbound).(adapter.PStartupConfigurableInbound); ok {
 			if err := configurable.ConfigureFromPanelNode(c.nodeInfo); err != nil {
-				c.log(fmt.Sprintf("nodeInfoMonitor>>ConfigureFromPanelNode %v", err), "error")
+				c.reloadPending = true
+				c.log(fmt.Sprintf("nodeInfoMonitor>>ConfigureFromPanelNode %v (will retry next cycle)", err), "error")
+			} else {
+				c.reloadPending = false
 			}
 		}
 	}
