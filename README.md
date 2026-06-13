@@ -54,29 +54,31 @@ SingR 会按旧 SSPanel V2ray 格式解析：
 
 ## 编译安装
 
-也可以使用安装脚本：
+也可以使用安装脚本（脚本要求 root 运行，下面命令均假设已是 root；非 root 请自行加 `sudo`）：
 
 ```sh
-sudo bash install.sh
+bash install.sh
 ```
 
 脚本会优先使用当前源码目录下已编译好的 `sing-box`，没有二进制时会尝试从源码编译。也可以显式指定二进制：
 
 ```sh
-sudo env SINGR_BINARY=/path/to/sing-box bash install.sh
+env SINGR_BINARY=/path/to/sing-box bash install.sh
 ```
 
 如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
 
 ```sh
-sudo env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.3.1
+env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.3.1
 ```
 
 正式发布后，也可以直接拉取最新版本安装：
 
 ```sh
-sudo bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
 ```
+
+> Release 同时提供 `SingR-linux-<arch>.tar.gz` 和 `.zip`；安装脚本优先下载 `tar.gz`（保留可执行权限、不依赖 `unzip`）。脚本还会安装 `vim` 和 `iptables`（v4/v6 同包，供 Hysteria2 端口跳跃管理使用）。
 
 脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
 
@@ -91,7 +93,10 @@ singr status
 singr log
 singr update
 singr restart
+singr porthop      # Hysteria2 端口跳跃管理（增/删/查跳跃规则）
 ```
+
+管理菜单里对应的是第 13 项「Hysteria2 端口跳跃管理」。
 
 手动编译安装方式如下。
 
@@ -105,20 +110,20 @@ make build
 编译完成后会在当前目录生成 `sing-box` 二进制。建议安装为 `/usr/local/bin/singr`：
 
 ```sh
-sudo install -m 755 ./sing-box /usr/local/bin/singr
+install -m 755 ./sing-box /usr/local/bin/singr
 ```
 
 创建配置目录：
 
 ```sh
-sudo mkdir -p /etc/singr/certs /var/log
+mkdir -p /etc/singr/certs /var/log
 ```
 
 复制示例配置：
 
 ```sh
-sudo cp release/poet/panel_anytls.json /etc/singr/panel.json
-sudo cp release/poet/server.json /etc/singr/server.json
+cp release/poet/panel_anytls.json /etc/singr/panel.json
+cp release/poet/server.json /etc/singr/server.json
 ```
 
 `release/poet/server.json` 是 anytls + hysteria2 的超集；`panel.json` 决定实际启用哪个（见上文「一份 server.json 同时支持两种协议」）。只想跑 anytls 的话，`panel_anytls.json` 即可；要跑 hysteria2 用 `panel_hysteria2.json`。
@@ -320,14 +325,18 @@ Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发�
 
   ⚠️ **obfs 开着,所有客户端就必须带相同 obfs**,否则连不上(obfs 不匹配 = 彻底连不上,不是降级)。订阅里要同步带 `obfs=salamander&obfs-password=<SNI 或你写的值>`。**完全不想用 obfs,就把整个 `obfs` 块删掉**(删掉才是关闭;留着空密码是"用 SNI 开启")。
 - **带宽 `up_mbps` / `down_mbps`**：`0` = 不限 / 让客户端自报（走 BBR 或 Brutal）。面板的 `node_speedlimit` 仍然独立生效（每用户限速叠加在 Hysteria2 自身拥塞控制之上）。
-- **端口跳跃（可选，纯运维，代码不管）**。Hysteria2 进程只绑 1 个 UDP 端口；端口跳跃是用防火墙把一段端口 NAT 到真实端口实现的：
+- **端口跳跃（可选，纯运维，代码不管）**。Hysteria2 进程只绑 1 个 UDP 端口；端口跳跃是用防火墙把一段端口 NAT 到真实端口实现的。
+
+  **推荐用内置管理器**：`SingR porthop`（或管理菜单第 13 项），输入 起始端口 / 结束端口 / 目标（真实）端口即可，自动下 v4+v6 的 REDIRECT 规则、写进 `/etc/singr/porthop.rules`，并由生成的 `singr-porthop.service` 开机重放。规则都带 `singr-porthop` 的 iptables comment 标记，所以列出 / 删除只动 SingR 自己的规则，不碰你其它防火墙规则；持久化由 SingR 自管，不依赖 `iptables-persistent` / `iptables-services`。
+
+  也可以手动下规则：
 
   ```sh
   iptables  -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
   ip6tables -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
   ```
 
-  `<真实端口>` 就是面板下发的那个监听端口。然后订阅地址写成区间，例如 `hysteria2://<uuid>@host:40000-60000/?sni=...`。范围别和真实端口或其它服务冲突；如果前面已有中转（如 nyanpass）在做端口跳跃，就别在落地再加这条 NAT，让跳跃只由一层负责。
+  `<真实端口>` 就是面板下发的那个监听端口。然后订阅地址写成区间，例如 `hysteria2://<uuid>@host:40000-60000/?sni=...`。范围别和真实端口或其它服务冲突；如果前面已有中转（如 nyanpass）在做端口跳跃，就别在落地再加这条 NAT，让跳跃只由一层负责。手动加的规则没有 `singr-porthop` 标记，`SingR porthop` 列表里看不到、也不会去管它。
 
 更详细的部署示例见 [release/poet/hysteria2.md](release/poet/hysteria2.md)。
 
@@ -336,9 +345,9 @@ Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发�
 把证书放到配置中指定的位置：
 
 ```sh
-sudo cp fullchain.pem /etc/singr/certs/anytls.crt
-sudo cp privkey.pem /etc/singr/certs/anytls.key
-sudo chmod 600 /etc/singr/certs/anytls.key
+cp fullchain.pem /etc/singr/certs/anytls.crt
+cp privkey.pem /etc/singr/certs/anytls.key
+chmod 600 /etc/singr/certs/anytls.key
 ```
 
 证书应覆盖 SSPanel 节点地址中的 `host=` 值。没有可信证书时可以临时使用自签证书，但客户端必须允许不安全证书或信任该证书。
@@ -400,9 +409,9 @@ WantedBy=multi-user.target
 启用并启动：
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now singr
-sudo systemctl status singr
+systemctl daemon-reload
+systemctl enable --now singr
+systemctl status singr
 ```
 
 查看日志：

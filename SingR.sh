@@ -210,6 +210,9 @@ update_shell() {
     chmod +x /usr/bin/SingR
     ln -sf /usr/bin/SingR /usr/bin/singr
     echo -e "${green}管理脚本升级成功，请重新运行 SingR${plain}"
+    # 刚刚把正在运行的脚本文件原地覆盖了，bash 是按字节偏移边读边执行的，
+    # 若继续往下读会读到新文件错位的内容而报错。这里直接退出，避免红字噪音。
+    exit 0
 }
 
 show_version() {
