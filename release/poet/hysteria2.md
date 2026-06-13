@@ -99,3 +99,17 @@ Then have the subscription target the range, e.g.
 the real listen port or other services. If a relay in front (e.g. nyanpass)
 already does port hopping, do **not** also add this NAT — let exactly one
 layer own the hopping.
+
+### Managed via `SingR porthop`
+
+Rather than running the `iptables`/`ip6tables` commands by hand, the
+management script ships a port-hopping manager: `SingR porthop` (or menu
+item 13) lets you list / add / delete rules by entering start port, end
+port and target (real) port. It writes both the v4 and v6 REDIRECT rules
+(tagged with a `singr-porthop` iptables comment so they can be listed and
+removed precisely without touching your other firewall rules) and persists
+them in `/etc/singr/porthop.rules`. Persistence is SingR-owned: a generated
+`singr-porthop.service` systemd oneshot replays the rules on boot — it does
+**not** depend on `iptables-persistent` / `iptables-services`, so it won't
+save or clobber your unrelated firewall rules. `install.sh` installs the
+`iptables` package (v4+v6) for this.

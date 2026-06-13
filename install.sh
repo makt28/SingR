@@ -115,12 +115,14 @@ detect_arch() {
 }
 
 install_base() {
+    # iptables/ip6tables 供 Hysteria2 端口跳跃管理（SingR porthop）使用，v4/v6 同包。
+    # 持久化由 SingR 自管的 singr-porthop.service 负责，不依赖发行版持久化工具。
     if [[ "${release}" == "centos" ]]; then
         yum install -y epel-release || true
-        yum install -y wget curl unzip tar ca-certificates jq
+        yum install -y wget curl unzip tar ca-certificates jq vim iptables
     else
         apt update -y
-        apt install -y wget curl unzip tar ca-certificates jq
+        apt install -y wget curl unzip tar ca-certificates jq vim iptables
     fi
 }
 
@@ -189,13 +191,12 @@ download_release() {
         [[ -n "${version}" ]] || die "检测 SingR 最新版本失败，请手动指定版本或设置 SINGR_RELEASE_URL。"
 
         log_info "检测到 SingR 版本：${version}"
+        # release workflow 只产出 SingR-linux-<arch>.{tar.gz,zip}；tar.gz 优先
+        # （保权限、Linux 原生、不依赖 unzip），zip 作兜底。不要再加其它命名，
+        # 否则会对不存在的资产产生稳定的 404 噪音。
         for candidate in \
             "SingR-linux-${arch}.tar.gz" \
-            "singr-linux-${arch}.tar.gz" \
-            "sing-box-linux-${arch}.tar.gz" \
-            "SingR-linux-${arch}.zip" \
-            "singr-linux-${arch}.zip" \
-            "sing-box-linux-${arch}.zip"; do
+            "SingR-linux-${arch}.zip"; do
             url="https://github.com/${SINGR_RELEASE_REPO}/releases/download/${version}/${candidate}"
             archive="${tmp_dir}/${candidate}"
             if curl -fL "${url}" -o "${archive}"; then

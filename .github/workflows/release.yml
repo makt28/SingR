@@ -85,6 +85,8 @@ jobs:
           chmod +x "${package_dir}/singr"
           (
             cd dist
+            tar -czf "SingR-linux-${{ matrix.arch }}.tar.gz" "SingR-linux-${{ matrix.arch }}"
+            sha256sum "SingR-linux-${{ matrix.arch }}.tar.gz" > "SingR-linux-${{ matrix.arch }}.tar.gz.sha256"
             zip -9 -r "SingR-linux-${{ matrix.arch }}.zip" "SingR-linux-${{ matrix.arch }}"
             sha256sum "SingR-linux-${{ matrix.arch }}.zip" > "SingR-linux-${{ matrix.arch }}.zip.sha256"
           )
@@ -94,6 +96,8 @@ jobs:
         with:
           name: SingR-linux-${{ matrix.arch }}
           path: |
+            dist/SingR-linux-${{ matrix.arch }}.tar.gz
+            dist/SingR-linux-${{ matrix.arch }}.tar.gz.sha256
             dist/SingR-linux-${{ matrix.arch }}.zip
             dist/SingR-linux-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
