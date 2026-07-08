@@ -359,17 +359,26 @@ EOF
     {
       "type": "direct",
       "tag": "anytls-out",
-      "domain_strategy": "prefer_ipv6"
+      "domain_resolver": {
+        "server": "google",
+        "strategy": "prefer_ipv6"
+      }
     },
     {
       "type": "direct",
       "tag": "hysteria2-out",
-      "domain_strategy": "prefer_ipv6"
+      "domain_resolver": {
+        "server": "google",
+        "strategy": "prefer_ipv6"
+      }
     },
     {
       "type": "direct",
       "tag": "direct",
-      "domain_strategy": "prefer_ipv6"
+      "domain_resolver": {
+        "server": "google",
+        "strategy": "prefer_ipv6"
+      }
     }
   ],
   "route": {
@@ -398,14 +407,14 @@ EOF
 migrate_config() {
     local cfg="${CONFIG_DIR}/server.json"
     [[ -f "${cfg}" ]] || return 0
-    command -v jq >/dev/null 2>&1 || { log_warn "未安装 jq，跳过 server.json 迁移；建议手动加上 dns/domain_strategy。"; return 0; }
+    command -v jq >/dev/null 2>&1 || { log_warn "未安装 jq，跳过 server.json 迁移；建议手动加上 dns/domain_resolver。"; return 0; }
 
     local needs_migrate
     needs_migrate="$(jq -r '
         (.dns // null) as $dns
         | (.route.auto_detect_interface // false) as $adi
         | (.outbounds // []) as $outs
-        | ((($outs | map(select(.type=="direct" and (.domain_strategy // "")==""))) | length) > 0) as $missDS
+        | ((($outs | map(select(.type=="direct" and (has("domain_strategy") or (has("domain_resolver") | not))))) | length) > 0) as $missDS
         | (($dns == null) or $missDS or ($adi == true))
     ' "${cfg}" 2>/dev/null || echo "false")"
 
@@ -421,15 +430,20 @@ migrate_config() {
     tmp="$(mktemp)"
     if jq '
         .dns = (.dns // {servers:[{tag:"google",type:"udp",server:"8.8.8.8"}], strategy:"prefer_ipv6"})
+        | (((.dns.servers // []) | map(.tag // empty) | .[0]) // "google") as $dnsTag
         | .outbounds = ((.outbounds // []) | map(
-            if .type == "direct" and ((.domain_strategy // "") == "")
-            then . + {domain_strategy:"prefer_ipv6"}
+            if .type == "direct"
+            then (
+                (.domain_strategy // "prefer_ipv6") as $strategy
+                | (if has("domain_resolver") then . else . + {domain_resolver:{server:$dnsTag, strategy:$strategy}} end)
+                | del(.domain_strategy)
+            )
             else .
             end))
         | .route = ((.route // {}) | .auto_detect_interface = false)
     ' "${cfg}" > "${tmp}"; then
         mv "${tmp}" "${cfg}"
-        log_info "已为 server.json 添加 IPv6 出站策略 (prefer_ipv6) 并关闭 auto_detect_interface。"
+        log_info "已为 server.json 迁移 IPv6 出站策略 (domain_resolver, prefer_ipv6) 并关闭 auto_detect_interface。"
     else
         rm -f "${tmp}"
         log_warn "server.json 迁移失败，已保留原配置。"

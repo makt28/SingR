@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/sniff"
 	C "github.com/sagernet/sing-box/constant"
 	POET "github.com/sagernet/sing-box/poet"
@@ -33,7 +32,7 @@ import (
 
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	done := make(chan interface{})
+	done := make(chan any)
 	err := r.routeConnection(ctx, conn, metadata, N.OnceClose(func(it error) {
 		close(done)
 	}))
@@ -164,7 +163,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 }
 
 func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
-	done := make(chan interface{})
+	done := make(chan any)
 	err := r.routePacketConnection(ctx, conn, metadata, N.OnceClose(func(it error) {
 		close(done)
 	}))
@@ -411,54 +410,7 @@ func (r *Router) matchRule(
 	selectedRule adapter.Rule, selectedRuleIndex int,
 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
 ) {
-	if r.processSearcher != nil && metadata.ProcessInfo == nil {
-		var originDestination netip.AddrPort
-		if metadata.OriginDestination.IsValid() {
-			originDestination = metadata.OriginDestination.AddrPort()
-		} else if metadata.Destination.IsIP() {
-			originDestination = metadata.Destination.AddrPort()
-		}
-		processInfo, fErr := process.FindProcessInfo(r.processSearcher, ctx, metadata.Network, metadata.Source.AddrPort(), originDestination)
-		if fErr != nil {
-			r.logger.InfoContext(ctx, "failed to search process: ", fErr)
-		} else {
-			if processInfo.ProcessPath != "" {
-				if processInfo.UserName != "" {
-					r.logger.InfoContext(ctx, "found process path: ", processInfo.ProcessPath, ", user: ", processInfo.UserName)
-				} else if processInfo.UserId != -1 {
-					r.logger.InfoContext(ctx, "found process path: ", processInfo.ProcessPath, ", user id: ", processInfo.UserId)
-				} else {
-					r.logger.InfoContext(ctx, "found process path: ", processInfo.ProcessPath)
-				}
-			} else if processInfo.AndroidPackageName != "" {
-				r.logger.InfoContext(ctx, "found package name: ", processInfo.AndroidPackageName)
-			} else if processInfo.UserId != -1 {
-				if processInfo.UserName != "" {
-					r.logger.InfoContext(ctx, "found user: ", processInfo.UserName)
-				} else {
-					r.logger.InfoContext(ctx, "found user id: ", processInfo.UserId)
-				}
-			}
-			metadata.ProcessInfo = processInfo
-		}
-	}
-	if r.neighborResolver != nil && metadata.SourceMACAddress == nil && metadata.Source.Addr.IsValid() {
-		mac, macFound := r.neighborResolver.LookupMAC(metadata.Source.Addr)
-		if macFound {
-			metadata.SourceMACAddress = mac
-		}
-		hostname, hostnameFound := r.neighborResolver.LookupHostname(metadata.Source.Addr)
-		if hostnameFound {
-			metadata.SourceHostname = hostname
-			if macFound {
-				r.logger.InfoContext(ctx, "found neighbor: ", mac, ", hostname: ", hostname)
-			} else {
-				r.logger.InfoContext(ctx, "found neighbor hostname: ", hostname)
-			}
-		} else if macFound {
-			r.logger.InfoContext(ctx, "found neighbor: ", mac)
-		}
-	}
+	r.searchProcessInfo(ctx, metadata)
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
 		if !loaded {
@@ -751,7 +703,7 @@ func (r *Router) actionSniff(
 			}
 			if err != nil {
 				sniffBuffer.Release()
-				if !errors.Is(err, context.DeadlineExceeded) {
+				if !E.IsTimeout(err) {
 					fatalErr = err
 					return
 				}

@@ -2,7 +2,6 @@ package adapter
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"time"
 
@@ -83,8 +82,6 @@ type InboundContext struct {
 	SourceGeoIPCode      string
 	GeoIPCode            string
 	ProcessInfo          *ConnectionOwner
-	SourceMACAddress     net.HardwareAddr
-	SourceHostname       string
 	QueryType            uint16
 	FakeIP               bool
 
@@ -104,6 +101,10 @@ type InboundContext struct {
 func (c *InboundContext) ResetRuleCache() {
 	c.IPCIDRMatchSource = false
 	c.IPCIDRAcceptEmpty = false
+	c.ResetRuleMatchCache()
+}
+
+func (c *InboundContext) ResetRuleMatchCache() {
 	c.SourceAddressMatch = false
 	c.SourcePortMatch = false
 	c.DestinationAddressMatch = false

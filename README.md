@@ -82,7 +82,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
 
 脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
 
-> 0.2.5 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、给 `direct` 出站加 `domain_strategy: prefer_ipv6`、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4）。
+> 0.2.5 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、把 `direct` 出站的老 `domain_strategy` 字段迁移成 `domain_resolver`（保留原策略值，缺省 `prefer_ipv6`）、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4），同时跟上 sing-box 1.12+ 的新配置写法。
 
 `SingR` 和 `singr` 两个管理命令等价，大小写都可以。
 
@@ -263,17 +263,17 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
     {
       "type": "direct",
       "tag": "anytls-out",
-      "domain_strategy": "prefer_ipv6"
+      "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }
     },
     {
       "type": "direct",
       "tag": "hysteria2-out",
-      "domain_strategy": "prefer_ipv6"
+      "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }
     },
     {
       "type": "direct",
       "tag": "direct",
-      "domain_strategy": "prefer_ipv6"
+      "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }
     }
   ],
   "route": {
@@ -306,7 +306,7 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 
 ### 出口 IPv6
 
-默认配置里的 `direct` 出站都设了 `domain_strategy: prefer_ipv6`，并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
+默认配置里的 `direct` 出站都设了 `domain_resolver: { "server": "google", "strategy": "prefer_ipv6" }`（sing-box 1.12 起的新写法，老的出站 `domain_strategy` 字段已废弃并将在 1.14 移除），并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
 
 `auto_detect_interface` 在服务器端建议保持 `false`，它是给 client/TUN 场景用的；开着会把 outbound socket 强行绑到默认网卡，并在某些 IPv6-only 目的地下失效。
 
@@ -501,7 +501,7 @@ SINGR_SSPANEL_CONFIG=/etc/singr/panel.json \
 检查：
 
 - 服务器本身能否 `curl -6 ifconfig.co`。如果服务器没有 v6 GUA，无论 SingR 怎么配都没用。
-- `server.json` 的 `direct` 出站是否有 `domain_strategy: prefer_ipv6`，`dns` 块是否带 `strategy: prefer_ipv6`，`route.auto_detect_interface` 是否为 `false`。0.2.5 起 `singr update` 会自动迁移老配置，迁移前的备份在 `/etc/singr/server.json.bak.<时间戳>`。
+- `server.json` 的 `direct` 出站是否有 `domain_resolver: { "server": "google", "strategy": "prefer_ipv6" }`（老写法 `domain_strategy: prefer_ipv6` 已废弃），`dns` 块是否带 `strategy: prefer_ipv6`，`route.auto_detect_interface` 是否为 `false`。0.2.5 起 `singr update` 会自动迁移老配置，迁移前的备份在 `/etc/singr/server.json.bak.<时间戳>`。
 - 如果是从老版本升级上来的，第一次 `singr update` 后必须 `singr restart`。
 
 ### 面板连接失败

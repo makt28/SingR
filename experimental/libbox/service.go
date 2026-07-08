@@ -29,6 +29,7 @@ type platformInterfaceWrapper struct {
 	useProcFS              bool
 	networkManager         adapter.NetworkManager
 	myTunName              string
+	myTunAddress           []netip.Addr
 	defaultInterfaceAccess sync.Mutex
 	defaultInterface       *control.Interface
 	isExpensive            bool
@@ -78,8 +79,23 @@ func (w *platformInterfaceWrapper) OpenInterface(options *tun.Options, platformO
 	}
 	options.FileDescriptor = dupFd
 	w.myTunName = options.Name
-	w.iif.RegisterMyInterface(options.Name)
+	w.myTunAddress = myTunAddress(options)
 	return tun.New(*options)
+}
+
+func myTunAddress(options *tun.Options) []netip.Addr {
+	addresses := make([]netip.Addr, 0, len(options.Inet4Address)+len(options.Inet6Address))
+	for _, prefix := range options.Inet4Address {
+		addresses = append(addresses, prefix.Addr())
+	}
+	for _, prefix := range options.Inet6Address {
+		addresses = append(addresses, prefix.Addr())
+	}
+	return addresses
+}
+
+func (w *platformInterfaceWrapper) MyInterfaceAddress() []netip.Addr {
+	return w.myTunAddress
 }
 
 func (w *platformInterfaceWrapper) UsePlatformDefaultInterfaceMonitor() bool {
@@ -104,14 +120,11 @@ func (w *platformInterfaceWrapper) NetworkInterfaces() ([]adapter.NetworkInterfa
 	}
 	var interfaces []adapter.NetworkInterface
 	for _, netInterface := range iteratorToArray[*NetworkInterface](interfaceIterator) {
-		if netInterface.Name == w.myTunName {
-			continue
-		}
 		w.defaultInterfaceAccess.Lock()
 		// (GOOS=windows) SA4006: this value of `isDefault` is never used
 		// Why not used?
 		//nolint:staticcheck
-		isDefault := w.defaultInterface != nil && int(netInterface.Index) == w.defaultInterface.Index
+		isDefault := netInterface.Name != w.myTunName && w.defaultInterface != nil && int(netInterface.Index) == w.defaultInterface.Index
 		w.defaultInterfaceAccess.Unlock()
 		interfaces = append(interfaces, adapter.NetworkInterface{
 			Interface: control.Interface{
@@ -202,10 +215,10 @@ func (w *platformInterfaceWrapper) FindConnectionOwner(request *adapter.FindConn
 		return nil, err
 	}
 	return &adapter.ConnectionOwner{
-		UserId:             result.UserId,
-		UserName:           result.UserName,
-		ProcessPath:        result.ProcessPath,
-		AndroidPackageName: result.AndroidPackageName,
+		UserId:              result.UserId,
+		UserName:            result.UserName,
+		ProcessPath:         result.ProcessPath,
+		AndroidPackageNames: result.androidPackageNames,
 	}, nil
 }
 
@@ -219,46 +232,6 @@ func (w *platformInterfaceWrapper) UsePlatformNotification() bool {
 
 func (w *platformInterfaceWrapper) SendNotification(notification *adapter.Notification) error {
 	return w.iif.SendNotification((*Notification)(notification))
-}
-
-func (w *platformInterfaceWrapper) UsePlatformNeighborResolver() bool {
-	return true
-}
-
-func (w *platformInterfaceWrapper) StartNeighborMonitor(listener adapter.NeighborUpdateListener) error {
-	return w.iif.StartNeighborMonitor(&neighborUpdateListenerWrapper{listener: listener})
-}
-
-func (w *platformInterfaceWrapper) CloseNeighborMonitor(listener adapter.NeighborUpdateListener) error {
-	return w.iif.CloseNeighborMonitor(nil)
-}
-
-type neighborUpdateListenerWrapper struct {
-	listener adapter.NeighborUpdateListener
-}
-
-func (w *neighborUpdateListenerWrapper) UpdateNeighborTable(entries NeighborEntryIterator) {
-	var result []adapter.NeighborEntry
-	for entries.HasNext() {
-		entry := entries.Next()
-		if entry == nil {
-			continue
-		}
-		address, err := netip.ParseAddr(entry.Address)
-		if err != nil {
-			continue
-		}
-		macAddress, err := net.ParseMAC(entry.MacAddress)
-		if err != nil {
-			continue
-		}
-		result = append(result, adapter.NeighborEntry{
-			Address:    address,
-			MACAddress: macAddress,
-			Hostname:   entry.Hostname,
-		})
-	}
-	w.listener.UpdateNeighborTable(result)
 }
 
 func AvailablePort(startPort int32) (int32, error) {

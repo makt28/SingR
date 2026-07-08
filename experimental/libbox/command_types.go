@@ -239,11 +239,15 @@ func (c *Connections) Iterator() ConnectionIterator {
 }
 
 type ProcessInfo struct {
-	ProcessID   int64
-	UserID      int32
-	UserName    string
-	ProcessPath string
-	PackageName string
+	ProcessID    int64
+	UserID       int32
+	UserName     string
+	ProcessPath  string
+	packageNames []string
+}
+
+func (p *ProcessInfo) PackageNames() StringIterator {
+	return newIterator(p.packageNames)
 }
 
 type Connection struct {
@@ -339,11 +343,11 @@ func connectionFromGRPC(conn *daemon.Connection) Connection {
 	var processInfo *ProcessInfo
 	if conn.ProcessInfo != nil {
 		processInfo = &ProcessInfo{
-			ProcessID:   int64(conn.ProcessInfo.ProcessId),
-			UserID:      conn.ProcessInfo.UserId,
-			UserName:    conn.ProcessInfo.UserName,
-			ProcessPath: conn.ProcessInfo.ProcessPath,
-			PackageName: conn.ProcessInfo.PackageName,
+			ProcessID:    int64(conn.ProcessInfo.ProcessId),
+			UserID:       conn.ProcessInfo.UserId,
+			UserName:     conn.ProcessInfo.UserName,
+			ProcessPath:  conn.ProcessInfo.ProcessPath,
+			packageNames: conn.ProcessInfo.PackageNames,
 		}
 	}
 	return Connection{
@@ -410,16 +414,6 @@ func systemProxyStatusFromGRPC(status *daemon.SystemProxyStatus) *SystemProxySta
 		return nil
 	}
 	return &SystemProxyStatus{
-		Available: status.Available,
-		Enabled:   status.Enabled,
-	}
-}
-
-func systemProxyStatusToGRPC(status *SystemProxyStatus) *daemon.SystemProxyStatus {
-	if status == nil {
-		return nil
-	}
-	return &daemon.SystemProxyStatus{
 		Available: status.Available,
 		Enabled:   status.Enabled,
 	}

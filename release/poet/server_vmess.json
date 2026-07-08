@@ -34,9 +34,6 @@
             "listen": "::",
             "listen_port": 54111,
             "tcp_fast_open": false,
-            "sniff": false,
-            "sniff_override_destination": false,
-            "proxy_protocol": false,
             "users": [
                 {
                     "name": "sekai",
@@ -79,16 +76,6 @@
         "default_domain_resolver": {
             "server": "google-tls",
             "strategy": "prefer_ipv4"
-        },
-        "geoip": {
-            "path": "/etc/sing-poet/geoip.db",
-            "download_url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db",
-            "download_detour": "direct"
-        },
-        "geosite": {
-            "path": "/etc/sing-poet/geosite.db",
-            "download_url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
-            "download_detour": "direct"
         },
         "final": "direct",
         "auto_detect_interface": true
