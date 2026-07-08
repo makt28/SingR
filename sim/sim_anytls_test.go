@@ -37,24 +37,6 @@ import (
 
 const anytlsPassword = "anytls-sim-password"
 
-// writeAllChunked writes buf in chunks of at most chunk bytes. Used to
-// stay under sing-anytls' uint16 frame-length limit (writeDataFrame at
-// session.go:378 casts len(data) to uint16; > 64 KiB causes protocol
-// corruption — separate sing-anytls bug, not the over-reporting issue).
-func writeAllChunked(w io.Writer, buf []byte, chunk int) {
-	for off := 0; off < len(buf); {
-		end := off + chunk
-		if end > len(buf) {
-			end = len(buf)
-		}
-		n, err := w.Write(buf[off:end])
-		if err != nil {
-			return
-		}
-		off += n
-	}
-}
-
 // echoCountingHandler is the Service-side handler. For each substream it
 // receives, it wraps the stream with bufio.NewInt64CounterConn pointing
 // at the SingR Authenticator user's send/recv atomics — the SAME wrap
@@ -81,7 +63,9 @@ func (h *echoCountingHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 	if _, err := io.ReadFull(wrapped, buf); err != nil {
 		return
 	}
-	writeAllChunked(wrapped, buf, 32*1024)
+	// Single >64 KiB Write: exercises sing-anytls writeDataFrame frame
+	// splitting (uint16 overflow fixed in the fork's v0.0.12 sync).
+	_, _ = wrapped.Write(buf)
 }
 
 func TestAnyTLSLayerNoByteInflation(t *testing.T) {
@@ -172,7 +156,7 @@ func TestAnyTLSLayerNoByteInflation(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			writeAllChunked(conn, payload, 32*1024)
+			_, _ = conn.Write(payload)
 		}()
 		got := make([]byte, perStream)
 		go func() {
@@ -289,7 +273,7 @@ func TestAnyTLSReportE2E(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			writeAllChunked(conn, payload, 32*1024)
+			_, _ = conn.Write(payload)
 		}()
 		got := make([]byte, perStream)
 		go func() {

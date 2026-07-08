@@ -152,10 +152,8 @@ github.com/logrusorgru/aurora v2.0.3+incompatible h1:tOpm7WcpBTn4fjmVfgpQq0EfczG
 github.com/logrusorgru/aurora v2.0.3+incompatible/go.mod h1:7rIyQOR62GCctdiQpZ/zOJlFyk6y+94wXzv6RNZgaR4=
 github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 h1:6E+4a0GO5zZEnZ81pIr0yLvtUWk2if982qA3F3QD6H4=
 github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0/go.mod h1:zJYVVT2jmtg6P3p1VtQj7WsuWi/y4VnjVBn7F8KPB3I=
-github.com/makt28/sing-anytls v0.0.0-20260505154255-e10aa1d4db0f h1:xp5OxZ3Il0fvdbyhyG7mWBhAtxYOn+rDUzB/aS41U3g=
-github.com/makt28/sing-anytls v0.0.0-20260505154255-e10aa1d4db0f/go.mod h1:qff/dApzF9+G89beT78Xo1eITkh7Sl9bYuG8Lf9e9kY=
-github.com/makt28/sing-anytls v0.0.0-20260508075853-86be3f016e4d h1:uLvtDr0UAoL37lE2cMWbUGKLBbV5aKVs8/5OXYZDhtI=
-github.com/makt28/sing-anytls v0.0.0-20260508075853-86be3f016e4d/go.mod h1:qff/dApzF9+G89beT78Xo1eITkh7Sl9bYuG8Lf9e9kY=
+github.com/makt28/sing-anytls v0.0.0-20260708060615-58c92716a26e h1:mug6Qe658cto6MGqShfXI99lRT/iit0loVf0sAcWBUQ=
+github.com/makt28/sing-anytls v0.0.0-20260708060615-58c92716a26e/go.mod h1:qff/dApzF9+G89beT78Xo1eITkh7Sl9bYuG8Lf9e9kY=
 github.com/mdlayher/netlink v1.9.0 h1:G8+GLq2x3v4D4MVIqDdNUhTUC7TKiCy/6MDkmItfKco=
 github.com/mdlayher/netlink v1.9.0/go.mod h1:YBnl5BXsCoRuwBjKKlZ+aYmEoq0r12FDA/3JC+94KDg=
 github.com/mdlayher/socket v0.5.1 h1:VZaqt6RkGkt2OE9l3GcC6nZkqD3xKeQLyfleW/uBcos=
