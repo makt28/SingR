@@ -54,17 +54,26 @@
         {
             "type": "direct",
             "tag": "anytls-out",
-            "domain_strategy": "prefer_ipv6"
+            "domain_resolver": {
+                "server": "google",
+                "strategy": "prefer_ipv6"
+            }
         },
         {
             "type": "direct",
             "tag": "hysteria2-out",
-            "domain_strategy": "prefer_ipv6"
+            "domain_resolver": {
+                "server": "google",
+                "strategy": "prefer_ipv6"
+            }
         },
         {
             "type": "direct",
             "tag": "direct",
-            "domain_strategy": "prefer_ipv6"
+            "domain_resolver": {
+                "server": "google",
+                "strategy": "prefer_ipv6"
+            }
         }
     ],
     "route": {

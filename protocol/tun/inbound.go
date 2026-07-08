@@ -67,6 +67,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.GSO {
 		return nil, E.New("GSO option in tun is deprecated in sing-box 1.11.0 and removed in sing-box 1.12.0")
 	}
+	//nolint:staticcheck
+	if options.InboundOptions != (option.InboundOptions{}) {
+		return nil, E.New("legacy inbound fields are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, checkout migration: https://sing-box.sagernet.org/migration/#migrate-legacy-inbound-fields-to-rule-actions")
+	}
 
 	address := options.Address
 	inet4Address := common.Filter(address, func(it netip.Prefix) bool {
@@ -156,22 +160,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if nfQueue == 0 {
 		nfQueue = tun.DefaultAutoRedirectNFQueue
 	}
-	var includeMACAddress []net.HardwareAddr
-	for i, macString := range options.IncludeMACAddress {
-		mac, macErr := net.ParseMAC(macString)
-		if macErr != nil {
-			return nil, E.Cause(macErr, "parse include_mac_address[", i, "]")
-		}
-		includeMACAddress = append(includeMACAddress, mac)
-	}
-	var excludeMACAddress []net.HardwareAddr
-	for i, macString := range options.ExcludeMACAddress {
-		mac, macErr := net.ParseMAC(macString)
-		if macErr != nil {
-			return nil, E.Cause(macErr, "parse exclude_mac_address[", i, "]")
-		}
-		excludeMACAddress = append(excludeMACAddress, mac)
-	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	multiPendingPackets := C.IsDarwin && ((options.Stack == "gvisor" && tunMTU < 32768) || (options.Stack != "gvisor" && options.MTU <= 9000))
 	inbound := &Inbound{
@@ -209,8 +197,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			IncludeAndroidUser:                    options.IncludeAndroidUser,
 			IncludePackage:                        options.IncludePackage,
 			ExcludePackage:                        options.ExcludePackage,
-			IncludeMACAddress:                     includeMACAddress,
-			ExcludeMACAddress:                     excludeMACAddress,
 			InterfaceMonitor:                      networkManager.InterfaceMonitor(),
 			EXP_MultiPendingPackets:               multiPendingPackets,
 		},
@@ -394,6 +380,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			Tun:                    tunInterface,
 			TunOptions:             t.tunOptions,
 			UDPTimeout:             t.udpTimeout,
+			ICMPTimeout:            C.ICMPTimeout,
 			Handler:                t,
 			Logger:                 t.logger,
 			ForwarderBindInterface: forwarderBindInterface,
