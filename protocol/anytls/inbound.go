@@ -72,7 +72,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 
 	paddingScheme := padding.DefaultPaddingScheme
-	if len(options.PaddingScheme) > 0 {
+	switch {
+	case isRandomPaddingScheme(options.PaddingScheme):
+		var md5hex string
+		paddingScheme, md5hex = randomPaddingScheme()
+		logger.Debug("anytls: randomized padding scheme generated, md5=", md5hex)
+	case len(options.PaddingScheme) > 0:
 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
 	}
 
