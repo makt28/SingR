@@ -1,5 +1,7 @@
 # SingR
 
+项目地址：<https://github.com/makt28/SingR>
+
 SingR 是基于 sing-box 的 SSPanel 后端，面向旧版 SSPanel `/mod_mu` 接口。
 
 它的主要用途是：在 SSPanel 里继续把节点配置成 `V2ray`，但通过节点地址里的 `path` 别名，把节点作为 sing-box 的 **AnyTLS** 或 **Hysteria2** 入站运行：
@@ -66,7 +68,13 @@ bash install.sh
 env SINGR_BINARY=/path/to/sing-box bash install.sh
 ```
 
-如果已经发布到 GitHub Release，可以指定仓库和版本下载安装：
+仓库已内置默认 Release 地址（`makt28/SingR`），发布到 GitHub Release 后直接指定版本即可下载安装：
+
+```sh
+bash install.sh v0.3.1
+```
+
+如需从其它仓库（fork）下载，再显式覆盖：
 
 ```sh
 env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.3.1
@@ -103,6 +111,8 @@ singr porthop      # Hysteria2 端口跳跃管理（增/删/查跳跃规则）
 克隆或上传源码后，在项目根目录执行：
 
 ```sh
+git clone https://github.com/makt28/SingR.git
+cd SingR
 go mod download
 make build
 ```
@@ -303,6 +313,31 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 - Hysteria2：因为 TLS 焊在 QUIC service 里，端口/SNI 变化会**重建整个 service**并把当前用户表重新灌进去（端口变化先起新后关旧；同端口仅 SNI 变化要先关旧再起新，有极短重启窗口）。日志 `hysteria2 listener hot-reloaded to port ...` / `hysteria2 TLS hot-reloaded with SNI ...`。
 
 **两种协议的证书材料、入站类型、路由规则、obfs/带宽/masquerade 都不会被热更新。**
+
+### AnyTLS padding 方案（抗指纹）
+
+AnyTLS 入站支持在 `server.json` 里设置 `padding_scheme`，用来打乱记录长度分布、削弱指纹：
+
+```json
+{
+  "type": "anytls",
+  "tag": "anytls-in",
+  "padding_scheme": ["random"]
+}
+```
+
+三种取值：
+
+- **`["random"]`**（不区分大小写的哨兵值）：进程**每次启动**随机合成一套 padding 方案。这样每个默认节点不再共用同一套公开默认方案的指纹（长度分布 / md5）。方案的 md5 会在 debug 日志打印。
+- **任意其它非空列表**：按写入内容逐行拼接，作为自定义方案原样使用。
+- **留空 / 不写**：使用 sing-box fork 内置的公开默认方案。
+
+要点：
+
+- **服务端权威，客户端自动同步。** 服务端在握手 settings 帧里比对客户端的 `padding-md5`，不一致时主动把自己的方案推给客户端，所以只需配置服务端，客户端下次会话自动更新——这也是「每次启动随机」不需要改客户端的原因。
+- **在 `NewService` 时定型，不参与热更新。** AnyTLS 热更新只换 listener/TLS，方案在进程生命周期内固定，只有重启才变化（正好就是「每次启动」语义）。
+- **不影响流量计费和性能。** padding 帧在子流计数器和限速之下，既不计费也不限速；开销集中在每个会话的前几条记录，之后为零。
+- 只随机化「公开默认方案」这一个指纹，**不隐藏协议本身是 AnyTLS**。稳定的自定义方案同样是合理选择；跨重启变化的形状本身也是一种轻微特征。
 
 ### 出口 IPv6
 
