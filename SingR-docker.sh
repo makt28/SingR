@@ -119,6 +119,29 @@ check_status() {
     return 0
 }
 
+# 容器的 restart 策略（no / always / unless-stopped / on-failure）
+container_restart_policy() {
+    docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "${CONTAINER}" 2>/dev/null
+}
+
+# dockerd 本身是否开机自启——容器 --restart 策略只有在 docker 服务开机启动时才生效
+docker_daemon_enabled() {
+    systemctl is-enabled --quiet docker 2>/dev/null
+}
+
+# 开机自启 = 容器 restart 策略 + docker 服务开机自启，两者都要满足
+show_enable_status() {
+    local pol; pol="$(container_restart_policy)"
+    if [[ "${pol}" == "always" || "${pol}" == "unless-stopped" ]]; then
+        echo -e "是否开机自启：${green}是${plain}（容器 --restart=${pol}）"
+    else
+        echo -e "是否开机自启：${red}否${plain}（容器 --restart=${pol:-无}）"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && ! docker_daemon_enabled; then
+        echo -e "  ${yellow}⚠ docker 服务未开机自启，容器重启后不会自动拉起：systemctl enable docker${plain}"
+    fi
+}
+
 start() {
     require_docker
     local rc=0
@@ -177,22 +200,27 @@ status() {
     require_docker
     docker ps -a --filter "name=^/${CONTAINER}$" \
         --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null || true
+    if container_exists; then echo; show_enable_status; fi
     if [[ $# == 0 ]]; then before_show_menu; fi
 }
 
 enable() {
     require_docker
+    container_exists || { echo -e "${red}容器不存在，请先 singr start${plain}"; if [[ $# == 0 ]]; then before_show_menu; fi; return 1; }
     docker update --restart=always "${CONTAINER}" >/dev/null 2>&1 || true
+    # 容器自启依赖 dockerd 自身开机启动，一并设上，否则重启后不生效
+    systemctl enable docker >/dev/null 2>&1 || true
     RESTART="always"; save_restart
-    echo -e "${green}${APP_NAME} 已设置开机自启（--restart=always）${plain}"
+    echo -e "${green}${APP_NAME} 已设置开机自启（容器 --restart=always + docker 服务开机自启）${plain}"
     if [[ $# == 0 ]]; then before_show_menu; fi
 }
 
 disable() {
     require_docker
+    # 只取消容器自启，不动 docker 服务（宿主机可能还跑着别的容器）
     docker update --restart=no "${CONTAINER}" >/dev/null 2>&1 || true
     RESTART="no"; save_restart
-    echo -e "${green}${APP_NAME} 已取消开机自启（--restart=no）${plain}"
+    echo -e "${green}${APP_NAME} 已取消开机自启（容器 --restart=no；docker 服务未改动）${plain}"
     if [[ $# == 0 ]]; then before_show_menu; fi
 }
 
@@ -297,10 +325,19 @@ config() {
 
 show_version() {
     require_docker
+    # docker 下「版本」分两层：docker.conf 里锁定的镜像 tag，和容器内二进制自报版本。
+    echo -e "${green}配置镜像（docker.conf）：${plain}${IMAGE}"
+    if container_exists; then
+        echo -e "${green}容器当前镜像：${plain}$(docker inspect -f '{{.Config.Image}}' "${CONTAINER}" 2>/dev/null)"
+    fi
+    echo -e "${green}二进制版本：${plain}"
     if container_running; then
-        docker exec "${CONTAINER}" singr version 2>/dev/null || echo -e "${red}无法执行 version${plain}"
+        docker exec "${CONTAINER}" singr version 2>&1 | sed 's/^/  /'
+    elif docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        echo -e "  ${yellow}(容器未运行，取镜像内二进制)${plain}"
+        docker run --rm --entrypoint singr "${IMAGE}" version 2>&1 | sed 's/^/  /'
     else
-        docker run --rm "${IMAGE}" version 2>/dev/null || echo -e "${red}无法执行 version${plain}"
+        echo -e "  ${red}容器未运行且本地无镜像 ${IMAGE}，无法查看。可先 singr start 或 docker pull${plain}"
     fi
     if [[ $# == 0 ]]; then before_show_menu; fi
 }
@@ -316,8 +353,8 @@ update_shell() {
 show_status() {
     check_status
     case $? in
-        0) echo -e "${APP_NAME} 状态：${green}已运行${plain}" ;;
-        1) echo -e "${APP_NAME} 状态：${yellow}未运行（容器已创建）${plain}" ;;
+        0) echo -e "${APP_NAME} 状态：${green}已运行${plain}"; show_enable_status ;;
+        1) echo -e "${APP_NAME} 状态：${yellow}未运行（容器已创建）${plain}"; show_enable_status ;;
         2) echo -e "${APP_NAME} 状态：${red}未安装（无容器）${plain}" ;;
     esac
 }
