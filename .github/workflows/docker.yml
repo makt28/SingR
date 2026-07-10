@@ -5,6 +5,10 @@
 name: Publish SingR Docker Image
 
 on:
+  push:
+    tags:
+      - "v*"          # 推 tag 直接触发（与 release.yml 并行；不依赖被 GITHUB_TOKEN
+                      # 抑制的 release:published 事件）
   release:
     types:
       - published
@@ -54,7 +58,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'push' && !contains(github.ref_name, '-')) }}
             type=raw,value=${{ steps.ref.outputs.ref }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -67,5 +71,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 关闭 SLSA provenance 证明，避免 GHCR 列表出现 unknown/unknown 条目。
+          # 纯元数据，不影响镜像运行；本节点镜像无下游做 attestation 校验。
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
