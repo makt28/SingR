@@ -191,8 +191,18 @@ if [[ -n "${PROTOCOL}" ]]; then
         '(.inbounds[] | select(.tag==$tag) | .tls.key_path) // ""' "${SERVER}" 2>/dev/null || echo "")"
     [[ -n "${active_cert}" ]] || die "server.json 中找不到 ${PROTOCOL}-in 的证书路径。"
     if [[ ! -s "${active_cert}" || ! -s "${active_key}" ]]; then
-        die "缺少 TLS 证书：${active_cert} / ${active_key}
-请把证书放到挂载目录（默认 ${CERT_DIR}/${PROTOCOL}.crt 与 ${PROTOCOL}.key），或用 --cert-path/--key-path 指定后重启。
+        hint=""
+        # 证书路径不在挂载目录内 → 多半是宿主机路径（如 /root/xxx），容器里根本看不到。
+        case "${active_cert}" in
+            "${CONFIG_DIR}"/*) ;;
+            *) hint="
+注意：证书路径 ${active_cert} 不在挂载目录 ${CONFIG_DIR} 下。容器只挂载了
+${CONFIG_DIR}，宿主机上别处（如 /root/）的文件在容器内不可见。请把证书复制到
+${CERT_DIR}/ 下（如 ${CERT_DIR}/${PROTOCOL}.crt 与 ${PROTOCOL}.key），
+或用 install-docker.sh 的 --cert-path/--key-path（脚本会自动复制进挂载目录）。" ;;
+        esac
+        die "缺少 TLS 证书（容器内路径）：${active_cert} / ${active_key}${hint}
+默认位置：${CERT_DIR}/${PROTOCOL}.crt 与 ${PROTOCOL}.key。
 与裸机二进制一致：没有证书不会启动。"
     fi
 fi

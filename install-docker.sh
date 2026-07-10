@@ -26,8 +26,9 @@
 #   --enable-device-limit BOOL (default false)
 #   --update-periodic N        (default 60)
 #   --sni HOST                 inbound server_name
-#   --cert-path PATH           TLS cert path inside the container/volume
-#   --key-path PATH            TLS key path
+#   --cert-path PATH           宿主机证书路径，安装时复制进挂载目录（任意路径均可，
+#                              如 /root/foo.pem）——容器只挂载 /etc/singr-docker
+#   --key-path PATH            宿主机私钥路径，同上
 #   --log-level LEVEL          (default info)
 # Container options:
 #   --image REF                (default ghcr.io/makt28/singr:latest)
@@ -62,6 +63,7 @@ LOG_MAX_FILE="5"
 
 # --- app flags (forwarded verbatim to the container entrypoint) -------------
 API_URL=""; API_KEY=""; NODE_ID=""; PROTOCOL=""
+CERT_SRC=""; KEY_SRC=""       # 宿主机上的证书源路径，安装时复制进挂载目录
 declare -a APP_FLAGS=()
 
 check_root() { [[ "${EUID}" -eq 0 ]] || die "错误：必须使用 root 用户运行此脚本。"; }
@@ -81,8 +83,8 @@ parse_args() {
             --enable-device-limit) APP_FLAGS+=(--enable-device-limit "$2"); shift 2;;
             --update-periodic)     APP_FLAGS+=(--update-periodic "$2"); shift 2;;
             --sni)          APP_FLAGS+=(--sni "$2"); shift 2;;
-            --cert-path)    APP_FLAGS+=(--cert-path "$2"); shift 2;;
-            --key-path)     APP_FLAGS+=(--key-path "$2"); shift 2;;
+            --cert-path)    CERT_SRC="$2"; shift 2;;   # 复制进挂载目录，不透传路径
+            --key-path)     KEY_SRC="$2"; shift 2;;
             --log-level)    APP_FLAGS+=(--log-level "$2"); shift 2;;
             --image)          IMAGE="$2"; shift 2;;
             --container-name) CONTAINER="$2"; shift 2;;
@@ -177,12 +179,35 @@ print_usage() {
     echo "配置目录：${CONFIG_DIR}"
 }
 
+# 把 --cert-path/--key-path 指向的宿主机证书复制进挂载目录 ${CERT_DIR}，用协议标准
+# 名（<proto>.crt/.key）——容器只挂载 ${CONFIG_DIR}，宿主机别处（如 /root/）的文件
+# 容器内不可见。复制后走 server.json 默认路径，无需再向容器透传 --cert-path。
+copy_certs() {
+    local proto
+    case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
+        hysteria2|hy2) proto="hysteria2" ;;
+        *)             proto="anytls" ;;
+    esac
+    mkdir -p "${CERT_DIR}"
+    if [[ -n "${CERT_SRC}" ]]; then
+        [[ -s "${CERT_SRC}" ]] || die "找不到证书文件：${CERT_SRC}"
+        install -m 644 "${CERT_SRC}" "${CERT_DIR}/${proto}.crt"
+        log_info "已复制证书 -> ${CERT_DIR}/${proto}.crt"
+    fi
+    if [[ -n "${KEY_SRC}" ]]; then
+        [[ -s "${KEY_SRC}" ]] || die "找不到私钥文件：${KEY_SRC}"
+        install -m 600 "${KEY_SRC}" "${CERT_DIR}/${proto}.key"
+        log_info "已复制私钥 -> ${CERT_DIR}/${proto}.key"
+    fi
+}
+
 main() {
     check_root
     parse_args "$@"
     validate
     install_docker
     write_conf
+    copy_certs
     install_management_script
 
     log_info "拉取镜像：${IMAGE}"

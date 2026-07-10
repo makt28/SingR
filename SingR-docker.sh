@@ -76,7 +76,10 @@ before_show_menu() {
 }
 
 container_exists()  { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; }
-container_running() { docker ps    --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; }
+# 用真实 State.Status 判断，而不是 `docker ps`——崩溃重启中的容器 `docker ps`
+# 也会列出（Restarting），会把 crash-loop 误判成"已运行"。只有 status==running
+# 才算真在跑（restarting/exited/created 都不算）。
+container_running() { [[ "$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null)" == "running" ]]; }
 
 # 删旧建新（update / 首次 bootstrap 共用）。RUN_FLAGS 是首启引导参数；因为
 # entrypoint 只在 panel.json 不存在时生成，重建不会覆盖已有配置。
@@ -94,10 +97,18 @@ container_recreate() {
 }
 
 # docker run -d 只要容器被创建就返回 0，即使入口随即退出（例如缺证书）。
-# 停一下再确认容器仍在运行，供 update 等破坏性路径判断真正成功与否。
+# 采样两次 State.Status + RestartCount：既要当前在 running，又要重启计数不再增长，
+# 才算真正起来了——否则是 crash-loop（缺证书等会不停重启，单次采样可能恰好抓到
+# 短暂的 running）。
 verify_running() {
     sleep 2
-    container_running
+    container_running || return 1
+    local r1 r2
+    r1="$(docker inspect -f '{{.RestartCount}}' "${CONTAINER}" 2>/dev/null)"
+    sleep 3
+    container_running || return 1
+    r2="$(docker inspect -f '{{.RestartCount}}' "${CONTAINER}" 2>/dev/null)"
+    [[ "${r1}" == "${r2}" ]]
 }
 
 # 从镜像引用里取出 repo（去掉 tag 和 @digest）。正确区分 registry 端口冒号与
