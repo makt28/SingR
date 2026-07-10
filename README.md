@@ -106,7 +106,110 @@ singr porthop      # Hysteria2 端口跳跃管理（增/删/查跳跃规则）
 
 管理菜单里对应的是第 13 项「Hysteria2 端口跳跃管理」。
 
-手动编译安装方式如下。
+## Docker 部署
+
+除裸机 systemd 安装外，SingR 还提供 Docker 镜像，发布在 **`ghcr.io/makt28/singr`**
+（多架构 `linux/amd64` + `linux/arm64`）。
+
+- 稳定版：`ghcr.io/makt28/singr:latest`（发 Release 后自动更新），也可锁定
+  `:vX.Y.Z`。
+- 配置目录 `/etc/singr-docker`，与裸机的 `/etc/singr` **完全隔离**，互不影响，
+  一台机器二选一即可。
+
+> **证书是必须的（三种方式通用）**：和裸机二进制一致，没有 TLS 证书容器不会
+> 启动。先建目录并放证书：
+> ```sh
+> mkdir -p /etc/singr-docker/certs
+> # anytls 放 anytls.crt / anytls.key；hysteria2 放 hysteria2.crt / hysteria2.key
+> ```
+> 也可以自签测试证书（生产建议用真证书，anytls/hy2 对 TLS 指纹敏感）：
+> ```sh
+> openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+>   -keyout /etc/singr-docker/certs/anytls.key \
+>   -out    /etc/singr-docker/certs/anytls.crt -subj "/CN=example.com"
+> ```
+
+### 方式一：管理脚本一键（推荐）
+
+自动装 docker、拉镜像、建容器，并装上与裸机**完全一致**的 `singr` 管理命令
+（`singr start/stop/restart/config/log/update/porthop`），底层驱动的是容器而非
+systemd。
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/install-docker.sh) \
+  --api-url https://your-sspanel.example.com \
+  --api-key your-apikey \
+  --node-id 44 \
+  --protocol anytls          # 或 hysteria2
+# 放好证书后： singr restart
+```
+
+之后的管理和裸机无差别：
+
+```sh
+singr config     # 改 /etc/singr-docker/panel.json，自动 docker restart
+singr log        # docker logs -f
+singr update     # 拉最新镜像重建容器（也可 singr update v0.5.0 指定版本）
+singr porthop    # Hysteria2 端口跳跃
+singr uninstall  # 删容器 + 配置 + 端口跳跃规则
+```
+
+### 方式二：直接 docker run（soga 风格）
+
+不装管理脚本，纯 `docker run` + 环境变量：
+
+```sh
+docker run -d --name singr \
+  --network host --restart always \
+  --log-opt max-size=10m --log-opt max-file=5 \
+  -v /etc/singr-docker:/etc/singr-docker \
+  -e SINGR_API_URL=https://your-sspanel.example.com \
+  -e SINGR_API_KEY=your-apikey \
+  -e SINGR_NODE_ID=44 \
+  -e SINGR_PROTOCOL=anytls \
+  ghcr.io/makt28/singr:latest
+```
+
+管理用原生命令：`docker logs -f singr` / `docker restart singr` / `docker pull ... && docker rm -f singr && <重新 run>`。
+
+### 方式三：docker compose
+
+仓库根目录有 [`docker-compose.yml`](docker-compose.yml)，改好里面的 `SINGR_*`
+后：
+
+```sh
+mkdir -p singr-data/certs   # 放证书到 singr-data/certs/
+docker compose up -d
+docker compose logs -f
+```
+
+### 参数 / 环境变量对照
+
+flag（方式一）与 `SINGR_*` 环境变量（方式二/三）一一对应，任选其一：
+
+| flag | 环境变量 | 说明 | 默认 |
+| --- | --- | --- | --- |
+| `--api-url` | `SINGR_API_URL` | 面板 apihost（必填） | |
+| `--api-key` | `SINGR_API_KEY` | 面板 apikey（必填） | |
+| `--node-id` | `SINGR_NODE_ID` | 节点 ID（必填） | |
+| `--protocol` | `SINGR_PROTOCOL` | `anytls` 或 `hysteria2`（必填） | |
+| `--sni` | `SINGR_SNI` | 入站 `server_name` | 空 |
+| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书/私钥路径 | 默认协议证书路径 |
+| `--speed-limit` / `--device-limit` | `SINGR_SPEED_LIMIT` / `SINGR_DEVICE_LIMIT` | 限速 / 设备数 | 0 |
+| `--enable-device-limit` | `SINGR_ENABLE_DEVICE_LIMIT` | 是否硬限设备 | false |
+| `--update-periodic` | `SINGR_UPDATE_PERIODIC` | 面板同步周期（秒） | 60 |
+| `--image` | —— | 镜像地址（仅方式一） | `ghcr.io/makt28/singr:latest` |
+
+三种方式共同点：`--network=host`（面板动态下发端口、Hysteria2 走 UDP，必须
+host 网络）、日志走 stdout（`docker logs` 查看，配合 `--log-opt` 轮转）。首次
+启动用上面的参数生成 `/etc/singr-docker/panel.json`，**之后配置以该文件为准**
+（改文件 + 重启即可，参数只做首次引导），更新/重建容器配置不丢。
+
+Hysteria2 端口跳跃是宿主机 iptables NAT（host 网络下容器与宿主机共享网络栈），
+方式一用 `singr porthop` 管理，方式二/三可另跑一次 `install-docker.sh` 装上
+`singr` 命令后使用，或直接手动配 iptables。
+
+## 手动编译安装
 
 克隆或上传源码后，在项目根目录执行：
 

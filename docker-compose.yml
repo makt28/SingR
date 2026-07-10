@@ -1,0 +1,35 @@
+# SingR node — docker compose.
+#
+# Equivalent to `install-docker.sh`, using env vars instead of CLI flags (the
+# entrypoint accepts either). Config, panel.json and certs live in the mounted
+# ./singr-data (= /etc/singr-docker inside). Certs are mandatory: put
+# anytls.crt/anytls.key (or hysteria2.crt/.key) under ./singr-data/certs before
+# `docker compose up`, or the container refuses to start (same as bare-metal).
+#
+# host networking is required: the panel delivers the listen port dynamically
+# and hysteria2 is UDP, so ports can't be pre-mapped.
+services:
+  singr:
+    image: ghcr.io/makt28/singr:latest
+    container_name: singr
+    restart: always
+    network_mode: host
+    environment:
+      SINGR_API_URL: "https://your-sspanel.example.com"
+      SINGR_API_KEY: "your-apikey"
+      SINGR_NODE_ID: "44"
+      SINGR_PROTOCOL: "anytls"        # or hysteria2
+      # SINGR_SNI: "node.example.com"
+      # SINGR_SPEED_LIMIT: "0"
+      # SINGR_DEVICE_LIMIT: "0"
+      # SINGR_ENABLE_DEVICE_LIMIT: "false"
+      # SINGR_UPDATE_PERIODIC: "60"
+      # SINGR_CERT_PATH: "/etc/singr-docker/certs/anytls.crt"
+      # SINGR_KEY_PATH: "/etc/singr-docker/certs/anytls.key"
+    volumes:
+      - ./singr-data:/etc/singr-docker
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
