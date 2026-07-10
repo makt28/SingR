@@ -20,13 +20,15 @@ ENV GOARCH=$TARGETARCH
 RUN set -ex \
     && apk add --no-cache git build-base \
     && export COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
-    && export CORE_VERSION=$(go run ./cmd/internal/read_tag 2>/dev/null || echo unknown) \
-    && export SINGR_VERSION=$(cat release/singr/VERSION) \
+    # SingR 版本优先取 git tag（与 release.yml 一致，避免用陈旧的 VERSION 文件），
+    # 无 tag 时回退到 VERSION 文件。核心版本不注入，交给源码 constant/version.go
+    # 的默认值（即上游基线），保持与裸机二进制一致。
+    && export SINGR_VERSION=$(go run ./cmd/internal/read_tag 2>/dev/null || cat release/singr/VERSION) \
     && export TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS) \
     && export LDFLAGS_SHARED=$(cat release/LDFLAGS) \
     && go build -v -trimpath -tags "$TAGS" \
         -o /go/bin/singr \
-        -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$CORE_VERSION' -X 'github.com/sagernet/sing-box/poet/constant.Version=$SINGR_VERSION' $LDFLAGS_SHARED -s -w -buildid=" \
+        -ldflags "-X 'github.com/sagernet/sing-box/poet/constant.Version=$SINGR_VERSION' $LDFLAGS_SHARED -s -w -buildid=" \
         ./cmd/sing-box
 
 FROM --platform=$TARGETPLATFORM alpine AS dist
