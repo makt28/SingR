@@ -1,0 +1,11 @@
+# Keep the Docker build context lean. NOTE: .git is intentionally NOT ignored —
+# the Dockerfile runs `go run ./cmd/internal/read_tag` and `git rev-parse` to
+# stamp the core version, which need the git metadata.
+Libbox.xcframework
+docs
+*.tar.gz
+*.zip
+/sing-box
+/singr
+.cache
+sim/.cache
