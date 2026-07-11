@@ -17,14 +17,20 @@ permissions:
 
 jobs:
   build:
-    name: Build linux ${{ matrix.arch }}
+    name: Build ${{ matrix.label }} ${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-          - arch: arm64
+          - { label: linux, goos: linux, goarch: amd64, binname: singr, buildmode: exe, ldextra: "" }
+          - { label: linux, goos: linux, goarch: arm64, binname: singr, buildmode: exe, ldextra: "" }
+          # Android node box: GOOS stays linux (CGO_ENABLED=0 static, no NDK).
+          # -buildmode=pie satisfies Android API 28+'s PIE requirement, and
+          # `-I /system/bin/linker64` repoints PT_INTERP from glibc's ld.so
+          # (absent on Android) to bionic's linker — without it exec fails with
+          # a misleading "No such file or directory" on the missing interpreter.
+          - { label: android, goos: linux, goarch: arm64, binname: libsingr.so, buildmode: pie, ldextra: "-I /system/bin/linker64" }
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -60,46 +66,49 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: "0"
-          GOOS: linux
-          GOARCH: ${{ matrix.arch }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
-          mkdir -p "dist/SingR-linux-${{ matrix.arch }}"
+          pkg="SingR-${{ matrix.label }}-${{ matrix.goarch }}"
+          mkdir -p "dist/${pkg}"
           TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
           go build -v -trimpath \
+            -buildmode=${{ matrix.buildmode }} \
             -tags "${TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/poet/constant.Version=${SINGR_VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-            -o "dist/SingR-linux-${{ matrix.arch }}/singr" \
+            -ldflags "-X 'github.com/sagernet/sing-box/poet/constant.Version=${SINGR_VERSION}' ${LDFLAGS_SHARED} -s -w -buildid= ${{ matrix.ldextra }}" \
+            -o "dist/${pkg}/${{ matrix.binname }}" \
             ./cmd/sing-box
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          package_dir="dist/SingR-linux-${{ matrix.arch }}"
+          pkg="SingR-${{ matrix.label }}-${{ matrix.goarch }}"
+          package_dir="dist/${pkg}"
           cp README.md "${package_dir}/"
           cp release/poet/panel_anytls.json "${package_dir}/panel.json"
           cp release/poet/server_anytls.json "${package_dir}/server.json"
           printf '%s\n' "${SINGR_VERSION}" > "${package_dir}/VERSION"
-          chmod +x "${package_dir}/singr"
+          chmod +x "${package_dir}/${{ matrix.binname }}"
           (
             cd dist
-            tar -czf "SingR-linux-${{ matrix.arch }}.tar.gz" "SingR-linux-${{ matrix.arch }}"
-            sha256sum "SingR-linux-${{ matrix.arch }}.tar.gz" > "SingR-linux-${{ matrix.arch }}.tar.gz.sha256"
-            zip -9 -r "SingR-linux-${{ matrix.arch }}.zip" "SingR-linux-${{ matrix.arch }}"
-            sha256sum "SingR-linux-${{ matrix.arch }}.zip" > "SingR-linux-${{ matrix.arch }}.zip.sha256"
+            tar -czf "${pkg}.tar.gz" "${pkg}"
+            sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+            zip -9 -r "${pkg}.zip" "${pkg}"
+            sha256sum "${pkg}.zip" > "${pkg}.zip.sha256"
           )
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SingR-linux-${{ matrix.arch }}
+          name: SingR-${{ matrix.label }}-${{ matrix.goarch }}
           path: |
-            dist/SingR-linux-${{ matrix.arch }}.tar.gz
-            dist/SingR-linux-${{ matrix.arch }}.tar.gz.sha256
-            dist/SingR-linux-${{ matrix.arch }}.zip
-            dist/SingR-linux-${{ matrix.arch }}.zip.sha256
+            dist/SingR-${{ matrix.label }}-${{ matrix.goarch }}.tar.gz
+            dist/SingR-${{ matrix.label }}-${{ matrix.goarch }}.tar.gz.sha256
+            dist/SingR-${{ matrix.label }}-${{ matrix.goarch }}.zip
+            dist/SingR-${{ matrix.label }}-${{ matrix.goarch }}.zip.sha256
           if-no-files-found: error
 
   release:
