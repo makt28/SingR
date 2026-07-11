@@ -2,12 +2,14 @@ package libbox
 
 import (
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
+	poetShortcuts "github.com/sagernet/sing-box/poet/shortcuts"
 	"github.com/sagernet/sing/common/byteformats"
 )
 
@@ -59,6 +61,14 @@ func Setup(options *SetupOptions) error {
 
 	os.MkdirAll(sWorkingPath, 0o777)
 	os.MkdirAll(sTempPath, 0o777)
+
+	// SingR/Android: the CLI feeds poet its panel config via `-p <file>`
+	// (cmd/sing-box/cmd.go), but the libbox path has no such flag — so
+	// box.Start()→POET.Start() would find an empty poetConfigPath and exit(1).
+	// Point it at <workingPath>/panel.json, which the app writes before start.
+	// This lives in libbox only; cmd/sing-box does not import it, so the Linux
+	// binary and its `-p` behaviour are untouched.
+	poetShortcuts.SetObject("poetConfigPath", filepath.Join(sWorkingPath, "panel.json"))
 	return nil
 }
 
