@@ -25,12 +25,10 @@ jobs:
         include:
           - { label: linux, goos: linux, goarch: amd64, binname: singr, buildmode: exe, ldextra: "" }
           - { label: linux, goos: linux, goarch: arm64, binname: singr, buildmode: exe, ldextra: "" }
-          # Android node box: GOOS stays linux (CGO_ENABLED=0 static, no NDK).
-          # -buildmode=pie satisfies Android API 28+'s PIE requirement, and
-          # `-I /system/bin/linker64` repoints PT_INTERP from glibc's ld.so
-          # (absent on Android) to bionic's linker — without it exec fails with
-          # a misleading "No such file or directory" on the missing interpreter.
-          - { label: android, goos: linux, goarch: arm64, binname: libsingr.so, buildmode: pie, ldextra: "-I /system/bin/linker64" }
+          # The Android node used to ship as a standalone CGO_ENABLED=0 PIE
+          # (libsingr.so). That binary can't run on modern Android (netlink route
+          # monitoring is sandboxed) so it's replaced by the gomobile AAR built in
+          # the build_android_aar job below, which the app embeds via libbox.
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -111,11 +109,85 @@ jobs:
             dist/SingR-${{ matrix.label }}-${{ matrix.goarch }}.zip.sha256
           if-no-files-found: error
 
+  build_android_aar:
+    name: Build Android AAR (libbox)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # gomobile (sagernet fork) tracks recent Go; match the proven android job.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "~1.25.10"
+          cache: true
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Setup OpenJDK
+        run: sudo apt update && sudo apt install -y openjdk-17-jdk-headless
+
+      - name: Set version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${{ inputs.version }}"
+            if [[ -z "${VERSION}" ]]; then
+              VERSION="v$(cat release/singr/VERSION)"
+            fi
+          fi
+          if [[ "${VERSION}" != v* ]]; then
+            VERSION="v${VERSION}"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          # build_libbox/gomobile stamps the version from the git tag.
+          git tag -f "${VERSION}"
+
+      - name: Build AAR
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make lib_android
+          test -f libbox.aar
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp libbox.aar "dist/SingR-android.aar"
+          ( cd dist && sha256sum "SingR-android.aar" > "SingR-android.aar.sha256" )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SingR-android-aar
+          path: |
+            dist/SingR-android.aar
+            dist/SingR-android.aar.sha256
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs:
       - build
+      - build_android_aar
     steps:
       - name: Resolve version
         shell: bash
