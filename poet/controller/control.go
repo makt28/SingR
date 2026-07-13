@@ -37,6 +37,38 @@ func (c *Controller) syncUserList() error {
 	shouldRefreshRuntimeUsers := len(added) > 0 || len(deleted) > 0 || len(changed) > 0
 	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d changed: %d total: %d", len(added), len(deleted), len(changed), len(runtimeUsers)), "info")
 
+	// Apply the protocol runtime delta first. Do not commit usersMap or
+	// mutate the authenticator until this succeeds: otherwise the next panel
+	// cycle sees no diff and never retries a failed AddUsers/RemoveUsers (or
+	// full RefreshUsers), leaving accounting state ahead of authentication.
+	if shouldRefreshRuntimeUsers {
+		in := *c.inbound
+		if incremental, ok := in.(adapter.PIncrementalUserInbound); ok {
+			if len(deleted) > 0 {
+				if err := incremental.RemoveUsers(deleted); err != nil {
+					c.log(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+					return err
+				}
+			}
+			if len(deltaAddedChangedUsers) > 0 {
+				if err := incremental.AddUsers(&deltaAddedChangedUsers, c.nodeInfo); err != nil {
+					c.log(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+					return err
+				}
+			}
+		} else {
+			refresher, ok := in.(adapter.PInbound)
+			if !ok {
+				c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
+				return errors.New("inbound type does not support user refresh")
+			}
+			if err := refresher.RefreshUsers(&runtimeUsers, c.nodeInfo); err != nil {
+				c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+				return err
+			}
+		}
+	}
+
 	for _, hash := range deleted {
 		c.log(fmt.Sprintf("DeleteUser: %s", hash), "debug")
 		if err := c.author.DelUser(hash); err != nil {
@@ -76,35 +108,6 @@ func (c *Controller) syncUserList() error {
 		c.author.SetUserProfile(hash, *u)
 		c.author.SetUserAliases(hash, u.UUID, u.Passwd, u.Email)
 		c.ApplyUserLimits(hash, *u)
-	}
-
-	if shouldRefreshRuntimeUsers {
-		in := *c.inbound
-		if incremental, ok := in.(adapter.PIncrementalUserInbound); ok {
-			if len(deleted) > 0 {
-				if err := incremental.RemoveUsers(deleted); err != nil {
-					c.log(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-					return err
-				}
-			}
-			if len(deltaAddedChangedUsers) > 0 {
-				if err := incremental.AddUsers(&deltaAddedChangedUsers, c.nodeInfo); err != nil {
-					c.log(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-					return err
-				}
-			}
-			return nil
-		}
-
-		refresher, ok := in.(adapter.PInbound)
-		if !ok {
-			c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
-			return errors.New("inbound type does not support user refresh")
-		}
-		if err := refresher.RefreshUsers(&runtimeUsers, c.nodeInfo); err != nil {
-			c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-			return err
-		}
 	}
 
 	return nil

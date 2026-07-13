@@ -182,8 +182,9 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		return nil, errors.New(api.NodeNotModified)
 	}
 
-	if err == nil && res != nil && res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["node"] {
-		c.eTags["node"] = res.Header().Get("ETag")
+	var responseETag string
+	if err == nil && res != nil {
+		responseETag = res.Header().Get("ETag")
 	}
 
 	response, err := c.parseResponse(res, path, err)
@@ -234,6 +235,9 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		res, _ := json.Marshal(nodeInfoResponse)
 		return nil, fmt.Errorf("parse node info failed: %s, \nError: %s", string(res), err)
 	}
+	if responseETag != "" {
+		c.eTags["node"] = responseETag
+	}
 
 	return nodeInfo, nil
 }
@@ -252,8 +256,9 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		return nil, errors.New(api.UserNotModified)
 	}
 
-	if err == nil && res != nil && res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["users"] {
-		c.eTags["users"] = res.Header().Get("ETag")
+	var responseETag string
+	if err == nil && res != nil {
+		responseETag = res.Header().Get("ETag")
 	}
 
 	response, err := c.parseResponse(res, path, err)
@@ -270,6 +275,9 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	if err != nil {
 		res, _ := json.Marshal(userListResponse)
 		return nil, fmt.Errorf("parse user list failed: %s", string(res))
+	}
+	if responseETag != "" {
+		c.eTags["users"] = responseETag
 	}
 	return userList, nil
 }
@@ -378,8 +386,9 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 		return nil, errors.New(api.RuleNotModified)
 	}
 
-	if err == nil && res != nil && res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["rules"] {
-		c.eTags["rules"] = res.Header().Get("ETag")
+	var responseETag string
+	if err == nil && res != nil {
+		responseETag = res.Header().Get("ETag")
 	}
 
 	response, err := c.parseResponse(res, path, err)
@@ -394,10 +403,17 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	}
 
 	for _, r := range *ruleListResponse {
+		pattern, err := regexp.Compile(r.Content)
+		if err != nil {
+			return nil, fmt.Errorf("compile detect rule %d failed: %w", r.ID, err)
+		}
 		ruleList = append(ruleList, api.DetectRule{
 			ID:      r.ID,
-			Pattern: regexp.MustCompile(r.Content),
+			Pattern: pattern,
 		})
+	}
+	if responseETag != "" {
+		c.eTags["rules"] = responseETag
 	}
 	return &ruleList, nil
 }
