@@ -286,6 +286,91 @@ func TestInvalidPanelPayloadDoesNotCommitETag(t *testing.T) {
 	}
 }
 
+// TestValidETagRetainedAcrossInvalidPayload is the three-phase ETag
+// regression: a committed "v1" must survive an invalid "v2" payload (the
+// next request still sends If-None-Match: "v1", so the panel re-serves the
+// full body instead of 304), and a corrected "v2" must then commit.
+func TestValidETagRetainedAcrossInvalidPayload(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		etagKey string
+		valid   string
+		invalid string
+		fetch   func(*APIClient) error
+	}{
+		{
+			name: "node", path: "/mod_mu/nodes/3/info", etagKey: "node",
+			valid:   `{"server":"example.com;14555;0;ws;;path=/anytls","version":"2020.1"}`,
+			invalid: `"not-an-object"`,
+			fetch:   func(client *APIClient) error { _, err := client.GetNodeInfo(); return err },
+		},
+		{
+			name: "users", path: "/mod_mu/users", etagKey: "users",
+			valid:   `[{"id":101,"email":"one@example.com","uuid":"uuid-101"}]`,
+			invalid: `{"not":"a-list"}`,
+			fetch:   func(client *APIClient) error { _, err := client.GetUserList(); return err },
+		},
+		{
+			name: "rules", path: "/mod_mu/func/detect_rules", etagKey: "rules",
+			valid:   `[{"id":7,"regex":"example\\.com"}]`,
+			invalid: `[{"id":8,"regex":"["}]`,
+			fetch:   func(client *APIClient) error { _, err := client.GetNodeRule(); return err },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch requests.Add(1) {
+				case 1:
+					if got := request.Header.Get("If-None-Match"); got != "" {
+						t.Errorf("first If-None-Match = %q, want empty", got)
+					}
+					writeRawPanelData(writer, http.StatusOK, `"v1"`, test.valid)
+				case 2:
+					if got := request.Header.Get("If-None-Match"); got != `"v1"` {
+						t.Errorf("second If-None-Match = %q, want %q", got, `"v1"`)
+					}
+					writeRawPanelData(writer, http.StatusOK, `"v2"`, test.invalid)
+				default:
+					// The invalid v2 must NOT have replaced or cleared the
+					// committed v1: the client still validates against v1
+					// and therefore receives the corrected body.
+					if got := request.Header.Get("If-None-Match"); got != `"v1"` {
+						t.Errorf("third If-None-Match = %q, want retained %q", got, `"v1"`)
+					}
+					writeRawPanelData(writer, http.StatusOK, `"v2"`, test.valid)
+				}
+			}))
+			defer server.Close()
+
+			client := newHTTPTestClient(server.URL)
+			if err := test.fetch(client); err != nil {
+				t.Fatalf("first fetch: %v", err)
+			}
+			if client.eTags[test.etagKey] != `"v1"` {
+				t.Fatalf("stored ETag = %q, want %q", client.eTags[test.etagKey], `"v1"`)
+			}
+			if err := test.fetch(client); err == nil {
+				t.Fatal("invalid payload fetch succeeded")
+			}
+			if client.eTags[test.etagKey] != `"v1"` {
+				t.Fatalf("ETag after invalid payload = %q, want retained %q", client.eTags[test.etagKey], `"v1"`)
+			}
+			if err := test.fetch(client); err != nil {
+				t.Fatalf("corrected fetch: %v", err)
+			}
+			if client.eTags[test.etagKey] != `"v2"` {
+				t.Fatalf("ETag after corrected payload = %q, want %q", client.eTags[test.etagKey], `"v2"`)
+			}
+			if requests.Load() != 3 {
+				t.Fatalf("requests = %d, want 3", requests.Load())
+			}
+		})
+	}
+}
+
 func newHTTPTestClient(host string) *APIClient {
 	client := New(&api.Config{APIHost: host, Key: "test-key", NodeID: 3, NodeType: "V2ray"})
 	client.client.SetRetryWaitTime(time.Millisecond)

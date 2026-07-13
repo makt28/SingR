@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/poet/api"
+	singquic "github.com/sagernet/sing-quic/hysteria2"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
@@ -324,6 +326,115 @@ func TestHysteria2HandlersPreserveAuthenticatedUser(t *testing.T) {
 	if router.packetMetadata.Source != source || router.packetMetadata.Destination != destination {
 		t.Fatalf("UDP metadata addresses = source %v destination %v", router.packetMetadata.Source, router.packetMetadata.Destination)
 	}
+}
+
+// TestHysteria2AuthenticationEndToEnd drives a real sing-quic hysteria2
+// client against the running inbound over loopback UDP, proving that panel
+// user updates land in the QUIC service's actual auth table (the mirror
+// tests above only check currentUsers) and that a SNI-only hot reload —
+// which rebuilds the whole service — re-applies the user table.
+func TestHysteria2AuthenticationEndToEnd(t *testing.T) {
+	port := testFreeUDPPort(t)
+	h := newTestHysteria2Inbound(t, port, "initial.example.com")
+	h.router = &silentHysteria2Router{}
+	if err := h.Start(adapter.StartStateStart); err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	users := []api.UserInfo{
+		{UID: 1001, UUID: "uuid-1001", Passwd: "unused-passwd"},
+		{UID: 1002, Passwd: "passwd-1002"},
+	}
+	if err := h.RefreshUsers(&users, &api.NodeInfo{NodeType: C.TypeHysteria2}); err != nil {
+		t.Fatal(err)
+	}
+	assertHysteria2PasswordAccepted(t, port, "uuid-1001", true)
+	assertHysteria2PasswordAccepted(t, port, "unused-passwd", false)
+	assertHysteria2PasswordAccepted(t, port, "passwd-1002", true)
+
+	rotated := []api.UserInfo{{UID: 1001, UUID: "uuid-1001-rotated"}}
+	if err := h.AddUsers(&rotated, &api.NodeInfo{NodeType: C.TypeHysteria2}); err != nil {
+		t.Fatal(err)
+	}
+	assertHysteria2PasswordAccepted(t, port, "uuid-1001", false)
+	assertHysteria2PasswordAccepted(t, port, "uuid-1001-rotated", true)
+
+	if err := h.RemoveUsers([]string{"u1002"}); err != nil {
+		t.Fatal(err)
+	}
+	assertHysteria2PasswordAccepted(t, port, "passwd-1002", false)
+
+	// SNI-only reload closes the old service and rebuilds tlsConfig +
+	// listener + service on the same UDP port; the surviving users must be
+	// re-applied to the rebuilt service from the currentUsers mirror.
+	if err := h.ConfigureFromPanelNode(&api.NodeInfo{
+		NodeType: C.TypeHysteria2,
+		Port:     uint32(port),
+		Host:     "reload-a.example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertHysteria2PasswordAccepted(t, port, "uuid-1001-rotated", true)
+	assertHysteria2PasswordAccepted(t, port, "uuid-1001", false)
+}
+
+// assertHysteria2PasswordAccepted performs a full QUIC + hysteria2 auth
+// handshake against 127.0.0.1:port. DialConn fails with "authentication
+// failed" when the service rejects the password, so acceptance is exactly
+// err == nil.
+func assertHysteria2PasswordAccepted(t *testing.T, port int, password string, want bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tlsConfig, err := tls.NewClient(ctx, log.NewNOPFactory().Logger(), "127.0.0.1", option.OutboundTLSOptions{
+		Enabled:    true,
+		ServerName: "initial.example.com",
+		Insecure:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := singquic.NewClient(singquic.ClientOptions{
+		Context:       ctx,
+		Dialer:        N.SystemDialer,
+		Logger:        log.NewNOPFactory().Logger(),
+		ServerAddress: M.ParseSocksaddr(fmt.Sprintf("127.0.0.1:%d", port)),
+		Password:      password,
+		TLSConfig:     tlsConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(net.ErrClosed)
+	conn, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:443"))
+	if err == nil {
+		_ = conn.Close()
+	}
+	accepted := err == nil
+	if accepted != want {
+		t.Fatalf("password %q accepted = %v, want %v (error: %v)", password, accepted, want, err)
+	}
+}
+
+// silentHysteria2Router accepts routed connections without recording state,
+// so concurrent server-side goroutines cannot race on shared fields.
+type silentHysteria2Router struct {
+	adapter.Router
+}
+
+func (*silentHysteria2Router) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
+	return nil
+}
+
+func (*silentHysteria2Router) RoutePacketConnection(context.Context, N.PacketConn, adapter.InboundContext) error {
+	return nil
+}
+
+func (*silentHysteria2Router) RouteConnectionEx(context.Context, net.Conn, adapter.InboundContext, N.CloseHandlerFunc) {
+}
+
+func (*silentHysteria2Router) RoutePacketConnectionEx(context.Context, N.PacketConn, adapter.InboundContext, N.CloseHandlerFunc) {
 }
 
 type captureHysteria2Router struct {

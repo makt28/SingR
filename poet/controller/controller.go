@@ -67,6 +67,20 @@ type Controller struct {
 	// needed.
 	reloadPending bool
 
+	// userSyncPending is the user-list twin of reloadPending: set when a
+	// freshly fetched user list could not be applied to the protocol
+	// runtime (AddUsers/RemoveUsers/RefreshUsers failed), cleared on the
+	// next successful sync. GetUserList commits its ETag as soon as the
+	// response parses, so after such a failure the panel answers 304
+	// UserNotModified on every following cycle — without this flag the
+	// early 304 return in syncUserList would short-circuit the retry and
+	// the runtime would stay behind usersMap forever. lastUserList caches
+	// the fetched list so the retry can recompute the same delta under a
+	// 304; it is only populated while a retry is pending. Both fields are
+	// only touched from the monitor goroutine; no lock needed.
+	userSyncPending bool
+	lastUserList    []api.UserInfo
+
 	// environment = development testing staging production
 	env string
 }

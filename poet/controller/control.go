@@ -13,11 +13,19 @@ import (
 func (c *Controller) syncUserList() error {
 	userInfo, err := c.apiClient.GetUserList()
 	if err != nil {
-		if err.Error() == api.UserNotModified {
+		if err.Error() != api.UserNotModified {
+			return err
+		}
+		// GetUserList already committed its ETag when the previous
+		// response parsed, so a runtime-apply failure would never be
+		// retried through the diff alone: replay the cached list under
+		// 304 until the runtime delta lands (see userSyncPending).
+		if !c.userSyncPending {
 			c.log("GetUserList: 304 UserNotModified", "info")
 			return nil
 		}
-		return err
+		c.log("GetUserList: 304 UserNotModified, retrying pending runtime user sync", "info")
+		userInfo = &c.lastUserList
 	}
 
 	nextMap, added, deleted, changed := diffUsers(c.usersMap, *userInfo, c.buildUserHash)
@@ -41,33 +49,20 @@ func (c *Controller) syncUserList() error {
 	// mutate the authenticator until this succeeds: otherwise the next panel
 	// cycle sees no diff and never retries a failed AddUsers/RemoveUsers (or
 	// full RefreshUsers), leaving accounting state ahead of authentication.
+	// On failure, cache the fetched list and mark the sync pending so the
+	// retry survives 304 UserNotModified answers (the users ETag is already
+	// committed by then). Retrying is safe: RemoveUsers/AddUsers are
+	// idempotent on both inbound implementations, so replaying the same
+	// delta converges.
 	if shouldRefreshRuntimeUsers {
-		in := *c.inbound
-		if incremental, ok := in.(adapter.PIncrementalUserInbound); ok {
-			if len(deleted) > 0 {
-				if err := incremental.RemoveUsers(deleted); err != nil {
-					c.log(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-					return err
-				}
-			}
-			if len(deltaAddedChangedUsers) > 0 {
-				if err := incremental.AddUsers(&deltaAddedChangedUsers, c.nodeInfo); err != nil {
-					c.log(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-					return err
-				}
-			}
-		} else {
-			refresher, ok := in.(adapter.PInbound)
-			if !ok {
-				c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
-				return errors.New("inbound type does not support user refresh")
-			}
-			if err := refresher.RefreshUsers(&runtimeUsers, c.nodeInfo); err != nil {
-				c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
-				return err
-			}
+		if err := c.applyRuntimeUserDelta(deleted, deltaAddedChangedUsers, runtimeUsers); err != nil {
+			c.userSyncPending = true
+			c.lastUserList = append([]api.UserInfo(nil), (*userInfo)...)
+			return err
 		}
 	}
+	c.userSyncPending = false
+	c.lastUserList = nil
 
 	for _, hash := range deleted {
 		c.log(fmt.Sprintf("DeleteUser: %s", hash), "debug")
@@ -110,6 +105,39 @@ func (c *Controller) syncUserList() error {
 		c.ApplyUserLimits(hash, *u)
 	}
 
+	return nil
+}
+
+// applyRuntimeUserDelta pushes the computed user diff into the protocol
+// runtime, preferring the incremental interface and falling back to a full
+// refresh. It performs no controller-state mutation; the caller commits
+// usersMap/authenticator only after this succeeds.
+func (c *Controller) applyRuntimeUserDelta(deleted []string, deltaAddedChangedUsers, runtimeUsers []api.UserInfo) error {
+	in := *c.inbound
+	if incremental, ok := in.(adapter.PIncrementalUserInbound); ok {
+		if len(deleted) > 0 {
+			if err := incremental.RemoveUsers(deleted); err != nil {
+				c.log(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+				return err
+			}
+		}
+		if len(deltaAddedChangedUsers) > 0 {
+			if err := incremental.AddUsers(&deltaAddedChangedUsers, c.nodeInfo); err != nil {
+				c.log(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+				return err
+			}
+		}
+		return nil
+	}
+	refresher, ok := in.(adapter.PInbound)
+	if !ok {
+		c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
+		return errors.New("inbound type does not support user refresh")
+	}
+	if err := refresher.RefreshUsers(&runtimeUsers, c.nodeInfo); err != nil {
+		c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+		return err
+	}
 	return nil
 }
 
