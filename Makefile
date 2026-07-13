@@ -252,6 +252,9 @@ test_stdio:
 lib_android:
 	go run ./cmd/internal/build_libbox -target android
 
+lib_android_arm64:
+	go run ./cmd/internal/build_libbox -target android -platform android/arm64 -build-legacy=false
+
 lib_apple:
 	go run ./cmd/internal/build_libbox -target apple
 

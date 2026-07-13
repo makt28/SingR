@@ -18,6 +18,7 @@ import (
 
 var (
 	debugEnabled bool
+	buildLegacy  bool
 	target       string
 	platform     string
 	// withTailscale bool
@@ -25,6 +26,7 @@ var (
 
 func init() {
 	flag.BoolVar(&debugEnabled, "debug", false, "enable debug")
+	flag.BoolVar(&buildLegacy, "build-legacy", true, "build legacy Android AAR")
 	flag.StringVar(&target, "target", "android", "target platform")
 	flag.StringVar(&platform, "platform", "", "specify platform")
 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
@@ -174,6 +176,10 @@ func buildAndroid() {
 		OutputName: "libbox.aar",
 		Tags:       mainTags,
 	}, bindTarget)
+
+	if !buildLegacy {
+		return
+	}
 
 	// Build legacy variant (SDK 21, no naive outbound)
 	legacyTags := filterTags(sharedTags, "with_naive_outbound")

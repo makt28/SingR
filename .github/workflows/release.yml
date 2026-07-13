@@ -162,7 +162,12 @@ jobs:
           set -euo pipefail
           make lib_install
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android
+          make lib_android_arm64
+          unzip -Z1 libbox.aar | grep -qx 'jni/arm64-v8a/libbox.so'
+          if unzip -Z1 libbox.aar | grep -Eq '^jni/(armeabi-v7a|x86|x86_64)/'; then
+            echo "::error::Android release AAR contains an unexpected non-arm64 ABI"
+            exit 1
+          fi
           test -f libbox.aar
 
       - name: Package
