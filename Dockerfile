@@ -8,7 +8,7 @@
 # unit with this image. Config lives in /etc/singr-docker (isolated from the
 # bare-metal /etc/singr install so the two never collide on one host).
 # ============================================================================
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS builder
 COPY . /go/src/github.com/sagernet/sing-box
 WORKDIR /go/src/github.com/sagernet/sing-box
 ARG TARGETOS TARGETARCH
@@ -31,7 +31,7 @@ RUN set -ex \
         -ldflags "-X 'github.com/sagernet/sing-box/poet/constant.Version=$SINGR_VERSION' $LDFLAGS_SHARED -s -w -buildid=" \
         ./cmd/sing-box
 
-FROM --platform=$TARGETPLATFORM alpine AS dist
+FROM alpine:3.24 AS dist
 RUN set -ex \
     && apk add --no-cache --upgrade bash tzdata ca-certificates jq
 COPY --from=builder /go/bin/singr /usr/local/bin/singr

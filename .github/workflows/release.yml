@@ -36,7 +36,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.26.5"
           cache: true
@@ -99,7 +99,7 @@ jobs:
           )
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: SingR-${{ matrix.label }}-${{ matrix.goarch }}
           path: |
@@ -120,7 +120,7 @@ jobs:
 
       # Keep gomobile on the same pinned stable Go toolchain as the Linux release.
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.26.5"
           cache: true
@@ -179,7 +179,7 @@ jobs:
           ( cd dist && sha256sum "SingR-android.aar" > "SingR-android.aar.sha256" )
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: SingR-android-aar
           path: |
@@ -213,7 +213,7 @@ jobs:
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
