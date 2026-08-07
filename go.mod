@@ -184,4 +184,4 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
 
-replace github.com/sagernet/sing-quic => github.com/makt28/sing-quic v0.0.0-20260609144705-82864cb89ca8
+replace github.com/sagernet/sing-quic => github.com/makt28/sing-quic v0.0.0-20260807222158-5af2408d4f26
