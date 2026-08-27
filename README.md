@@ -123,11 +123,18 @@ singr add \
   --cert-path /etc/letsencrypt/live/b.example.com/fullchain.pem \
   --key-path  /etc/letsencrypt/live/b.example.com/privkey.pem
 
-singr del 57                  # 也可以用 InTag：singr del anytls-in-57
+singr del @2                  # @序号取自上面 list 的 # 列，最省事
+                              # 也可用 NodeID 或 InTag：singr del anytls-in-57
 ```
 
 `singr add` 不带参数（或从菜单进入）会逐项询问。每个节点独立拥有用户表、流量统计、
 限速桶和审计规则，**不同节点的用户 ID 撞车也不会串账**。
+
+> **指定节点优先用 `@序号`。** NodeID 只在单个面板内唯一——对接多个面板时，两个面板
+> 各有一个 16 号节点是很正常的。此时 `singr del 16` 会**拒绝执行**并列出候选（带 `@序号`
+> 和面板域名），绝不会替你挑一个删掉。`@序号` 和 InTag 则永远唯一。
+>
+> shell 里 `#` 是注释起始，`singr del #1` 会被吞掉，所以用 `@1`（写 `'#1'` 加引号也认）。
 
 几点必须知道的：
 
@@ -159,6 +166,18 @@ Docker 因为容器只挂载 `/etc/singr-docker`，宿主机别处（如 `/root/
 ```sh
 certbot renew --deploy-hook "singr cert-sync"
 ```
+
+> **从旧版本升级上来的 Docker 机器需要补一步。** 证书源只在首次安装和 `singr add` 时
+> 登记，老机器上 `certs.json` 并不存在，此时同步是空转的（`singr cert-sync` 检测到未
+> 登记会直接告诉你）。给每个已有节点补登记一次即可：
+>
+> ```sh
+> singr cert @1 --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
+>               --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
+> ```
+>
+> 同一个命令也用于更换某个节点的证书源，不必 `del` 再 `add`。
+
 
 ## Docker 部署
 

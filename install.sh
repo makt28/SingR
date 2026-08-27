@@ -117,12 +117,14 @@ detect_arch() {
 install_base() {
     # iptables/ip6tables 供 Hysteria2 端口跳跃管理（SingR porthop）使用，v4/v6 同包。
     # 持久化由 SingR 自管的 singr-porthop.service 负责，不依赖发行版持久化工具。
+    # logrotate 供日志轮转（install_logrotate）——没有它 /var/log/singr.log 只增不减，
+    # 撑爆磁盘后一切写操作都会失败。
     if [[ "${release}" == "centos" ]]; then
         yum install -y epel-release || true
-        yum install -y wget curl unzip tar ca-certificates jq vim iptables
+        yum install -y wget curl unzip tar ca-certificates jq vim iptables logrotate
     else
         apt update -y
-        apt install -y wget curl unzip tar ca-certificates jq vim iptables
+        apt install -y wget curl unzip tar ca-certificates jq vim iptables logrotate
     fi
 }
 
@@ -484,6 +486,69 @@ EOF
     systemctl enable "${SERVICE_NAME}"
 }
 
+_write_logrotate_conf() {
+    local conf="$1" logfile="$2" maxsize_line="$3"
+    cat >"${conf}" <<EOF
+${logfile} {
+    daily
+    rotate 7${maxsize_line}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+EOF
+}
+
+# 日志轮转：保留 7 天，多的自动删。
+#
+# copytruncate 是必须的，不是风格选择：sing-box 在启动时以 O_APPEND 打开日志并
+# 一直持有那个 fd（log/observable.go），既没有重开日志的机制，SIGHUP 又是把整个
+# box 拆了重建（cmd/sing-box/cmd_run.go）——代价远超轮转本身，不能用。若按常规的
+# rename 方式轮转，进程会继续往被改名的旧 inode 写，新的 singr.log 永远是空的、
+# 旧文件继续变大，而且 rm 掉也不会释放空间（fd 还开着）。O_APPEND 则保证
+# truncate 之后写入回到偏移 0，不会留下稀疏空洞，copytruncate 是安全的。
+#
+# daily + rotate 7 给出 7 天保留；maxsize 是兜底：某天日志暴涨时提前轮转，让磁盘
+# 占用有上限。代价是那一天的实际保留时长会短于 7 天——但撑爆磁盘更糟。
+install_logrotate() {
+    local conf="/etc/logrotate.d/singr"
+    local logfile="/var/log/singr.log"
+
+    # 轮转目标以 server.json 实际配置的 log.output 为准；为空表示输出到 stdout
+    # （由 systemd/journald 接管），那就不归 logrotate 管。
+    if command -v jq >/dev/null 2>&1 && [[ -f "${CONFIG_DIR}/server.json" ]]; then
+        local configured
+        configured="$(jq -r '(.log.output // "")' "${CONFIG_DIR}/server.json" 2>/dev/null || echo "")"
+        if [[ -z "${configured}" ]]; then
+            log_info "server.json 未配置日志文件（输出到 stdout），跳过 logrotate 配置。"
+            return 0
+        fi
+        logfile="${configured}"
+    fi
+
+    if [[ -f "${conf}" ]]; then
+        log_warn "保留已有日志轮转配置：${conf}"
+        return 0
+    fi
+
+    if ! command -v logrotate >/dev/null 2>&1; then
+        log_warn "未安装 logrotate，跳过日志轮转配置。注意 ${logfile} 会无限增长，最终撑爆磁盘。"
+        return 0
+    fi
+
+    _write_logrotate_conf "${conf}" "${logfile}" $'\n    maxsize 200M'
+    # 老版本 logrotate 不认识 maxsize，会让整份配置解析失败、一条都不轮转——
+    # 那比没有兜底更糟，所以先 dry-run 验一下，不过就退回不带 maxsize 的版本。
+    if ! logrotate -d "${conf}" >/dev/null 2>&1; then
+        _write_logrotate_conf "${conf}" "${logfile}" ""
+        log_warn "当前 logrotate 不支持 maxsize，已退回纯按天轮转（失去单日暴涨的兜底）。"
+    fi
+    log_info "已配置日志轮转：${conf}（${logfile}，保留 7 天）"
+}
+
 install_management_script() {
     local target="/usr/bin/SingR"
     local lower="/usr/bin/singr"
@@ -562,6 +627,7 @@ main() {
     install_binary
     install_config
     migrate_config
+    install_logrotate
     install_service
     install_management_script
 

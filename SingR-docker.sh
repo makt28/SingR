@@ -768,6 +768,60 @@ node_add() {
     return 1
 }
 
+# 把 <@序号|NodeID|InTag> 解析成唯一的 intag。stdout 只回显 intag，其余输出走 stderr。
+#
+# 三种选择器：
+#   @N      singr list 里的 # 列序号，永不歧义，最省事。shell 里 # 会被当成注释
+#           起始（`singr del #1` 会把 #1 整个吞掉），所以主推 @N；'#N' 加引号也认。
+#   InTag   唯一，由 node_alloc_tag 保证。
+#   NodeID  **在多面板场景下不唯一**：两个不同面板各有一个 56 号节点很正常。
+#
+# NodeID 命中多个时绝不能像 jq 的 first(...) 那样静默挑一个 —— 对 del 来说那是
+# 删错节点。这里直接报错，并把候选连同序号、面板域名列出来，让用户用 @N 重来。
+node_resolve_tag() {
+    local sel="$1" matches n idx tag
+
+    if [[ "${sel}" =~ ^[@#]([0-9]+)$ ]]; then
+        idx="${BASH_REMATCH[1]}"
+        if [[ "${idx}" -lt 1 ]]; then
+            echo -e "${red}序号从 1 开始${plain}" >&2
+            return 1
+        fi
+        tag="$(jq -r --argjson i "$((idx - 1))" '((.nodes // [])[$i] // {}) | (.intag // "")' "${PANEL_CONFIG}" 2>/dev/null)"
+        if [[ -z "${tag}" ]]; then
+            echo -e "${red}序号 ${idx} 超出范围（当前 $(node_count) 个节点，用 singr list 查看）${plain}" >&2
+            return 1
+        fi
+        printf '%s' "${tag}"
+        return 0
+    fi
+
+    # 输出 "序号<TAB>intag<TAB>域名"，冲突时好直接列给用户看。
+    matches="$(jq -r --arg s "${sel}" '
+        (.nodes // []) | to_entries[]
+        | select(((.value.apiconfig.nodeid // "") | tostring) == $s or (.value.intag // "") == $s)
+        | [((.key + 1) | tostring), (.value.intag // ""), (.value.apiconfig.apihost // "")] | @tsv
+    ' "${PANEL_CONFIG}" 2>/dev/null)"
+    n="$(printf '%s\n' "${matches}" | grep -c .)"
+
+    if [[ "${n}" -eq 0 ]]; then
+        echo -e "${red}未找到节点：${sel}${plain}" >&2
+        echo -e "${yellow}用 singr list 查看现有节点，可用 @序号 / NodeID / InTag 指定。${plain}" >&2
+        return 1
+    fi
+    if [[ "${n}" -gt 1 ]]; then
+        echo -e "${red}「${sel}」同时命中 ${n} 个节点（NodeID 在多面板下会重复），无法确定是哪一个：${plain}" >&2
+        local i t h
+        while IFS=$'\t' read -r i t h; do
+            [[ -z "${t}" ]] && continue
+            printf '  @%-4s %-22s %s\n' "${i}" "${t}" "${h}" >&2
+        done <<<"${matches}"
+        echo -e "${yellow}请改用上面的 @序号（如 @${matches%%$'\t'*}）或 InTag 精确指定。${plain}" >&2
+        return 1
+    fi
+    printf '%s' "$(printf '%s' "${matches}" | cut -f2)"
+}
+
 node_del() {
     node_require_jq || return 1
     node_configs_ready || return 1
@@ -776,18 +830,12 @@ node_del() {
     if [[ -z "${sel}" ]]; then
         node_list || return 1
         echo
-        read -r -p "输入要删除的 NodeID 或 InTag（回车取消）: " sel
+        read -r -p "输入要删除的 @序号 / NodeID / InTag（回车取消）: " sel
         [[ -z "${sel}" ]] && return 0
     fi
 
     local tag
-    tag="$(jq -r --arg s "${sel}" '
-        first((.nodes // [])[] | select(((.apiconfig.nodeid // "") | tostring) == $s or (.intag // "") == $s) | .intag) // ""
-    ' "${PANEL_CONFIG}" 2>/dev/null)"
-    if [[ -z "${tag}" ]]; then
-        echo -e "${red}未找到节点：${sel}${plain}"
-        return 1
-    fi
+    tag="$(node_resolve_tag "${sel}")" || return 1
 
     if [[ "$(node_count)" == "1" ]]; then
         echo -e "${red}这是最后一个节点。删掉之后 panel.json 将没有任何节点，进程会以"
@@ -928,9 +976,85 @@ certs_sync() {
     return ${changed}
 }
 
+# 给一个已存在的节点登记 / 更换宿主机证书源。
+#
+# 为什么必须有这个动词：certs.json 只由 install-docker.sh（首装）和 singr add
+# （新节点）写入。从旧版本升级上来的机器，管理脚本更新后有了 certs_sync，但
+# certs.json 不存在，于是整体 no-op —— 证书续期依旧不生效，而且不会报任何错。
+# 这个动词用来补登记，顺带也用于换证书源（不必 del 再 add）。
+#
+# 节点用 @序号 指定最省事（singr list 的 # 列）；NodeID 在多面板下会重复，
+# node_resolve_tag 遇到歧义会拒绝并列出候选，不会挑错节点。
+node_cert_register() {
+    require_docker
+    node_require_jq || return 1
+    node_configs_ready || return 1
+
+    local sel="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    local cert_src="" key_src=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cert-path) cert_src="$2"; shift 2 ;;
+            --key-path) key_src="$2"; shift 2 ;;
+            *) echo -e "${red}未知参数：$1${plain}"; return 1 ;;
+        esac
+    done
+
+    if [[ -z "${sel}" ]] && [[ -t 0 ]]; then
+        node_list || return 1
+        echo
+        read -r -p "输入要登记证书的 @序号 / NodeID / InTag（回车取消）: " sel
+        [[ -z "${sel}" ]] && return 0
+    fi
+    [[ -n "${sel}" ]] || {
+        echo -e "${red}用法：singr cert <@序号|NodeID|InTag> --cert-path PATH --key-path PATH${plain}"
+        return 1
+    }
+
+    local tag
+    tag="$(node_resolve_tag "${sel}")" || return 1
+
+    if [[ -t 0 ]]; then
+        [[ -z "${cert_src}" ]] && read -r -p "宿主机证书路径 (--cert-path): " cert_src
+        [[ -z "${key_src}" ]] && read -r -p "宿主机私钥路径 (--key-path): " key_src
+    fi
+    [[ -s "${cert_src}" ]] || { echo -e "${red}找不到证书文件：${cert_src}${plain}"; return 1; }
+    [[ -s "${key_src}" ]] || { echo -e "${red}找不到私钥文件：${key_src}${plain}"; return 1; }
+
+    # 目标路径以 server.json 里该 inbound 的配置为准；不在挂载目录下就没法同步。
+    local dst_cert
+    dst_cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+    [[ -n "${dst_cert}" ]] || { echo -e "${red}server.json 里没有 tag 为 ${tag} 的 inbound${plain}"; return 1; }
+    case "${dst_cert}" in
+        "${CONFIG_DIR}"/*) ;;
+        *)
+            echo -e "${red}该 inbound 的证书路径 ${dst_cert} 不在 ${CONFIG_DIR} 下，容器内不可见。${plain}"
+            echo -e "${yellow}请先用 singr config 把它改到 ${CERT_DIR}/ 下，再执行本命令。${plain}"
+            return 1
+            ;;
+    esac
+
+    certs_map_set "${tag}" "${cert_src}" "${key_src}" || return 1
+    echo -e "${green}已登记 ${tag} 的证书源：${cert_src}${plain}"
+    cert_sync_cmd 0
+}
+
 # 供 certbot --deploy-hook 使用：同步证书，只有确实变了才重启容器。
 cert_sync_cmd() {
     require_docker
+    # 有节点却没有任何证书源登记 —— 这是从旧版本升级上来的机器的正常状态：证书源
+    # 只在首装（install-docker.sh）和 singr add 时登记。此时同步是空转的，必须说
+    # 出来，否则用户挂上 certbot 钩子还以为万事大吉，续期其实从来没生效过。
+    if [[ ! -s "${CERTS_MAP}" ]] && command -v jq >/dev/null 2>&1 &&
+        [[ -f "${PANEL_CONFIG}" ]] && [[ "$(jq -r '(.nodes // []) | length' "${PANEL_CONFIG}" 2>/dev/null || echo 0)" != "0" ]]; then
+        echo -e "${yellow}尚未登记任何证书源（${CERTS_MAP} 不存在），证书同步不会做任何事。${plain}"
+        echo -e "${yellow}这是从旧版本升级上来的机器的正常状态。给每个节点补登记一次即可：${plain}"
+        echo -e "  singr cert @1 --cert-path /路径/fullchain.pem --key-path /路径/privkey.pem"
+        echo -e "${yellow}（@1 是 singr list 里的 # 序号）${plain}"
+        if [[ $# == 0 ]]; then before_show_menu; fi
+        return 1
+    fi
     if certs_sync; then
         echo -e "${green}证书有更新，重启容器使其生效（TLS 证书材料不热重载）${plain}"
         restart 0
@@ -1160,7 +1284,9 @@ show_usage() {
     echo "------------------------------------------"
     echo "singr list                  查看当前节点"
     echo "singr add [参数]            添加节点（不带参数则逐项询问）"
-    echo "singr del <NodeID|InTag>    删除节点"
+    echo "singr del <@序号>           删除节点，序号取自 singr list 的 # 列"
+    echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
+    echo "singr cert <@序号> ...      登记/更换该节点的宿主机证书源"
     echo "singr cert-sync             重新复制宿主机证书，变了才重启（certbot 钩子）"
     echo "------------------------------------------"
     echo "添加节点参数："
@@ -1232,6 +1358,7 @@ if [[ $# -gt 0 ]]; then
         add) shift; node_add "$@" ;;
         del | delete | rm) node_del "${2:-}" ;;
         cert-sync | certsync) cert_sync_cmd 0 ;;
+        cert) shift; node_cert_register "$@" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;
         porthop-flush) porthop_flush_all ;;

@@ -114,6 +114,7 @@ uninstall_singr() {
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
     systemctl daemon-reload
     systemctl reset-failed >/dev/null 2>&1 || true
+    rm -f /etc/logrotate.d/singr
     rm -rf "${INSTALL_DIR}" "${CONFIG_DIR}"
 
     echo -e "${green}卸载成功${plain}"
@@ -638,6 +639,60 @@ node_add() {
     return 1
 }
 
+# 把 <@序号|NodeID|InTag> 解析成唯一的 intag。stdout 只回显 intag，其余输出走 stderr。
+#
+# 三种选择器：
+#   @N      singr list 里的 # 列序号，永不歧义，最省事。shell 里 # 会被当成注释
+#           起始（`singr del #1` 会把 #1 整个吞掉），所以主推 @N；'#N' 加引号也认。
+#   InTag   唯一，由 node_alloc_tag 保证。
+#   NodeID  **在多面板场景下不唯一**：两个不同面板各有一个 56 号节点很正常。
+#
+# NodeID 命中多个时绝不能像 jq 的 first(...) 那样静默挑一个 —— 对 del 来说那是
+# 删错节点。这里直接报错，并把候选连同序号、面板域名列出来，让用户用 @N 重来。
+node_resolve_tag() {
+    local sel="$1" matches n idx tag
+
+    if [[ "${sel}" =~ ^[@#]([0-9]+)$ ]]; then
+        idx="${BASH_REMATCH[1]}"
+        if [[ "${idx}" -lt 1 ]]; then
+            echo -e "${red}序号从 1 开始${plain}" >&2
+            return 1
+        fi
+        tag="$(jq -r --argjson i "$((idx - 1))" '((.nodes // [])[$i] // {}) | (.intag // "")' "${PANEL_CONFIG}" 2>/dev/null)"
+        if [[ -z "${tag}" ]]; then
+            echo -e "${red}序号 ${idx} 超出范围（当前 $(node_count) 个节点，用 singr list 查看）${plain}" >&2
+            return 1
+        fi
+        printf '%s' "${tag}"
+        return 0
+    fi
+
+    # 输出 "序号<TAB>intag<TAB>域名"，冲突时好直接列给用户看。
+    matches="$(jq -r --arg s "${sel}" '
+        (.nodes // []) | to_entries[]
+        | select(((.value.apiconfig.nodeid // "") | tostring) == $s or (.value.intag // "") == $s)
+        | [((.key + 1) | tostring), (.value.intag // ""), (.value.apiconfig.apihost // "")] | @tsv
+    ' "${PANEL_CONFIG}" 2>/dev/null)"
+    n="$(printf '%s\n' "${matches}" | grep -c .)"
+
+    if [[ "${n}" -eq 0 ]]; then
+        echo -e "${red}未找到节点：${sel}${plain}" >&2
+        echo -e "${yellow}用 singr list 查看现有节点，可用 @序号 / NodeID / InTag 指定。${plain}" >&2
+        return 1
+    fi
+    if [[ "${n}" -gt 1 ]]; then
+        echo -e "${red}「${sel}」同时命中 ${n} 个节点（NodeID 在多面板下会重复），无法确定是哪一个：${plain}" >&2
+        local i t h
+        while IFS=$'\t' read -r i t h; do
+            [[ -z "${t}" ]] && continue
+            printf '  @%-4s %-22s %s\n' "${i}" "${t}" "${h}" >&2
+        done <<<"${matches}"
+        echo -e "${yellow}请改用上面的 @序号（如 @${matches%%$'\t'*}）或 InTag 精确指定。${plain}" >&2
+        return 1
+    fi
+    printf '%s' "$(printf '%s' "${matches}" | cut -f2)"
+}
+
 node_del() {
     node_require_jq || return 1
     node_configs_ready || return 1
@@ -646,18 +701,12 @@ node_del() {
     if [[ -z "${sel}" ]]; then
         node_list || return 1
         echo
-        read -r -p "输入要删除的 NodeID 或 InTag（回车取消）: " sel
+        read -r -p "输入要删除的 @序号 / NodeID / InTag（回车取消）: " sel
         [[ -z "${sel}" ]] && return 0
     fi
 
     local tag
-    tag="$(jq -r --arg s "${sel}" '
-        first((.nodes // [])[] | select(((.apiconfig.nodeid // "") | tostring) == $s or (.intag // "") == $s) | .intag) // ""
-    ' "${PANEL_CONFIG}" 2>/dev/null)"
-    if [[ -z "${tag}" ]]; then
-        echo -e "${red}未找到节点：${sel}${plain}"
-        return 1
-    fi
+    tag="$(node_resolve_tag "${sel}")" || return 1
 
     if [[ "$(node_count)" == "1" ]]; then
         echo -e "${red}这是最后一个节点。删掉之后 panel.json 将没有任何节点，进程会以"
@@ -979,7 +1028,8 @@ show_usage() {
     echo "------------------------------------------"
     echo "SingR list                  查看当前节点"
     echo "SingR add [参数]            添加节点（不带参数则逐项询问）"
-    echo "SingR del <NodeID|InTag>    删除节点"
+    echo "SingR del <@序号>           删除节点，序号取自 singr list 的 # 列"
+    echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
     echo "------------------------------------------"
     echo "添加节点参数："
     echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2"
