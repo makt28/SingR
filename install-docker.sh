@@ -168,8 +168,23 @@ install_management_script() {
     if [[ -f "${SCRIPT_DIR}/SingR-docker.sh" ]]; then
         install -m 755 "${SCRIPT_DIR}/SingR-docker.sh" "${target}"
     else
-        curl -fsSL "${SCRIPT_URL}" -o "${target}" || die "下载管理脚本失败：${SCRIPT_URL}"
-        chmod +x "${target}"
+        # 下到临时文件校验后再就位：curl 退出码只能挡住网络/写入失败，挡不住
+        # 200 返回了一个错误页或被截断的内容——那会装上一个语法坏掉的管理命令。
+        local tmp
+        tmp="$(mktemp "$(dirname "${target}")/.SingR.XXXXXX")" || die "无法创建临时文件（磁盘满？）"
+        curl -fsSL "${SCRIPT_URL}" -o "${tmp}" || {
+            rm -f "${tmp}"
+            die "下载管理脚本失败：${SCRIPT_URL}"
+        }
+        if [[ ! -s "${tmp}" ]] || ! bash -n "${tmp}" 2>/dev/null; then
+            rm -f "${tmp}"
+            die "下载到的管理脚本不完整或语法有误：${SCRIPT_URL}"
+        fi
+        chmod 755 "${tmp}"
+        mv -f "${tmp}" "${target}" || {
+            rm -f "${tmp}"
+            die "安装管理脚本失败：${target}"
+        }
     fi
     ln -sf "${target}" /usr/bin/singr
     log_info "已安装管理命令：SingR / singr"
