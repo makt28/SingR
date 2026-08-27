@@ -106,6 +106,60 @@ singr porthop      # Hysteria2 端口跳跃管理（增/删/查跳跃规则）
 
 管理菜单里对应的是第 13 项「Hysteria2 端口跳跃管理」。
 
+## 多节点（一个进程带多个面板节点）
+
+一台机器可以同时对接多个面板节点，共用同一个 SingR 进程。裸机和 Docker 用法完全
+一致，管理菜单里对应第 14 项「节点管理」。
+
+```sh
+singr list                    # 查看当前节点（NodeID / 协议 / 域名 / InTag / 证书状态）
+
+singr add \
+  --api-url https://panel-b.example.com \
+  --api-key your-apikey \
+  --node-id 57 \
+  --protocol anytls \
+  --sni b.example.com \
+  --cert-path /etc/letsencrypt/live/b.example.com/fullchain.pem \
+  --key-path  /etc/letsencrypt/live/b.example.com/privkey.pem
+
+singr del 57                  # 也可以用 InTag：singr del anytls-in-57
+```
+
+`singr add` 不带参数（或从菜单进入）会逐项询问。每个节点独立拥有用户表、流量统计、
+限速桶和审计规则，**不同节点的用户 ID 撞车也不会串账**。
+
+几点必须知道的：
+
+- **端口必须在面板侧错开。** 监听端口由面板下发，两个节点拿到同一个端口时第二个
+  监听会起不来——anytls 会回滚到旧配置（随机端口），进程看着健康，节点其实不可达。
+- **任一节点起不来会拖垮全部节点。** 同进程内只要有一个节点向面板取信息失败，整个
+  进程就会退出并被拉起重试。所以 `singr add` / `singr del` 每次都会先备份配置，改完
+  重启并校验，起不来就**自动回滚**到改动前的状态。
+- **inbound 标签自动分配**：第一个 anytls 节点用 `anytls-in`，第二个用
+  `anytls-in-<节点ID>`，以此类推；hysteria2 同理。
+- 只剩一个节点时不允许删除（没有节点进程无法启动）。要换节点请先 `add` 新的、再
+  `del` 旧的。
+
+### 证书续期
+
+TLS 证书材料不热重载，**续期后必须重启才生效**，两种部署方式都是如此。
+
+裸机直接引用你给的证书路径（不复制），certbot 原地更新文件即可：
+
+```sh
+certbot renew --deploy-hook "singr restart"
+```
+
+Docker 因为容器只挂载 `/etc/singr-docker`，宿主机别处（如 `/root/`、
+`/etc/letsencrypt/`）的文件容器内看不见，所以证书必须复制进挂载目录。`singr` 会记住
+你给的源路径（记在 `/etc/singr-docker/certs.json`），每次 `start` / `restart` /
+`update` 之前自动重新复制一遍。挂上这行就全自动了（只有证书真的变了才会重启）：
+
+```sh
+certbot renew --deploy-hook "singr cert-sync"
+```
+
 ## Docker 部署
 
 除裸机 systemd 安装外，SingR 还提供 Docker 镜像，发布在 **`ghcr.io/makt28/singr`**
@@ -206,8 +260,19 @@ host 网络）、日志走 stdout（`docker logs` 查看，配合 `--log-opt` �
 （改文件 + 重启即可，参数只做首次引导），更新/重建容器配置不丢。
 
 Hysteria2 端口跳跃是宿主机 iptables NAT（host 网络下容器与宿主机共享网络栈），
-方式一用 `singr porthop` 管理，方式二/三可另跑一次 `install-docker.sh` 装上
-`singr` 命令后使用，或直接手动配 iptables。
+方式一用 `singr porthop` 管理。方式二/三没有装管理脚本，可以只把脚本取下来用
+（**不要**再跑一次 `install-docker.sh`：它检测到已有 `/etc/singr-docker/panel.json`
+会直接拒绝，因为重复安装不会让新参数生效，却会先删掉正在服务的容器）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/SingR-docker.sh -o /usr/bin/SingR
+chmod +x /usr/bin/SingR && ln -sf /usr/bin/SingR /usr/bin/singr
+```
+
+或者直接手动配 iptables。
+
+> 首次启动的参数只做引导，**之后一切以 `/etc/singr-docker/panel.json` 为准**。要加
+> 节点请用 `singr add`（见上面「多节点」），不要重跑安装脚本。
 
 ## 手动编译安装
 

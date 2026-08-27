@@ -38,6 +38,8 @@ CONFIG_DIR="${SINGR_CONFIG_DIR:-/etc/singr-docker}"
 CERT_DIR="${CONFIG_DIR}/certs"
 PANEL="${CONFIG_DIR}/panel.json"
 SERVER="${CONFIG_DIR}/server.json"
+# 首个节点的协议标记。自多节点支持（singr add）起，证书检查改为遍历 panel.json
+# 的 .nodes[].intag，不再依赖这个文件；保留只为向后兼容与排障时看一眼。
 PROTO_MARK="${CONFIG_DIR}/.protocol"
 DEFAULT_SERVER="/opt/singr/server.default.json"
 
@@ -173,23 +175,25 @@ else
     log_warn "保留已有配置：${PANEL}"
 fi
 
-# --- resolve active protocol for the cert check -----------------------------
-if [[ -z "${PROTOCOL}" ]]; then
-    if [[ -f "${PROTO_MARK}" ]]; then
-        PROTOCOL="$(cat "${PROTO_MARK}")"
-    else
-        # Fall back to whatever protocol panel.json actually references.
-        PROTOCOL="$(jq -r '(.nodes[0].intag // "") | sub("-in$";"")' "${PANEL}" 2>/dev/null || echo "")"
-    fi
-fi
-
 # --- certificate check: refuse to start without it (matches bare-metal) -----
-if [[ -n "${PROTOCOL}" ]]; then
-    active_cert="$(jq -r --arg tag "${PROTOCOL}-in" \
-        '(.inbounds[] | select(.tag==$tag) | .tls.certificate_path) // ""' "${SERVER}" 2>/dev/null || echo "")"
-    active_key="$(jq -r --arg tag "${PROTOCOL}-in" \
-        '(.inbounds[] | select(.tag==$tag) | .tls.key_path) // ""' "${SERVER}" 2>/dev/null || echo "")"
-    [[ -n "${active_cert}" ]] || die "server.json 中找不到 ${PROTOCOL}-in 的证书路径。"
+#
+# Multi-node aware: panel.json may carry several nodes, each bound to its own
+# inbound via `intag` (added with `singr add`). Every referenced inbound is
+# checked, not just one protocol's — any single node failing Start() makes
+# poet/panel/panel.go os.Exit(1) and takes the whole process down with it, so a
+# loud, specific failure here beats a crash-loop with a vaguer error later.
+node_tags="$(jq -r '(.nodes // [])[] | (.intag // "") | select(. != "")' "${PANEL}" 2>/dev/null || echo "")"
+[[ -n "${node_tags}" ]] || die "panel.json 里没有任何带 intag 的节点，进程会以 'no Node with InTag found' 退出。"
+
+while IFS= read -r tag; do
+    [[ -z "${tag}" ]] && continue
+    active_cert="$(jq -r --arg t "${tag}" \
+        '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER}" 2>/dev/null || echo "")"
+    active_key="$(jq -r --arg t "${tag}" \
+        '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER}" 2>/dev/null || echo "")"
+    if [[ -z "${active_cert}" ]]; then
+        die "panel.json 的节点引用了 inbound '${tag}'，但 server.json 里没有这个 tag 的 inbound（或它没有 tls 配置）。"
+    fi
     if [[ ! -s "${active_cert}" || ! -s "${active_key}" ]]; then
         hint=""
         # 证书路径不在挂载目录内 → 多半是宿主机路径（如 /root/xxx），容器里根本看不到。
@@ -198,14 +202,13 @@ if [[ -n "${PROTOCOL}" ]]; then
             *) hint="
 注意：证书路径 ${active_cert} 不在挂载目录 ${CONFIG_DIR} 下。容器只挂载了
 ${CONFIG_DIR}，宿主机上别处（如 /root/）的文件在容器内不可见。请把证书复制到
-${CERT_DIR}/ 下（如 ${CERT_DIR}/${PROTOCOL}.crt 与 ${PROTOCOL}.key），
-或用 install-docker.sh 的 --cert-path/--key-path（脚本会自动复制进挂载目录）。" ;;
+${CERT_DIR}/ 下，或用 singr add 的 --cert-path/--key-path（脚本会复制进挂载目录
+并登记源路径，之后每次重启自动重新同步）。" ;;
         esac
-        die "缺少 TLS 证书（容器内路径）：${active_cert} / ${active_key}${hint}
-默认位置：${CERT_DIR}/${PROTOCOL}.crt 与 ${PROTOCOL}.key。
+        die "节点 inbound '${tag}' 缺少 TLS 证书（容器内路径）：${active_cert} / ${active_key}${hint}
 与裸机二进制一致：没有证书不会启动。"
     fi
-fi
+done <<<"${node_tags}"
 
 log_info "启动 SingR：singr run -c ${SERVER} -p ${PANEL}"
 exec /usr/local/bin/singr run -c "${SERVER}" -p "${PANEL}"

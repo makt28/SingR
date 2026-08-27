@@ -13,6 +13,12 @@
 # Usage:
 #   bash install-docker.sh --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 [opts]
 #
+# 本脚本只负责装第一个节点。已经装过之后再跑会被拒绝（重复运行不会让新参数生效，
+# 却会先删掉正在服务的容器）。同一台机上再加节点请用：
+#   singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 \
+#             --sni HOST --cert-path PATH --key-path PATH
+# 查看/删除：singr list / singr del <NodeID>
+#
 # App parameters (written into panel.json on first container start):
 #   --api-url URL              (required)   panel apihost
 #   --api-key KEY              (required)   panel apikey
@@ -47,6 +53,7 @@ die()      { echo -e "${red}$*${plain}" >&2; exit 1; }
 CONFIG_DIR="/etc/singr-docker"
 CERT_DIR="${CONFIG_DIR}/certs"
 DOCKER_CONF="${CONFIG_DIR}/docker.conf"
+CERTS_MAP="${CONFIG_DIR}/certs.json"
 
 RELEASE_REPO="${SINGR_RELEASE_REPO:-makt28/SingR}"
 RELEASE_BRANCH="${SINGR_RELEASE_BRANCH:-main}"
@@ -67,6 +74,22 @@ CERT_SRC=""; KEY_SRC=""       # 宿主机上的证书源路径，安装时复制
 declare -a APP_FLAGS=()
 
 check_root() { [[ "${EUID}" -eq 0 ]] || die "错误：必须使用 root 用户运行此脚本。"; }
+
+# 重复安装守卫。entrypoint 只在 panel.json 不存在时才用命令行参数生成配置，所以
+# 第二次带着新节点参数跑本脚本，参数会被静默忽略——而 _bootstrap 又会先
+# `docker rm -f` 掉正在服务的容器，再用旧配置拉起来。等于停一次机换来零变更。
+# 多节点请走 `singr add`（同一进程可以带多个节点，见 AGENTS.md「多节点」）。
+guard_existing_install() {
+    [[ -f "${CONFIG_DIR}/panel.json" ]] || return 0
+    die "检测到 ${CONFIG_DIR}/panel.json 已存在：本机已经装过 SingR（Docker）。
+重复运行安装脚本不会让新参数生效，反而会先删掉正在运行的容器。请改用：
+  · 新增节点：  singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 \\
+                          --sni HOST --cert-path PATH --key-path PATH
+  · 查看节点：  singr list
+  · 删除节点：  singr del <NodeID>
+  · 升级镜像：  singr update
+  · 推倒重来：  singr uninstall  然后再跑本脚本"
+}
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -91,7 +114,9 @@ parse_args() {
             --restart)        RESTART="$2"; shift 2;;
             --log-max-size)   LOG_MAX_SIZE="$2"; shift 2;;
             --log-max-file)   LOG_MAX_FILE="$2"; shift 2;;
-            -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+            # 只打印文件顶部那段连续的注释头，遇到第一行非注释就停。
+            # 旧写法 `grep '^#' "$0"` 会把脚本里每个函数的说明注释也一并倒出来。
+            -h|--help) awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1{exit}' "$0"; exit 0;;
             *) die "未知参数：$1（用 -h 查看用法）";;
         esac
     done
@@ -199,12 +224,38 @@ copy_certs() {
         install -m 600 "${KEY_SRC}" "${CERT_DIR}/${proto}.key"
         log_info "已复制私钥 -> ${CERT_DIR}/${proto}.key"
     fi
+    record_cert_sources "${proto}-in"
+}
+
+# 登记宿主机证书源路径，供 `singr` 的 certs_sync 在每次 start/restart/update 前
+# 重新复制。不登记的话复制就是一次性的：certbot 续期后容器会一直用着安装当天
+# 那张证书，而且无从得知源文件在哪。
+#
+# 这里不用 jq 写：装 docker 的宿主机不一定有 jq，而首装时只有一个条目，here-doc
+# 足够。singr add 之后的写入才走 jq。含引号/反斜杠的路径直接拒绝，避免拼出坏 JSON。
+record_cert_sources() {
+    local tag="$1"
+    [[ -n "${CERT_SRC}" && -n "${KEY_SRC}" ]] || return 0
+    case "${CERT_SRC}${KEY_SRC}" in
+        *'"'* | *'\'*)
+            log_warn "证书路径含引号或反斜杠，跳过源路径登记；证书续期后需手动执行 singr cert-sync 或重新复制。"
+            return 0
+            ;;
+    esac
+    cat > "${CERTS_MAP}" <<EOF
+{
+  "${tag}": { "cert": "${CERT_SRC}", "key": "${KEY_SRC}" }
+}
+EOF
+    chmod 600 "${CERTS_MAP}" 2>/dev/null || true
+    log_info "已登记证书源路径：${CERTS_MAP}（重启时自动重新同步）"
 }
 
 main() {
     check_root
     parse_args "$@"
     validate
+    guard_existing_install
     install_docker
     write_conf
     copy_certs

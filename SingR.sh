@@ -10,6 +10,7 @@ APP_NAME="SingR"
 INSTALL_DIR="/usr/local/SingR"
 BIN_PATH="${INSTALL_DIR}/singr"
 CONFIG_DIR="/etc/singr"
+CERT_DIR="${CONFIG_DIR}/certs"
 PANEL_CONFIG="${CONFIG_DIR}/panel.json"
 SERVER_CONFIG="${CONFIG_DIR}/server.json"
 LOG_FILE="/var/log/singr.log"
@@ -249,6 +250,490 @@ show_status() {
     esac
 }
 
+# >>>>>>>>>>>>>>>> SYNC BLOCK: 节点管理 >>>>>>>>>>>>>>>>
+# 本块在 SingR.sh 与 SingR-docker.sh 中逐字相同，改一处必须同步另一处。
+#
+# 单进程多节点：panel.json 的 .nodes[] 每项是一个面板节点，靠唯一的 intag 绑定
+# server.json 里的一个 inbound。Go 侧本来就按这个模型工作——
+# poet/panel/panel.go 按 NodesConfig 循环建 Controller（每个 Controller 自带
+# Authenticator，用户表与流量计数天然隔离），poet/poet.go 按 metadata.Inbound
+# 找 Controller 计费，cmd/sing-box/cmd_run.go 的 filterInboundsByPanel 只实例化
+# 被 intag 引用的 inbound。所以"加节点"纯粹是改这两个 JSON，无需改 Go。
+#
+# 注意：同一进程内任一节点 Start() 失败会让 poet/panel/panel.go 走 os.Exit(1)，
+# 把所有节点一起带下线。因此本块的每次写入都走"备份 → 重启 → 校验 → 失败回滚"。
+#
+# 后端差异由下列钩子承担，各脚本自行实现，不在本块内：
+#   node_backend_place_cert <tag> <cert_src> <key_src>  -> 仅在 stdout 回显
+#                                                          "<certpath>|<keypath>"，其余输出走 stderr
+#   node_backend_forget_cert <tag>                      -> 清理该 tag 的证书登记
+#   node_backend_restart                                -> 重启后端
+#   node_backend_verify                                 -> 0=确实起来了（须能识别 crash-loop）
+#   node_cert_renew_hint                                -> 打印该后端的证书续期建议
+
+node_require_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    echo -e "${yellow}节点管理需要 jq，正在尝试自动安装...${plain}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq jq >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y jq >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y jq >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache jq >/dev/null 2>&1
+    fi
+    command -v jq >/dev/null 2>&1 && return 0
+    echo -e "${red}jq 安装失败，请手动安装后重试（Debian/Ubuntu: apt install jq）${plain}"
+    return 1
+}
+
+node_norm_proto() {
+    case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        anytls) echo anytls ;;
+        hysteria2 | hy2) echo hysteria2 ;;
+        *) return 1 ;;
+    esac
+}
+
+node_configs_ready() {
+    if [[ ! -f "${PANEL_CONFIG}" || ! -f "${SERVER_CONFIG}" ]]; then
+        echo -e "${red}未找到 ${PANEL_CONFIG} 或 ${SERVER_CONFIG}，请先完成安装${plain}"
+        return 1
+    fi
+    return 0
+}
+
+# tag 是否已被某个节点占用。只看 panel.json：server.json 里存在同名 inbound 但没有
+# 节点引用它（默认配置铺的 anytls-in / hysteria2-in 超集就是这种），那不是"占用"，
+# 而是可以直接接管的模板——第一次 add 就该落在 anytls-in 上，与老装机保持一致。
+node_tag_used() {
+    jq -e --arg t "$1" '[(.nodes // [])[].intag] | index($t) != null' "${PANEL_CONFIG}" >/dev/null 2>&1
+}
+
+node_alloc_tag() {
+    local proto="$1" nodeid="$2" cand n
+    cand="${proto}-in"
+    node_tag_used "${cand}" || { printf '%s' "${cand}"; return; }
+    cand="${proto}-in-${nodeid}"
+    node_tag_used "${cand}" || { printf '%s' "${cand}"; return; }
+    n=2
+    while node_tag_used "${cand}-${n}"; do n=$((n + 1)); done
+    printf '%s' "${cand}-${n}"
+}
+
+node_count() {
+    jq -r '(.nodes // []) | length' "${PANEL_CONFIG}" 2>/dev/null || echo 0
+}
+
+# install.sh 铺的占位节点（apihost=your-sspanel.example.com / apikey=your-apikey）
+# 不是真节点，留着会在启动时 GetNodeInfo 失败，把同进程的真节点一起拖死。
+node_has_placeholder() {
+    jq -e '[(.nodes // [])[] | select(((.apiconfig.apihost // "") | test("your-sspanel\\.example\\.com"))
+            or ((.apiconfig.apikey // "") == "your-apikey"))] | length > 0' "${PANEL_CONFIG}" >/dev/null 2>&1
+}
+
+node_drop_placeholder() {
+    local tmp
+    tmp="$(mktemp)" || return 1
+    jq '(.nodes // []) |= map(select((((.apiconfig.apihost // "") | test("your-sspanel\\.example\\.com"))
+            or ((.apiconfig.apikey // "") == "your-apikey")) | not))' \
+        "${PANEL_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${PANEL_CONFIG}"
+}
+
+node_list() {
+    node_require_jq || return 1
+    node_configs_ready || return 1
+
+    echo -e "${green}当前节点（${PANEL_CONFIG}）：${plain}"
+    if [[ "$(node_count)" == "0" ]]; then
+        echo -e "  ${yellow}(无节点，用 singr add 添加)${plain}"
+        return 0
+    fi
+
+    # 表头用 ASCII：printf 的宽度按字节算，中文表头会和下面的数据列对不齐。
+    printf '  %-3s %-8s %-10s %-34s %-20s %s\n' "#" "NodeID" "PROTO" "DOMAIN" "INTAG" "CERT"
+    local i=1 nodeid apihost intag proto cert key mark
+    while IFS=$'\t' read -r nodeid apihost intag; do
+        [[ -z "${intag}" ]] && continue
+        proto="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .type)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+        [[ -z "${proto}" ]] && proto="${intag%%-in*}"
+        cert="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+        key="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+        if [[ -z "${cert}" ]]; then
+            mark="${red}无 inbound${plain}"
+        elif [[ -s "${cert}" && -s "${key}" ]]; then
+            mark="${green}OK${plain}"
+        else
+            mark="${red}缺失${plain}"
+        fi
+        printf '  %-3s %-8s %-10s %-34s %-20s ' "${i}" "${nodeid}" "${proto}" "${apihost}" "${intag}"
+        echo -e "${mark}"
+        i=$((i + 1))
+    done < <(jq -r '(.nodes // [])[] | [((.apiconfig.nodeid // "?")|tostring), (.apiconfig.apihost // "?"), (.intag // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null)
+}
+
+# 菜单里用的简版：装好之前/没有 jq 时安静跳过，不要在主菜单上刷红字。
+node_list_brief() {
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -f "${PANEL_CONFIG}" && -f "${SERVER_CONFIG}" ]] || return 0
+    node_list
+}
+
+node_backup() {
+    cp -f "${PANEL_CONFIG}" "${PANEL_CONFIG}.bak" 2>/dev/null || return 1
+    cp -f "${SERVER_CONFIG}" "${SERVER_CONFIG}.bak" 2>/dev/null || return 1
+}
+
+node_restore() {
+    [[ -f "${PANEL_CONFIG}.bak" ]] && mv -f "${PANEL_CONFIG}.bak" "${PANEL_CONFIG}"
+    [[ -f "${SERVER_CONFIG}.bak" ]] && mv -f "${SERVER_CONFIG}.bak" "${SERVER_CONFIG}"
+    return 0
+}
+
+node_commit() {
+    rm -f "${PANEL_CONFIG}.bak" "${SERVER_CONFIG}.bak"
+}
+
+# 落盘后重启并校验；起不来就还原配置再重启回去。
+node_apply() {
+    echo -e "${green}正在重启 ${APP_NAME} 应用变更...${plain}"
+    node_backend_restart
+    if node_backend_verify; then
+        node_commit
+        echo -e "${green}变更已生效${plain}"
+        return 0
+    fi
+    echo -e "${red}${APP_NAME} 未能正常启动，正在回滚配置...${plain}"
+    node_restore
+    node_backend_restart
+    if node_backend_verify; then
+        echo -e "${yellow}已回滚到变更前的配置，${APP_NAME} 已恢复运行。请用 singr log 查看失败原因${plain}"
+    else
+        echo -e "${red}回滚后仍未能启动，请立即用 singr log 排查${plain}"
+    fi
+    return 1
+}
+
+node_inbound_template() {
+    case "$1" in
+        anytls)
+            echo '{"type":"anytls","tag":"","listen":"::","listen_port":0,"users":[],"tls":{"enabled":true,"server_name":"","certificate_path":"","key_path":""}}'
+            ;;
+        hysteria2)
+            echo '{"type":"hysteria2","tag":"","listen":"::","listen_port":0,"users":[],"up_mbps":0,"down_mbps":0,"ignore_client_bandwidth":false,"obfs":{"type":"salamander","password":""},"tls":{"enabled":true,"server_name":"","certificate_path":"","key_path":""}}'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 写 server.json：inbound / outbound / route 规则三处 upsert。
+# inbound 模板优先从现有同协议 inbound 深拷贝，保住用户改过的 up_mbps、obfs 等；
+# outbound 模板从现有 direct 出站拷贝，保住 domain_resolver（硬写会在用户删掉
+# dns 块时引用到不存在的 server tag）。
+node_write_server() {
+    local tag="$1" proto="$2" sni="$3" cert="$4" key="$5" itmpl otmpl tmp
+    itmpl="$(jq -c --arg p "${proto}" 'first(.inbounds[]? | select(.type==$p)) // empty' "${SERVER_CONFIG}" 2>/dev/null)"
+    [[ -z "${itmpl}" ]] && itmpl="$(node_inbound_template "${proto}")"
+    [[ -z "${itmpl}" ]] && return 1
+    otmpl="$(jq -c 'first(.outbounds[]? | select(.type=="direct")) // {"type":"direct"}' "${SERVER_CONFIG}" 2>/dev/null)"
+    [[ -z "${otmpl}" ]] && otmpl='{"type":"direct"}'
+
+    tmp="$(mktemp)" || return 1
+    jq --arg tag "${tag}" --arg out "${proto}-out" --arg sni "${sni}" \
+        --arg cert "${cert}" --arg key "${key}" \
+        --argjson itmpl "${itmpl}" --argjson otmpl "${otmpl}" '
+        ($itmpl
+            | .tag = $tag
+            | .listen_port = 0
+            | .users = []
+            | .tls.enabled = true
+            | .tls.server_name = $sni
+            | .tls.certificate_path = $cert
+            | .tls.key_path = $key) as $in
+        | .inbounds = (((.inbounds // []) | map(select(.tag != $tag))) + [$in])
+        | .outbounds = (if (((.outbounds // []) | map(.tag) | index($out)) != null)
+                        then (.outbounds // [])
+                        else (.outbounds // []) + [($otmpl | .tag = $out)] end)
+        | .route.rules = (((.route.rules // []) | map(select((.inbound // "") != $tag)))
+                        + [{inbound: $tag, outbound: $out}])
+    ' "${SERVER_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${SERVER_CONFIG}"
+}
+
+node_write_panel() {
+    local tag="$1" proto="$2" api_url="$3" api_key="$4" node_id="$5" panel_type="$6" \
+        node_type="$7" timeout="$8" speed_limit="$9" device_limit="${10}" \
+        update_periodic="${11}" enable_device_limit="${12}" tmp
+    tmp="$(mktemp)" || return 1
+    jq --arg intag "${tag}" --arg outtag "${proto}-out" --arg paneltype "${panel_type}" \
+        --arg apihost "${api_url}" --arg apikey "${api_key}" --arg nodetype "${node_type}" \
+        --argjson nodeid "${node_id}" --argjson timeout "${timeout}" \
+        --argjson speedlimit "${speed_limit}" --argjson devicelimit "${device_limit}" \
+        --argjson updateperiodic "${update_periodic}" \
+        --argjson enabledevicelimit "${enable_device_limit}" '
+        {
+            paneltype: $paneltype,
+            intag: $intag,
+            outtag: $outtag,
+            apiconfig: {
+                apihost: $apihost,
+                apikey: $apikey,
+                nodeid: $nodeid,
+                nodetype: $nodetype,
+                timeout: $timeout,
+                speedlimit: $speedlimit,
+                devicelimit: $devicelimit,
+                disablecustomconfig: true
+            },
+            controllerconfig: {
+                updateperiodic: $updateperiodic,
+                enabledevicelimit: $enabledevicelimit
+            }
+        } as $node
+        | .name = (.name // "SingR nodes")
+        | .nodes = (((.nodes // []) | map(select((.intag // "") != $intag))) + [$node])
+    ' "${PANEL_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${PANEL_CONFIG}"
+}
+
+node_add() {
+    node_require_jq || return 1
+    node_configs_ready || return 1
+
+    local api_url="" api_key="" node_id="" protocol="" sni="" cert_src="" key_src=""
+    local panel_type="SSpanel" node_type="V2ray" timeout="20" speed_limit="0"
+    local device_limit="0" enable_device_limit="false" update_periodic="60"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --api-url) api_url="$2"; shift 2 ;;
+            --api-key) api_key="$2"; shift 2 ;;
+            --node-id) node_id="$2"; shift 2 ;;
+            --protocol) protocol="$2"; shift 2 ;;
+            --sni) sni="$2"; shift 2 ;;
+            --cert-path) cert_src="$2"; shift 2 ;;
+            --key-path) key_src="$2"; shift 2 ;;
+            --panel-type) panel_type="$2"; shift 2 ;;
+            --node-type) node_type="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --speed-limit) speed_limit="$2"; shift 2 ;;
+            --device-limit) device_limit="$2"; shift 2 ;;
+            --enable-device-limit) enable_device_limit="$2"; shift 2 ;;
+            --update-periodic) update_periodic="$2"; shift 2 ;;
+            *) echo -e "${red}未知参数：$1${plain}"; return 1 ;;
+        esac
+    done
+
+    # 没给全且在交互终端上，就逐项问；非交互（脚本调用）则直接报缺参数。
+    if [[ -t 0 ]]; then
+        [[ -z "${api_url}" ]] && read -r -p "面板地址 (--api-url，如 https://panel.example.com): " api_url
+        [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
+        [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
+        [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 (--protocol): " protocol
+        [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
+        [[ -z "${cert_src}" ]] && read -r -p "证书路径 (--cert-path): " cert_src
+        [[ -z "${key_src}" ]] && read -r -p "私钥路径 (--key-path): " key_src
+    fi
+
+    [[ -n "${api_url}" ]] || { echo -e "${red}缺少 --api-url${plain}"; return 1; }
+    [[ -n "${api_key}" ]] || { echo -e "${red}缺少 --api-key${plain}"; return 1; }
+    [[ "${node_id}" =~ ^[0-9]+$ ]] || { echo -e "${red}--node-id 必须是整数${plain}"; return 1; }
+    [[ "${timeout}" =~ ^[0-9]+$ ]] || { echo -e "${red}--timeout 必须是整数${plain}"; return 1; }
+    [[ "${device_limit}" =~ ^[0-9]+$ ]] || { echo -e "${red}--device-limit 必须是整数${plain}"; return 1; }
+    [[ "${update_periodic}" =~ ^[0-9]+$ ]] || { echo -e "${red}--update-periodic 必须是整数${plain}"; return 1; }
+    [[ "${speed_limit}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo -e "${red}--speed-limit 必须是数字${plain}"; return 1; }
+    case "${enable_device_limit}" in
+        true | false) ;;
+        *) echo -e "${red}--enable-device-limit 必须是 true / false${plain}"; return 1 ;;
+    esac
+    local proto
+    proto="$(node_norm_proto "${protocol}")" || {
+        echo -e "${red}--protocol 只能是 anytls / hysteria2${plain}"
+        return 1
+    }
+    [[ -n "${cert_src}" && -n "${key_src}" ]] || {
+        echo -e "${red}缺少 --cert-path / --key-path（anytls 与 hysteria2 都强制 TLS，没有证书起不来）${plain}"
+        return 1
+    }
+
+    if jq -e --arg h "${api_url}" --argjson id "${node_id}" \
+        '[(.nodes // [])[] | select((.apiconfig.apihost // "") == $h and (.apiconfig.nodeid // -1) == $id)] | length > 0' \
+        "${PANEL_CONFIG}" >/dev/null 2>&1; then
+        echo -e "${red}该节点已存在：${api_url} #${node_id}${plain}"
+        echo -e "${yellow}如需改配置，先 singr del ${node_id} 再重新添加${plain}"
+        return 1
+    fi
+
+    if [[ "${proto}" == "hysteria2" && -z "${sni}" ]]; then
+        echo -e "${yellow}提示：hysteria2 默认开着 salamander obfs 且密码留空，此时密钥取自 SNI。"
+        echo -e "      SNI 也为空会让 obfs 静默关闭（配置显示开着，但实际没生效），"
+        echo -e "      客户端按文档配了 obfs 反而连不上。建议指定 --sni。${plain}"
+    fi
+
+    if node_has_placeholder; then
+        echo -e "${yellow}检测到占位节点（your-sspanel.example.com），将其移除后再添加${plain}"
+        node_drop_placeholder || { echo -e "${red}清理占位节点失败${plain}"; return 1; }
+    fi
+
+    local tag paths cert_path key_path
+    tag="$(node_alloc_tag "${proto}" "${node_id}")"
+    paths="$(node_backend_place_cert "${tag}" "${cert_src}" "${key_src}")" || return 1
+    cert_path="${paths%%|*}"
+    key_path="${paths##*|}"
+
+    node_backup || { echo -e "${red}备份配置失败，已中止${plain}"; return 1; }
+    if ! node_write_server "${tag}" "${proto}" "${sni}" "${cert_path}" "${key_path}"; then
+        echo -e "${red}写入 ${SERVER_CONFIG} 失败${plain}"
+        node_restore
+        node_backend_forget_cert "${tag}"
+        return 1
+    fi
+    if ! node_write_panel "${tag}" "${proto}" "${api_url}" "${api_key}" "${node_id}" \
+        "${panel_type}" "${node_type}" "${timeout}" "${speed_limit}" "${device_limit}" \
+        "${update_periodic}" "${enable_device_limit}"; then
+        echo -e "${red}写入 ${PANEL_CONFIG} 失败${plain}"
+        node_restore
+        node_backend_forget_cert "${tag}"
+        return 1
+    fi
+
+    echo -e "${green}已添加节点：${api_url} #${node_id}（${proto}，InTag=${tag}）${plain}"
+    if node_apply; then
+        echo
+        node_list
+        echo
+        echo -e "${yellow}提示：同一台机上的多个节点必须在面板侧配置不同端口，否则第二个监听会起不来。${plain}"
+        node_cert_renew_hint
+        return 0
+    fi
+    node_backend_forget_cert "${tag}"
+    return 1
+}
+
+node_del() {
+    node_require_jq || return 1
+    node_configs_ready || return 1
+
+    local sel="${1:-}"
+    if [[ -z "${sel}" ]]; then
+        node_list || return 1
+        echo
+        read -r -p "输入要删除的 NodeID 或 InTag（回车取消）: " sel
+        [[ -z "${sel}" ]] && return 0
+    fi
+
+    local tag
+    tag="$(jq -r --arg s "${sel}" '
+        first((.nodes // [])[] | select(((.apiconfig.nodeid // "") | tostring) == $s or (.intag // "") == $s) | .intag) // ""
+    ' "${PANEL_CONFIG}" 2>/dev/null)"
+    if [[ -z "${tag}" ]]; then
+        echo -e "${red}未找到节点：${sel}${plain}"
+        return 1
+    fi
+
+    if [[ "$(node_count)" == "1" ]]; then
+        echo -e "${red}这是最后一个节点。删掉之后 panel.json 将没有任何节点，进程会以"
+        echo -e "'no Node with InTag found' 退出。${plain}"
+        echo -e "${yellow}要换节点请先 singr add 新节点、再删旧的；要彻底移除请用 singr uninstall。${plain}"
+        return 1
+    fi
+
+    confirm "确定删除节点 ${sel}（InTag=${tag}）吗" "n" || return 0
+
+    node_backup || { echo -e "${red}备份配置失败，已中止${plain}"; return 1; }
+    local tmp
+    tmp="$(mktemp)" || return 1
+    jq --arg t "${tag}" '.nodes = ((.nodes // []) | map(select((.intag // "") != $t)))' \
+        "${PANEL_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${PANEL_CONFIG}" || {
+        echo -e "${red}写入 ${PANEL_CONFIG} 失败${plain}"
+        node_restore
+        return 1
+    }
+    tmp="$(mktemp)" || return 1
+    jq --arg t "${tag}" '
+        .inbounds = ((.inbounds // []) | map(select((.tag // "") != $t)))
+        | .route.rules = ((.route.rules // []) | map(select((.inbound // "") != $t)))
+    ' "${SERVER_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${SERVER_CONFIG}" || {
+        echo -e "${red}写入 ${SERVER_CONFIG} 失败${plain}"
+        node_restore
+        return 1
+    }
+
+    echo -e "${green}已删除节点 ${sel}（InTag=${tag}）${plain}"
+    if node_apply; then
+        node_backend_forget_cert "${tag}"
+        echo
+        node_list
+        return 0
+    fi
+    return 1
+}
+
+node_menu() {
+    while true; do
+        echo -e "
+  ${green}节点管理${plain}
+  1. 查看节点
+  2. 添加节点
+  3. 删除节点
+  0. 返回主菜单
+"
+        read -r -p "请输入选择 [0-3]: " nm
+        case "${nm}" in
+            1) node_list ;;
+            2) node_add ;;
+            3) node_del ;;
+            0) return ;;
+            *) echo -e "${red}请输入正确的数字 [0-3]${plain}" ;;
+        esac
+    done
+}
+# <<<<<<<<<<<<<<<< SYNC BLOCK: 节点管理 <<<<<<<<<<<<<<<<
+
+# ---- 节点管理：裸机后端实现（SYNC BLOCK 的四个钩子）----
+#
+# 证书原地引用，不复制。证书路径通常来自 certbot，复制一份会让续期在下次重启后
+# 静默失效；裸机没有容器那样的挂载边界，直接用用户给的路径最省事也最正确。
+
+node_backend_place_cert() {
+    local cert_src="$2" key_src="$3"
+    [[ -s "${cert_src}" ]] || {
+        echo -e "${red}找不到证书文件：${cert_src}${plain}" >&2
+        return 1
+    }
+    [[ -s "${key_src}" ]] || {
+        echo -e "${red}找不到私钥文件：${key_src}${plain}" >&2
+        return 1
+    }
+    printf '%s|%s' "${cert_src}" "${key_src}"
+}
+
+# 裸机没有证书副本，无需清理。
+node_backend_forget_cert() { :; }
+
+node_backend_restart() {
+    systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
+}
+
+# 与 docker 版同构：既要 active，又要重启计数不再增长，才算真起来了。
+# 单次 is-active 抓不到 Restart=on-failure 的 crash-loop——而"任一节点 Start()
+# 失败 → os.Exit(1)"正是加错节点时的表现，必须能识别出来才能触发回滚。
+node_backend_verify() {
+    local r1 r2
+    sleep 2
+    systemctl is-active --quiet "${SERVICE_NAME}" || return 1
+    r1="$(systemctl show -p NRestarts --value "${SERVICE_NAME}" 2>/dev/null)"
+    sleep 3
+    systemctl is-active --quiet "${SERVICE_NAME}" || return 1
+    r2="$(systemctl show -p NRestarts --value "${SERVICE_NAME}" 2>/dev/null)"
+    [[ "${r1}" == "${r2}" ]]
+}
+
+node_cert_renew_hint() {
+    echo -e "${yellow}证书续期提示：TLS 证书材料不热重载，续期后必须重启才生效。建议："
+    echo -e "  certbot renew --deploy-hook \"singr restart\"${plain}"
+}
+
 # ---------------- Hysteria2 端口跳跃管理 ----------------
 # 在 OS 防火墙层把一段 UDP 端口区间 REDIRECT 到真实 Hysteria2 端口（v4+v6）。
 # 规则持久化为 ${PORTHOP_RULES}，由 singr-porthop.service 开机重放，不依赖
@@ -464,6 +949,17 @@ show_usage() {
     echo "SingR update_shell          更新管理脚本"
     echo "SingR porthop               Hysteria2 端口跳跃管理"
     echo "------------------------------------------"
+    echo "SingR list                  查看当前节点"
+    echo "SingR add [参数]            添加节点（不带参数则逐项询问）"
+    echo "SingR del <NodeID|InTag>    删除节点"
+    echo "------------------------------------------"
+    echo "添加节点参数："
+    echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2"
+    echo "  --sni HOST --cert-path PATH --key-path PATH"
+    echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"
+    echo "  [--speed-limit 0] [--device-limit 0] [--enable-device-limit false]"
+    echo "  [--update-periodic 60]"
+    echo "------------------------------------------"
 }
 
 show_menu() {
@@ -483,10 +979,13 @@ show_menu() {
  11. 查看 SingR 版本
  12. 更新管理脚本
  13. Hysteria2 端口跳跃管理
+ 14. 节点管理（查看 / 添加 / 删除）
 "
     show_status
     echo
-    read -r -p "请输入选择 [0-13]: " num
+    node_list_brief
+    echo
+    read -r -p "请输入选择 [0-14]: " num
     case "${num}" in
         0) check_install && config ;;
         1) check_uninstall && install_singr ;;
@@ -502,7 +1001,8 @@ show_menu() {
         11) check_install && show_version ;;
         12) update_shell ;;
         13) porthop_menu && before_show_menu ;;
-        *) echo -e "${red}请输入正确的数字 [0-13]${plain}" && before_show_menu ;;
+        14) check_install && node_menu && before_show_menu ;;
+        *) echo -e "${red}请输入正确的数字 [0-14]${plain}" && before_show_menu ;;
     esac
 }
 
@@ -521,6 +1021,9 @@ if [[ $# -gt 0 ]]; then
         uninstall) check_install 0 && uninstall_singr 0 ;;
         version) check_install 0 && show_version 0 ;;
         update_shell) update_shell ;;
+        list | nodes) check_install 0 && node_list ;;
+        add) check_install 0 && shift && node_add "$@" ;;
+        del | delete | rm) check_install 0 && node_del "${2:-}" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;
         porthop-flush) porthop_flush_all ;;
