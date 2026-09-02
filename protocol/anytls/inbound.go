@@ -25,8 +25,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	anytls "github.com/makt28/sing-anytls"
-	"github.com/makt28/sing-anytls/padding"
+	anytls "github.com/anytls/sing-anytls"
+	"github.com/anytls/sing-anytls/padding"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -83,7 +83,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 
 	service, err := anytls.NewService(anytls.ServiceConfig{
 		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
-			return (anytls.User)(it)
+			return anytls.User(it)
 		}),
 		PaddingScheme: paddingScheme,
 		Handler:       (*inboundHandler)(inbound),
@@ -269,7 +269,7 @@ func (h *Inbound) Close() error {
 	return common.Close(h.listener, h.tlsConfig)
 }
 
-func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	h.tlsMu.RLock()
 	tlsCfg := h.tlsConfig
 	h.tlsMu.RUnlock()

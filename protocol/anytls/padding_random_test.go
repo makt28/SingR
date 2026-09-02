@@ -3,7 +3,7 @@ package anytls
 import (
 	"testing"
 
-	"github.com/makt28/sing-anytls/padding"
+	"github.com/anytls/sing-anytls/padding"
 )
 
 func TestRandomPaddingSchemeAlwaysValid(t *testing.T) {

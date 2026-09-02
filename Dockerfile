@@ -8,7 +8,7 @@
 # unit with this image. Config lives in /etc/singr-docker (isolated from the
 # bare-metal /etc/singr install so the two never collide on one host).
 # ============================================================================
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.7-alpine AS builder
 COPY . /go/src/github.com/sagernet/sing-box
 WORKDIR /go/src/github.com/sagernet/sing-box
 ARG TARGETOS TARGETARCH
