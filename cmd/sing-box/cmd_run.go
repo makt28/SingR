@@ -172,8 +172,97 @@ func filterInboundsByPanel(options option.Options) option.Options {
 	return options
 }
 
+// Default certificate file names probed under <panel config dir>/certs when a
+// TLS inbound leaves both certificate_path and key_path empty. Order matters:
+// the first name is also the one written back (and therefore the one named in
+// the startup error) when none of them exists on disk.
+var defaultCertificateNames = []string{"default.pem", "default.crt"}
+
+const defaultKeyName = "default.key"
+
+// applyDefaultCertificatePaths points TLS inbounds that carry no certificate at
+// <dir of -p>/certs/default.{pem,crt} + default.key, so a freshly installed
+// server.json can ship with empty TLS material and still work once the operator
+// drops a certificate into the well-known location.
+//
+// SingR-specific behavior (not in upstream sing-box): be careful on resync.
+//
+//   - The directory is derived from -p, not -c: poetConfigPath is a single
+//     string flag (-c is a list and -C takes directories), and every SingR
+//     deployment runs `singr run -c <dir>/server.json -p <dir>/panel.json`.
+//     That makes the bare-metal (/etc/singr) and docker (/etc/singr-docker)
+//     defaults fall out of one expression, with no build-time constant and no
+//     "am I in a container" test.
+//   - Gated on -p, like filterInboundsByPanel: no panel config means vanilla
+//     sing-box behavior, untouched.
+//   - Purely additive: an inbound that already names a certificate is never
+//     rewritten, so existing installations need no migration.
+//   - Runs after filterInboundsByPanel so that inbounds which will not be
+//     instantiated are left alone.
+//   - Only fires when the whole certificate story is unset. An explicit
+//     certificate/key (inline or path), a certificate provider, ACME, REALITY
+//     (which needs no certificate at all) or insecure: true (upstream
+//     generates a certificate itself) are all left as the operator wrote them.
+//   - The substitution is logged per inbound: an implicit path that appears
+//     nowhere in server.json must not also be invisible in the log.
+func applyDefaultCertificatePaths(options option.Options) option.Options {
+	if poetConfigPath == "" {
+		return options
+	}
+	certDirectory, err := filepath.Abs(filepath.Join(filepath.Dir(poetConfigPath), "certs"))
+	if err != nil {
+		return options
+	}
+	for _, inbound := range options.Inbounds {
+		tlsWrapper, withTLS := inbound.Options.(option.InboundTLSOptionsWrapper)
+		if !withTLS {
+			continue
+		}
+		tlsOptions := tlsWrapper.TakeInboundTLSOptions()
+		if tlsOptions == nil || !tlsOptions.Enabled {
+			continue
+		}
+		if !certificateUnset(tlsOptions) {
+			continue
+		}
+		certificatePath := filepath.Join(certDirectory, defaultCertificateNames[0])
+		for _, name := range defaultCertificateNames {
+			candidate := filepath.Join(certDirectory, name)
+			if stat, statErr := os.Stat(candidate); statErr == nil && !stat.IsDir() {
+				certificatePath = candidate
+				break
+			}
+		}
+		keyPath := filepath.Join(certDirectory, defaultKeyName)
+		tlsOptions.CertificatePath = certificatePath
+		tlsOptions.KeyPath = keyPath
+		log.Info("inbound/", inbound.Type, "[", inbound.Tag, "]: no TLS certificate configured, using default ", certificatePath, " + ", keyPath)
+	}
+	return options
+}
+
+// certificateUnset reports whether an inbound leaves the certificate entirely
+// to us: no inline material, no paths, no provider/ACME, not REALITY, and not
+// asking upstream to generate one via insecure.
+func certificateUnset(tlsOptions *option.InboundTLSOptions) bool {
+	if tlsOptions.CertificatePath != "" || tlsOptions.KeyPath != "" {
+		return false
+	}
+	if len(tlsOptions.Certificate) > 0 || len(tlsOptions.Key) > 0 {
+		return false
+	}
+	if tlsOptions.CertificateProvider != nil || tlsOptions.ACME != nil {
+		return false
+	}
+	if tlsOptions.Reality != nil && tlsOptions.Reality.Enabled {
+		return false
+	}
+	return !tlsOptions.Insecure
+}
+
 func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	options = filterInboundsByPanel(options)
+	options = applyDefaultCertificatePaths(options)
 	if disableColor {
 		if options.Log == nil {
 			options.Log = &option.LogOptions{}

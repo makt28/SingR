@@ -88,7 +88,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-mkdir -p "${CONFIG_DIR}" "${CERT_DIR}"
+mkdir -p "${CONFIG_DIR}"
+# 只在新建时设 700：这里要放私钥，默认的 755 会让机器上的非 root 用户读到。
+[[ -d "${CERT_DIR}" ]] || mkdir -m 700 -p "${CERT_DIR}"
 
 normalize_protocol() {
     case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -185,26 +187,55 @@ fi
 node_tags="$(jq -r '(.nodes // [])[] | (.intag // "") | select(. != "")' "${PANEL}" 2>/dev/null || echo "")"
 [[ -n "${node_tags}" ]] || die "panel.json 里没有任何带 intag 的节点，进程会以 'no Node with InTag found' 退出。"
 
+# server.json 里 certificate_path/key_path 为空不是"没配证书"，而是"用默认路径"：
+# 二进制（cmd/sing-box/cmd_run.go 的 applyDefaultCertificatePaths）会把空值补成
+# <panel.json 所在目录>/certs/default.pem（不存在则 default.crt）加 default.key。
+# 这里必须用同一套规则解析，否则空值会被误报成"没有这个 inbound"。
+default_cert_path() {
+    if [[ -s "${CERT_DIR}/default.pem" ]]; then
+        printf '%s' "${CERT_DIR}/default.pem"
+    elif [[ -s "${CERT_DIR}/default.crt" ]]; then
+        printf '%s' "${CERT_DIR}/default.crt"
+    else
+        printf '%s' "${CERT_DIR}/default.pem"
+    fi
+}
+
 while IFS= read -r tag; do
     [[ -z "${tag}" ]] && continue
+    if ! jq -e --arg t "${tag}" '[.inbounds[]? | select(.tag==$t)] | length > 0' "${SERVER}" >/dev/null 2>&1; then
+        die "panel.json 的节点引用了 inbound '${tag}'，但 server.json 里没有这个 tag 的 inbound。"
+    fi
     active_cert="$(jq -r --arg t "${tag}" \
         '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER}" 2>/dev/null || echo "")"
     active_key="$(jq -r --arg t "${tag}" \
         '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER}" 2>/dev/null || echo "")"
-    if [[ -z "${active_cert}" ]]; then
-        die "panel.json 的节点引用了 inbound '${tag}'，但 server.json 里没有这个 tag 的 inbound（或它没有 tls 配置）。"
+    using_default=0
+    if [[ -z "${active_cert}" && -z "${active_key}" ]]; then
+        active_cert="$(default_cert_path)"
+        active_key="${CERT_DIR}/default.key"
+        using_default=1
     fi
     if [[ ! -s "${active_cert}" || ! -s "${active_key}" ]]; then
         hint=""
-        # 证书路径不在挂载目录内 → 多半是宿主机路径（如 /root/xxx），容器里根本看不到。
-        case "${active_cert}" in
-            "${CONFIG_DIR}"/*) ;;
-            *) hint="
+        if [[ "${using_default}" == 1 ]]; then
+            hint="
+这个 inbound 在 server.json 里没有配置证书，用的是默认路径。把证书放进去即可：
+  cp 证书 ${CERT_DIR}/default.pem      # .crt 后缀也认
+  cp 私钥 ${CERT_DIR}/default.key
+容器只挂载了 ${CONFIG_DIR}，所以要放在这个目录下——软链到 /etc/letsencrypt 在
+容器内是断的。想让 certbot 续期自动生效，用 singr cert 登记宿主机源路径。"
+        else
+            # 证书路径不在挂载目录内 → 多半是宿主机路径（如 /root/xxx），容器里根本看不到。
+            case "${active_cert}" in
+                "${CONFIG_DIR}"/*) ;;
+                *) hint="
 注意：证书路径 ${active_cert} 不在挂载目录 ${CONFIG_DIR} 下。容器只挂载了
 ${CONFIG_DIR}，宿主机上别处（如 /root/）的文件在容器内不可见。请把证书复制到
 ${CERT_DIR}/ 下，或用 singr add 的 --cert-path/--key-path（脚本会复制进挂载目录
 并登记源路径，之后每次重启自动重新同步）。" ;;
-        esac
+            esac
+        fi
         die "节点 inbound '${tag}' 缺少 TLS 证书（容器内路径）：${active_cert} / ${active_key}${hint}
 与裸机二进制一致：没有证书不会启动。"
     fi

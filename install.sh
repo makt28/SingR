@@ -258,7 +258,10 @@ install_binary() {
 }
 
 install_config() {
-    mkdir -p "${CONFIG_DIR}" "${CERT_DIR}"
+    mkdir -p "${CONFIG_DIR}"
+    # 只在新建时设 700：这里要放私钥，默认的 755 会让机器上的非 root 用户读到。
+    # 已存在的目录不动权限，升级不该改用户已有的部署。
+    [[ -d "${CERT_DIR}" ]] || mkdir -m 700 -p "${CERT_DIR}"
 
     if [[ ! -f "${CONFIG_DIR}/panel.json" ]]; then
         if [[ -f "${SCRIPT_DIR}/panel.json" ]]; then
@@ -332,8 +335,8 @@ EOF
       "tls": {
         "enabled": true,
         "server_name": "",
-        "certificate_path": "/etc/singr/certs/anytls.crt",
-        "key_path": "/etc/singr/certs/anytls.key"
+        "certificate_path": "",
+        "key_path": ""
       }
     },
     {
@@ -352,8 +355,8 @@ EOF
       "tls": {
         "enabled": true,
         "server_name": "",
-        "certificate_path": "/etc/singr/certs/hysteria2.crt",
-        "key_path": "/etc/singr/certs/hysteria2.key"
+        "certificate_path": "",
+        "key_path": ""
       }
     }
   ],
@@ -611,8 +614,14 @@ print_usage() {
     echo "${CONFIG_DIR}/panel.json"
     echo "${CONFIG_DIR}/server.json"
     echo ""
-    echo "首次安装后请先修改配置和证书，再运行："
-    echo "singr config"
+    echo "证书：新装的 server.json 把 certificate_path/key_path 留空，此时使用默认路径"
+    echo "  ${CERT_DIR}/default.pem   # .crt 后缀也认"
+    echo "  ${CERT_DIR}/default.key"
+    echo "anytls 与 hysteria2 都强制 TLS，没有证书不会启动。也可用 singr add 的"
+    echo "--cert-path/--key-path 为单个节点指定别的路径（如 certbot 的 live 目录）。"
+    echo ""
+    echo "首次安装后请先添加节点，再运行："
+    echo "singr add"
     echo "singr restart"
 }
 

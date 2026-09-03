@@ -24,8 +24,11 @@ services:
       # SINGR_DEVICE_LIMIT: "0"
       # SINGR_ENABLE_DEVICE_LIMIT: "false"
       # SINGR_UPDATE_PERIODIC: "60"
-      # SINGR_CERT_PATH: "/etc/singr-docker/certs/anytls.crt"
-      # SINGR_KEY_PATH: "/etc/singr-docker/certs/anytls.key"
+      # 证书：不设这两项就用默认路径 /etc/singr-docker/certs/default.pem（找不到再试
+      # default.crt）与 default.key —— 即下面挂载的 ./singr-data/certs/ 里的同名文件。
+      # 只有需要放在别处时才设置，路径是**容器内**路径，必须落在挂载目录下。
+      # SINGR_CERT_PATH: "/etc/singr-docker/certs/mine.pem"
+      # SINGR_KEY_PATH: "/etc/singr-docker/certs/mine.key"
     volumes:
       - ./singr-data:/etc/singr-docker
     logging:

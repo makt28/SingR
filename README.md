@@ -160,18 +160,28 @@ TLS 证书材料不热重载，**续期后必须重启才生效**，两种部署
 certbot renew --deploy-hook "singr restart"
 ```
 
+用默认路径的裸机节点，把 `default.pem` / `default.key` 软链到 certbot 的 live 目录
+就同样是原地更新：
+
+```sh
+ln -sf /etc/letsencrypt/live/a.example.com/fullchain.pem /etc/singr/certs/default.pem
+ln -sf /etc/letsencrypt/live/a.example.com/privkey.pem   /etc/singr/certs/default.key
+```
+
 Docker 因为容器只挂载 `/etc/singr-docker`，宿主机别处（如 `/root/`、
-`/etc/letsencrypt/`）的文件容器内看不见，所以证书必须复制进挂载目录。`singr` 会记住
-你给的源路径（记在 `/etc/singr-docker/certs.json`），每次 `start` / `restart` /
-`update` 之前自动重新复制一遍。挂上这行就全自动了（只有证书真的变了才会重启）：
+`/etc/letsencrypt/`）的文件容器内看不见，所以证书必须复制进挂载目录——**软链也不
+行**，链接目标同样在容器外。`singr` 会记住你给的源路径（记在
+`/etc/singr-docker/certs.json`），每次 `start` / `restart` / `update` 之前自动重新
+复制一遍。挂上这行就全自动了（只有证书真的变了才会重启）：
 
 ```sh
 certbot renew --deploy-hook "singr cert-sync"
 ```
 
-> **从旧版本升级上来的 Docker 机器需要补一步。** 证书源只在首次安装和 `singr add` 时
-> 登记，老机器上 `certs.json` 并不存在，此时同步是空转的（`singr cert-sync` 检测到未
-> 登记会直接告诉你）。给每个已有节点补登记一次即可：
+> **两种情况需要补登记证书源。** 证书源只在 `singr add --cert-path` 和首次安装带
+> `--cert-path` 时登记：从旧版本升级上来的机器 `certs.json` 并不存在，而直接把证书
+> 放到默认路径 `certs/default.pem` 的节点也没有源可同步。两种情况下同步都是空转的
+> （`singr cert-sync` 检测到未登记会直接告诉你）。给每个节点补登记一次即可：
 >
 > ```sh
 > singr cert @1 --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
@@ -192,16 +202,17 @@ certbot renew --deploy-hook "singr cert-sync"
   一台机器二选一即可。
 
 > **证书是必须的（三种方式通用）**：和裸机二进制一致，没有 TLS 证书容器不会
-> 启动。先建目录并放证书：
+> 启动。放到默认路径即可：
 > ```sh
-> mkdir -p /etc/singr-docker/certs
-> # anytls 放 anytls.crt / anytls.key；hysteria2 放 hysteria2.crt / hysteria2.key
+> mkdir -m 700 -p /etc/singr-docker/certs
+> cp fullchain.pem /etc/singr-docker/certs/default.pem   # .crt 后缀也认
+> cp privkey.pem   /etc/singr-docker/certs/default.key
 > ```
 > 也可以自签测试证书（生产建议用真证书，anytls/hy2 对 TLS 指纹敏感）：
 > ```sh
 > openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
->   -keyout /etc/singr-docker/certs/anytls.key \
->   -out    /etc/singr-docker/certs/anytls.crt -subj "/CN=example.com"
+>   -keyout /etc/singr-docker/certs/default.key \
+>   -out    /etc/singr-docker/certs/default.pem -subj "/CN=example.com"
 > ```
 
 ### 方式一：管理脚本一键（推荐）
@@ -253,7 +264,7 @@ docker run -d --name singr \
 后：
 
 ```sh
-mkdir -p singr-data/certs   # 放证书到 singr-data/certs/
+mkdir -p singr-data/certs   # 证书放 singr-data/certs/default.pem 与 default.key
 docker compose up -d
 docker compose logs -f
 ```
@@ -269,7 +280,7 @@ flag（方式一）与 `SINGR_*` 环境变量（方式二/三）一一对应，�
 | `--node-id` | `SINGR_NODE_ID` | 节点 ID（必填） | |
 | `--protocol` | `SINGR_PROTOCOL` | `anytls` 或 `hysteria2`（必填） | |
 | `--sni` | `SINGR_SNI` | 入站 `server_name` | 空 |
-| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书/私钥路径 | 默认协议证书路径 |
+| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书/私钥路径（容器内路径） | 空 = 用默认路径 `certs/default.pem` + `default.key` |
 | `--speed-limit` / `--device-limit` | `SINGR_SPEED_LIMIT` / `SINGR_DEVICE_LIMIT` | 限速 / 设备数 | 0 |
 | `--enable-device-limit` | `SINGR_ENABLE_DEVICE_LIMIT` | 是否硬限设备 | false |
 | `--update-periodic` | `SINGR_UPDATE_PERIODIC` | 面板同步周期（秒） | 60 |
@@ -437,8 +448,8 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
       "tls": {
         "enabled": true,
         "server_name": "",
-        "certificate_path": "/etc/singr/certs/anytls.crt",
-        "key_path": "/etc/singr/certs/anytls.key"
+        "certificate_path": "",
+        "key_path": ""
       }
     },
     {
@@ -453,8 +464,8 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
       "tls": {
         "enabled": true,
         "server_name": "",
-        "certificate_path": "/etc/singr/certs/hysteria2.crt",
-        "key_path": "/etc/singr/certs/hysteria2.key"
+        "certificate_path": "",
+        "key_path": ""
       }
     }
   ],
@@ -572,17 +583,36 @@ Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发�
 
 ## 准备 TLS 证书
 
-把证书放到配置中指定的位置：
+新装的 `server.json` 把 `certificate_path` / `key_path` **留空**。留空不是"没配
+证书"，而是"用默认路径"——启动时 SingR 会把空值补成配置目录下的
+
+```
+/etc/singr/certs/default.pem    # 找不到再试 default.crt
+/etc/singr/certs/default.key
+```
+
+Docker 部署同理，只是配置目录换成 `/etc/singr-docker`。所以把证书放进去就行：
 
 ```sh
-cp fullchain.pem /etc/singr/certs/anytls.crt
-cp privkey.pem /etc/singr/certs/anytls.key
-chmod 600 /etc/singr/certs/anytls.key
+mkdir -m 700 -p /etc/singr/certs
+cp fullchain.pem /etc/singr/certs/default.pem
+cp privkey.pem   /etc/singr/certs/default.key
+chmod 600 /etc/singr/certs/default.key
 ```
+
+替换发生在启动时，日志里会有一行
+
+```
+inbound/anytls[anytls-in]: no TLS certificate configured, using default /etc/singr/certs/default.pem + /etc/singr/certs/default.key
+```
+
+需要按节点用不同证书时（比如多节点不同域名），用 `singr add --cert-path/--key-path`
+指定，或直接在 `server.json` 里写具体路径——**非空的路径不会被改写**，所以老机器
+升级上来什么都不用动。
 
 证书应覆盖 SSPanel 节点地址中的 `host=` 值。没有可信证书时可以临时使用自签证书，但客户端必须允许不安全证书或信任该证书。
 
-Hysteria2 节点同理，证书放到 `hysteria2-in` 配置里指定的路径（默认 `/etc/singr/certs/hysteria2.crt` / `.key`）。两个协议可以指向同一张证书，只要它覆盖各自的 SNI。
+Hysteria2 节点同理。两个协议默认指向同一张 `default.pem`——只要它覆盖各自的 SNI 就没问题；SNI 不同就得给其中一个显式指定路径。
 
 ## 启动
 

@@ -463,6 +463,47 @@ node_configs_ready() {
     return 0
 }
 
+# ---- 默认证书路径（Go 侧解析的 shell 镜像）----
+#
+# server.json 里 certificate_path/key_path 为空**不是**"没配证书"，而是"用默认
+# 路径"：二进制在 cmd/sing-box/cmd_run.go 的 applyDefaultCertificatePaths 里把空
+# 值补成 <panel.json 所在目录>/certs/default.pem（不存在则试 default.crt）加
+# default.key。裸机是 /etc/singr/certs，docker 是 /etc/singr-docker/certs，同一份
+# 代码同一个二进制，差别只来自 -p 的路径。
+#
+# 权威实现在 Go 那边，这里是它在 shell 侧的镜像，供 singr list 的证书状态、
+# docker 的启动前预检和证书同步使用。改任一侧必须同步另一侧。
+node_default_cert_path() {
+    if [[ -s "${CERT_DIR}/default.pem" ]]; then
+        printf '%s' "${CERT_DIR}/default.pem"
+    elif [[ -s "${CERT_DIR}/default.crt" ]]; then
+        printf '%s' "${CERT_DIR}/default.crt"
+    else
+        printf '%s' "${CERT_DIR}/default.pem"
+    fi
+}
+
+node_default_key_path() {
+    printf '%s' "${CERT_DIR}/default.key"
+}
+
+# server.json 里有没有这个 tag 的 inbound。和"证书为空"是两回事：前者是
+# panel.json / server.json 的 tag 对不上（进程会以 no Node with InTag found 退出），
+# 后者只是还没放证书。两种情况的处理完全不同，别用 -z cert 一并判断。
+node_inbound_exists() {
+    jq -e --arg t "$1" '[.inbounds[]? | select(.tag==$t)] | length > 0' "${SERVER_CONFIG}" >/dev/null 2>&1
+}
+
+# 回显某 inbound 实际生效的 "<certpath>|<keypath>"，空值按上面的默认规则补齐。
+node_effective_cert() {
+    local tag="$1" cert key
+    cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+    key="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+    [[ -z "${cert}" ]] && cert="$(node_default_cert_path)"
+    [[ -z "${key}" ]] && key="$(node_default_key_path)"
+    printf '%s|%s' "${cert}" "${key}"
+}
+
 # tag 是否已被某个节点占用。只看 panel.json：server.json 里存在同名 inbound 但没有
 # 节点引用它（默认配置铺的 anytls-in / hysteria2-in 超集就是这种），那不是"占用"，
 # 而是可以直接接管的模板——第一次 add 就该落在 anytls-in 上，与老装机保持一致。
@@ -512,19 +553,22 @@ node_list() {
 
     # 表头用 ASCII：printf 的宽度按字节算，中文表头会和下面的数据列对不齐。
     printf '  %-3s %-8s %-10s %-34s %-20s %s\n' "#" "NodeID" "PROTO" "DOMAIN" "INTAG" "CERT"
-    local i=1 nodeid apihost intag proto cert key mark
+    local i=1 nodeid apihost intag proto paths cert key mark
     while IFS=$'\t' read -r nodeid apihost intag; do
         [[ -z "${intag}" ]] && continue
         proto="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .type)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
         [[ -z "${proto}" ]] && proto="${intag%%-in*}"
-        cert="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
-        key="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
-        if [[ -z "${cert}" ]]; then
+        if ! node_inbound_exists "${intag}"; then
             mark="${red}无 inbound${plain}"
-        elif [[ -s "${cert}" && -s "${key}" ]]; then
-            mark="${green}OK${plain}"
         else
-            mark="${red}缺失${plain}"
+            paths="$(node_effective_cert "${intag}")"
+            cert="${paths%%|*}"
+            key="${paths##*|}"
+            if [[ -s "${cert}" && -s "${key}" ]]; then
+                mark="${green}OK${plain}"
+            else
+                mark="${red}缺失${plain}"
+            fi
         fi
         printf '  %-3s %-8s %-10s %-34s %-20s ' "${i}" "${nodeid}" "${proto}" "${apihost}" "${intag}"
         echo -e "${mark}"
@@ -689,8 +733,11 @@ node_add() {
         [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
         [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 (--protocol): " protocol
         [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
-        [[ -z "${cert_src}" ]] && read -r -p "证书路径 (--cert-path): " cert_src
-        [[ -z "${key_src}" ]] && read -r -p "私钥路径 (--key-path): " key_src
+        if [[ -z "${cert_src}" && -z "${key_src}" ]]; then
+            echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
+            read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
+            [[ -n "${cert_src}" ]] && read -r -p "私钥路径 (--key-path): " key_src
+        fi
     fi
 
     [[ -n "${api_url}" ]] || { echo -e "${red}缺少 --api-url${plain}"; return 1; }
@@ -709,10 +756,12 @@ node_add() {
         echo -e "${red}--protocol 只能是 anytls / hysteria2${plain}"
         return 1
     }
-    [[ -n "${cert_src}" && -n "${key_src}" ]] || {
-        echo -e "${red}缺少 --cert-path / --key-path（anytls 与 hysteria2 都强制 TLS，没有证书起不来）${plain}"
+    # 证书两个参数要么都给要么都不给：只给一个多半是敲漏了，别猜。都不给就把
+    # server.json 的路径留空，交给二进制解析默认路径（见 node_default_cert_path）。
+    if [[ -n "${cert_src}" && -z "${key_src}" ]] || [[ -z "${cert_src}" && -n "${key_src}" ]]; then
+        echo -e "${red}--cert-path 与 --key-path 必须同时给出（都不给则使用默认路径）${plain}"
         return 1
-    }
+    fi
 
     if jq -e --arg h "${api_url}" --argjson id "${node_id}" \
         '[(.nodes // [])[] | select((.apiconfig.apihost // "") == $h and (.apiconfig.nodeid // -1) == $id)] | length > 0' \
@@ -733,11 +782,34 @@ node_add() {
         node_drop_placeholder || { echo -e "${red}清理占位节点失败${plain}"; return 1; }
     fi
 
-    local tag paths cert_path key_path
+    local tag paths cert_path key_path eff_cert eff_key
     tag="$(node_alloc_tag "${proto}" "${node_id}")"
-    paths="$(node_backend_place_cert "${tag}" "${cert_src}" "${key_src}")" || return 1
-    cert_path="${paths%%|*}"
-    key_path="${paths##*|}"
+    if [[ -n "${cert_src}" ]]; then
+        paths="$(node_backend_place_cert "${tag}" "${cert_src}" "${key_src}")" || return 1
+        cert_path="${paths%%|*}"
+        key_path="${paths##*|}"
+        eff_cert="${cert_path}"
+        eff_key="${key_path}"
+    else
+        # 写空值，由二进制在启动时补成默认路径；不复制文件也不登记证书源。
+        cert_path=""
+        key_path=""
+        eff_cert="$(node_default_cert_path)"
+        eff_key="$(node_default_key_path)"
+    fi
+
+    # 启动前预检。anytls 与 hysteria2 都强制 TLS，缺证书的 inbound 建不起来，而
+    # 任一节点 Start() 失败会让 poet/panel/panel.go 走 os.Exit(1)，把同进程的其他
+    # 节点一起带下线。在这里拒绝，比落盘后靠 node_apply 回滚干净得多。
+    if [[ ! -s "${eff_cert}" || ! -s "${eff_key}" ]]; then
+        echo -e "${red}找不到证书：${eff_cert} 与 ${eff_key}${plain}"
+        echo -e "${yellow}没有证书进程起不来。放好证书后重试：${plain}"
+        echo -e "  cp 证书 ${CERT_DIR}/default.pem"
+        echo -e "  cp 私钥 ${CERT_DIR}/default.key"
+        echo -e "${yellow}（.crt 后缀也认；或用 --cert-path/--key-path 指定其他路径）${plain}"
+        node_backend_forget_cert "${tag}"
+        return 1
+    fi
 
     node_backup || { echo -e "${red}备份配置失败，已中止${plain}"; return 1; }
     if ! node_write_server "${tag}" "${proto}" "${sni}" "${cert_path}" "${key_path}"; then
@@ -944,11 +1016,16 @@ certs_sync() {
     fi
     [[ -f "${SERVER_CONFIG}" ]] || return 1
 
-    local tag src_cert src_key dst_cert dst_key
+    local tag src_cert src_key dst_paths dst_cert dst_key
     while IFS=$'\t' read -r tag src_cert src_key; do
         [[ -z "${tag}" ]] && continue
-        dst_cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
-        dst_key="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+        # 目标路径按二进制的解析规则来：server.json 里为空的 inbound 用的是默认
+        # 路径（首装 install-docker.sh 走的就是这条），不是"没有目标"——按空跳过
+        # 会让证书续期同步静默失效。
+        node_inbound_exists "${tag}" || continue
+        dst_paths="$(node_effective_cert "${tag}")"
+        dst_cert="${dst_paths%%|*}"
+        dst_key="${dst_paths##*|}"
         [[ -n "${dst_cert}" && -n "${dst_key}" ]] || continue
         # 目标必须落在挂载目录内，否则容器根本看不见。
         case "${dst_cert}" in
@@ -1022,10 +1099,15 @@ node_cert_register() {
     [[ -s "${cert_src}" ]] || { echo -e "${red}找不到证书文件：${cert_src}${plain}"; return 1; }
     [[ -s "${key_src}" ]] || { echo -e "${red}找不到私钥文件：${key_src}${plain}"; return 1; }
 
-    # 目标路径以 server.json 里该 inbound 的配置为准；不在挂载目录下就没法同步。
-    local dst_cert
-    dst_cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
-    [[ -n "${dst_cert}" ]] || { echo -e "${red}server.json 里没有 tag 为 ${tag} 的 inbound${plain}"; return 1; }
+    # 目标路径以 server.json 里该 inbound 的配置为准，为空则是默认路径（见
+    # node_effective_cert）；不在挂载目录下就没法同步。
+    node_inbound_exists "${tag}" || {
+        echo -e "${red}server.json 里没有 tag 为 ${tag} 的 inbound${plain}"
+        return 1
+    }
+    local dst_paths dst_cert
+    dst_paths="$(node_effective_cert "${tag}")"
+    dst_cert="${dst_paths%%|*}"
     case "${dst_cert}" in
         "${CONFIG_DIR}"/*) ;;
         *)
@@ -1102,9 +1184,15 @@ node_backend_verify() { verify_running; }
 
 node_cert_renew_hint() {
     echo -e "${yellow}证书续期提示：容器内的证书是宿主机证书的副本，且 TLS 证书材料不热重载。"
-    echo -e "singr 已记住源路径（${CERTS_MAP}），每次 start / restart / update 都会重新复制。"
-    echo -e "把这行挂到 certbot 上即可全自动（只在证书真的变了时才重启）："
-    echo -e "  certbot renew --deploy-hook \"singr cert-sync\"${plain}"
+    echo -e "用 --cert-path 添加的节点已记住源路径（${CERTS_MAP}），每次 start / restart /"
+    echo -e "update 都会重新复制。把这行挂到 certbot 上即可全自动（只在证书真的变了时才重启）："
+    echo -e "  certbot renew --deploy-hook \"singr cert-sync\""
+    echo -e ""
+    echo -e "如果用的是默认路径（add 时没给 --cert-path），则没有登记源路径，续期不会自动"
+    echo -e "生效——容器只挂载 ${CONFIG_DIR}，软链到 /etc/letsencrypt 在容器内是断的。"
+    echo -e "补一次登记即可（@1 是 singr list 的 # 序号）："
+    echo -e "  singr cert @1 --cert-path /etc/letsencrypt/live/域名/fullchain.pem \\"
+    echo -e "                --key-path  /etc/letsencrypt/live/域名/privkey.pem${plain}"
 }
 
 # ---------------- Hysteria2 端口跳跃管理（宿主机 iptables，与裸机版一致）------

@@ -14,9 +14,23 @@ The `host` value is parsed into `NodeInfo.Host`. Because the current runtime sti
 "tls": {
   "enabled": true,
   "server_name": "xxxx.com",
-  "certificate_path": "/etc/singr/certs/anytls.crt",
-  "key_path": "/etc/singr/certs/anytls.key"
+  "certificate_path": "",
+  "key_path": ""
 }
 ```
 
-You may replace `certificate_path` and `key_path` with your own certificate and private key. The certificate should cover the configured `server_name`/SSPanel `host` value. If you use a self-signed certificate, clients must explicitly trust it or enable insecure TLS verification.
+Leaving `certificate_path` and `key_path` empty is not "no certificate" — it
+means "use the default location". At startup SingR fills empty values in with
+`<directory of the panel config>/certs/default.pem` (falling back to
+`default.crt` when the `.pem` is absent) plus `default.key`, which is
+`/etc/singr/certs/` for a bare-metal install and `/etc/singr-docker/certs/`
+for the docker one. The substitution is logged:
+
+```text
+inbound/anytls[anytls-in]: no TLS certificate configured, using default /etc/singr/certs/default.pem + /etc/singr/certs/default.key
+```
+
+A path that is already set is never rewritten, so per-node certificates (and
+existing installations) keep working unchanged.
+
+You may also point `certificate_path` and `key_path` at your own certificate and private key. The certificate should cover the configured `server_name`/SSPanel `host` value. If you use a self-signed certificate, clients must explicitly trust it or enable insecure TLS verification.

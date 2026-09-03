@@ -144,7 +144,9 @@ install_docker() {
 }
 
 write_conf() {
-    mkdir -p "${CONFIG_DIR}" "${CERT_DIR}"
+    mkdir -p "${CONFIG_DIR}"
+    # 只在新建时设 700：这里要放私钥，默认的 755 会让机器上的非 root 用户读到。
+    [[ -d "${CERT_DIR}" ]] || mkdir -m 700 -p "${CERT_DIR}"
     # printf %q 产出可被 bash 重新解析的安全 token，供 docker.conf 里的数组字面量使用。
     local flags_literal="" f
     for f in "${APP_FLAGS[@]}"; do
@@ -191,18 +193,12 @@ install_management_script() {
 }
 
 print_usage() {
-    # 与入口一致的协议归一化，避免 hysteria2/hy2 被截成 hysteria/hy 而提示错误路径。
-    local cert_proto
-    case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
-        hysteria2|hy2) cert_proto="hysteria2" ;;
-        *)             cert_proto="anytls" ;;
-    esac
     echo ""
     log_info "SingR（Docker）安装完成。"
     echo ""
     echo -e "${yellow}⚠ 证书：没有证书容器不会启动（与裸机一致）。${plain}"
-    echo    "  请把证书放到：${CERT_DIR}/${cert_proto}.crt 与 ${cert_proto}.key"
-    echo    "  （默认路径见 ${CONFIG_DIR}/server.json，也可用 --cert-path/--key-path 指定）"
+    echo    "  请把证书放到：${CERT_DIR}/default.pem 与 ${CERT_DIR}/default.key"
+    echo    "  （证书用 .crt 后缀也认；也可用 singr add 的 --cert-path/--key-path 指定别的路径）"
     echo    "  放好后执行：singr restart"
     echo ""
     echo "常用管理命令："
@@ -219,9 +215,11 @@ print_usage() {
     echo "配置目录：${CONFIG_DIR}"
 }
 
-# 把 --cert-path/--key-path 指向的宿主机证书复制进挂载目录 ${CERT_DIR}，用协议标准
-# 名（<proto>.crt/.key）——容器只挂载 ${CONFIG_DIR}，宿主机别处（如 /root/）的文件
-# 容器内不可见。复制后走 server.json 默认路径，无需再向容器透传 --cert-path。
+# 把 --cert-path/--key-path 指向的宿主机证书复制进挂载目录 ${CERT_DIR}，用默认名
+# （default.pem / default.key）——容器只挂载 ${CONFIG_DIR}，宿主机别处（如 /root/）
+# 的文件容器内不可见。首装铺下去的 server.json 把 certificate_path/key_path 留空，
+# 二进制会自己解析到这两个文件（cmd/sing-box/cmd_run.go 的
+# applyDefaultCertificatePaths），所以复制完无需再向容器透传 --cert-path。
 copy_certs() {
     local proto
     case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
@@ -231,13 +229,13 @@ copy_certs() {
     mkdir -p "${CERT_DIR}"
     if [[ -n "${CERT_SRC}" ]]; then
         [[ -s "${CERT_SRC}" ]] || die "找不到证书文件：${CERT_SRC}"
-        install -m 644 "${CERT_SRC}" "${CERT_DIR}/${proto}.crt"
-        log_info "已复制证书 -> ${CERT_DIR}/${proto}.crt"
+        install -m 644 "${CERT_SRC}" "${CERT_DIR}/default.pem"
+        log_info "已复制证书 -> ${CERT_DIR}/default.pem"
     fi
     if [[ -n "${KEY_SRC}" ]]; then
         [[ -s "${KEY_SRC}" ]] || die "找不到私钥文件：${KEY_SRC}"
-        install -m 600 "${KEY_SRC}" "${CERT_DIR}/${proto}.key"
-        log_info "已复制私钥 -> ${CERT_DIR}/${proto}.key"
+        install -m 600 "${KEY_SRC}" "${CERT_DIR}/default.key"
+        log_info "已复制私钥 -> ${CERT_DIR}/default.key"
     fi
     record_cert_sources "${proto}-in"
 }

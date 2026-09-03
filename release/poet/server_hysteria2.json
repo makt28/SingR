@@ -32,8 +32,8 @@
             "tls": {
                 "enabled": true,
                 "server_name": "",
-                "certificate_path": "/etc/singr/certs/hysteria2.crt",
-                "key_path": "/etc/singr/certs/hysteria2.key"
+                "certificate_path": "",
+                "key_path": ""
             }
         }
     ],
