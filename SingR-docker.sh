@@ -543,13 +543,21 @@ node_cert_status() {
     fi
 }
 
-# 回显某 inbound 实际生效的 "<certpath>|<keypath>"，空值按上面的默认规则补齐。
+# 回显某 inbound 实际生效的 "<certpath>|<keypath>"。
+#
+# 只有 certificate_path 和 key_path **都**为空才代入默认路径 —— 必须和 Go 侧的
+# certificateUnset 完全一致。只填了一个是用户手写漏了，二进制会以 missing
+# certificate / missing key 拒绝启动；如果这里各自独立地补默认值，singr list 会
+# 给一个根本起不来的配置报 OK。半配置的情况照实回显（其中一项为空串），由调用方
+# 判成"配置不全"。
 node_effective_cert() {
     local tag="$1" cert key
     cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
     key="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
-    [[ -z "${cert}" ]] && cert="$(node_default_cert_path)"
-    [[ -z "${key}" ]] && key="$(node_default_key_path)"
+    if [[ -z "${cert}" && -z "${key}" ]]; then
+        cert="$(node_default_cert_path)"
+        key="$(node_default_key_path)"
+    fi
     printf '%s|%s' "${cert}" "${key}"
 }
 
@@ -613,7 +621,10 @@ node_list() {
             paths="$(node_effective_cert "${intag}")"
             cert="${paths%%|*}"
             key="${paths##*|}"
-            if [[ -s "${cert}" && -s "${key}" ]]; then
+            if [[ -z "${cert}" || -z "${key}" ]]; then
+                # 只写了 certificate_path 或 key_path 其中一个，二进制会拒绝启动。
+                mark="${red}配置不全${plain}"
+            elif [[ -s "${cert}" && -s "${key}" ]]; then
                 mark="$(node_cert_status "${cert}")"
             else
                 mark="${red}缺失${plain}"
@@ -785,7 +796,12 @@ node_add() {
         if [[ -z "${cert_src}" && -z "${key_src}" ]]; then
             echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
             read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
-            [[ -n "${cert_src}" ]] && read -r -p "私钥路径 (--key-path): " key_src
+        fi
+        # 只给了一对里的一个就把另一个问出来，别直接报错——命令行敲漏一个参数是常事。
+        if [[ -n "${cert_src}" && -z "${key_src}" ]]; then
+            read -r -p "私钥路径 (--key-path): " key_src
+        elif [[ -z "${cert_src}" && -n "${key_src}" ]]; then
+            read -r -p "证书路径 (--cert-path): " cert_src
         fi
     fi
 
@@ -1154,9 +1170,15 @@ node_cert_register() {
         echo -e "${red}server.json 里没有 tag 为 ${tag} 的 inbound${plain}"
         return 1
     }
-    local dst_paths dst_cert
+    local dst_paths dst_cert dst_key
     dst_paths="$(node_effective_cert "${tag}")"
     dst_cert="${dst_paths%%|*}"
+    dst_key="${dst_paths##*|}"
+    [[ -n "${dst_cert}" && -n "${dst_key}" ]] || {
+        echo -e "${red}inbound ${tag} 只配了 certificate_path 或 key_path 其中一个，进程起不来。${plain}"
+        echo -e "${yellow}用 singr config 把两个都填上（或都留空以使用默认路径）再执行本命令。${plain}"
+        return 1
+    }
     case "${dst_cert}" in
         "${CONFIG_DIR}"/*) ;;
         *)
@@ -1165,6 +1187,27 @@ node_cert_register() {
             return 1
             ;;
     esac
+
+    # 同一个目标路径不能登记两个不同的源。默认路径（certs/default.pem）是所有没有
+    # 显式指定证书的节点共用的，两个源会在每次 certs_sync 里互相覆盖 —— 每跑一次
+    # 就判定"证书变了"并重启容器，挂在 certbot 上就是无限重启。在这里拒绝，比让
+    # 用户去查为什么容器每天重启好得多。
+    if [[ -s "${CERTS_MAP}" ]]; then
+        local other other_src other_dst
+        while IFS=$'\t' read -r other other_src; do
+            [[ -z "${other}" || "${other}" == "${tag}" ]] && continue
+            [[ "${other_src}" == "${cert_src}" ]] && continue
+            node_inbound_exists "${other}" || continue
+            other_dst="$(node_effective_cert "${other}")"
+            other_dst="${other_dst%%|*}"
+            [[ "${other_dst}" == "${dst_cert}" ]] || continue
+            echo -e "${red}节点 ${other} 已经把另一个证书源登记到同一个目标路径：${dst_cert}${plain}"
+            echo -e "${yellow}两个源会在每次证书同步时互相覆盖，让 singr cert-sync 每跑一次就重启一次容器。${plain}"
+            echo -e "${yellow}先给其中一个节点指定独立的证书路径，再登记：${plain}"
+            echo -e "  singr del <节点> 后用 singr add ... --cert-path ... --key-path ... 重新添加"
+            return 1
+        done < <(jq -r 'to_entries[] | [.key, (.value.cert // "")] | @tsv' "${CERTS_MAP}" 2>/dev/null)
+    fi
 
     certs_map_set "${tag}" "${cert_src}" "${key_src}" || return 1
     echo -e "${green}已登记 ${tag} 的证书源：${cert_src}${plain}"

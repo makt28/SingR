@@ -141,8 +141,10 @@ singr del @2                  # @序号取自上面 list 的 # 列，最省事
 ```
 
 - 不足 30 天转黄，已过期转红。
-- `缺失` = 路径上没有文件；`无 inbound` = `panel.json` 的 `intag` 在 `server.json`
-  里找不到对应入站（这种节点会让整个进程起不来，是配置写错了）。
+- `缺失` = 路径上没有文件；`配置不全` = `certificate_path` 和 `key_path` 只写了一个
+  （两个都留空才是"用默认路径"，只写一个二进制会以 `missing key` 拒绝启动）；
+  `无 inbound` = `panel.json` 的 `intag` 在 `server.json` 里找不到对应入站。后两种都
+  会让整个进程起不来。
 - 天数靠 `openssl` 读取；机器上没有 `openssl` 或证书读不出来时只显示 `OK`，不影响
   其他列。
 
