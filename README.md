@@ -49,7 +49,7 @@ SingR 会按旧 SSPanel V2ray 格式解析：
 ## 环境要求
 
 - Linux 服务器，推荐 systemd 环境。
-- Go `1.24.7` 或兼容版本，用于源码编译。
+- Go `1.25.5` 或更高版本，用于源码编译（CI 与发布构建使用 `1.26.7`；Go 1.27 已验证可编译，但暂未用于发布）。
 - 一个可访问的旧 SSPanel 面板。
 - SSPanel 节点类型配置为 `V2ray`。
 - AnyTLS 需要 TLS 证书。生产环境建议使用可信证书；自签证书需要客户端开启允许不安全证书或手动信任证书。
@@ -91,6 +91,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
 脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
 
 > 0.2.5 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、把 `direct` 出站的老 `domain_strategy` 字段迁移成 `domain_resolver`（保留原策略值，缺省 `prefer_ipv6`）、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4），同时跟上 sing-box 1.12+ 的新配置写法。
+>
+> ⚠️ **0.6.0（核心 1.14）起这个迁移是硬性的**：sing-box 1.14 会直接拒绝启动带老 `domain_strategy` 出站字段的配置（报 `legacy domain strategy options is deprecated`）。迁移依赖 `jq`，**机器上没装 `jq` 时迁移只会打一条警告然后跳过**，升级后节点将起不来。升级前请先确认 `jq` 已安装。
 
 `SingR` 和 `singr` 两个管理命令等价，大小写都可以。
 
@@ -222,7 +224,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/install-do
 ```sh
 singr config     # 改 /etc/singr-docker/panel.json，自动 docker restart
 singr log        # docker logs -f
-singr update     # 拉最新镜像重建容器（也可 singr update v0.5.0 指定版本）
+singr update     # 拉最新镜像重建容器（也可 singr update v0.6.0 指定版本）
 singr porthop    # Hysteria2 端口跳跃
 singr uninstall  # 删容器 + 配置 + 端口跳跃规则
 ```
@@ -499,7 +501,7 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 - AnyTLS：端口变化时先在新端口起 listener、成功后才关旧端口（失败自动回滚）；SNI 变化只重建 TLS、不重启 listener。日志 `anytls listener hot-reloaded to port ...` / `anytls TLS hot-reloaded with SNI ...`。
 - Hysteria2：因为 TLS 焊在 QUIC service 里，端口/SNI 变化会**重建整个 service**并把当前用户表重新灌进去（端口变化先起新后关旧；同端口仅 SNI 变化要先关旧再起新，有极短重启窗口）。日志 `hysteria2 listener hot-reloaded to port ...` / `hysteria2 TLS hot-reloaded with SNI ...`。
 
-**两种协议的证书材料、入站类型、路由规则、obfs/带宽/masquerade 都不会被热更新。**
+**两种协议的证书材料、入站类型、路由规则、obfs/带宽/masquerade/realm 都不会被热更新。**
 
 ### AnyTLS padding 方案（抗指纹）
 
@@ -528,7 +530,7 @@ AnyTLS 入站支持在 `server.json` 里设置 `padding_scheme`，用来打乱�
 
 ### 出口 IPv6
 
-默认配置里的 `direct` 出站都设了 `domain_resolver: { "server": "google", "strategy": "prefer_ipv6" }`（sing-box 1.12 起的新写法，老的出站 `domain_strategy` 字段已废弃并将在 1.14 移除），并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
+默认配置里的 `direct` 出站都设了 `domain_resolver: { "server": "google", "strategy": "prefer_ipv6" }`（sing-box 1.12 起的新写法；老的出站 `domain_strategy` 字段自核心 1.14 起会被运行时直接拒绝，节点无法启动），并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
 
 `auto_detect_interface` 在服务器端建议保持 `false`，它是给 client/TUN 场景用的；开着会把 outbound socket 强行绑到默认网卡，并在某些 IPv6-only 目的地下失效。
 
@@ -546,6 +548,12 @@ Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发�
   规则:**`password` 留空 → 自动用 TLS SNI(`server_name`,即面板下发的 `host=`)当 obfs 密码;写了具体值 → 用写的那个。** 这样 SSPanel 不用额外字段也能"顺带"下发 obfs 密码。
 
   ⚠️ **obfs 开着,所有客户端就必须带相同 obfs**,否则连不上(obfs 不匹配 = 彻底连不上,不是降级)。订阅里要同步带 `obfs=salamander&obfs-password=<SNI 或你写的值>`。**完全不想用 obfs,就把整个 `obfs` 块删掉**(删掉才是关闭;留着空密码是"用 SNI 开启")。
+
+  核心 1.14 起还有第二种混淆 `gecko`（`"type": "gecko"`，可选 `min_packet_size` / `max_packet_size`）。它和 salamander 的区别是：salamander 只打乱字节、**不改包长**；gecko 会把每个 UDP 包切成 2–8 个分片并填充（默认 512–1200 字节），改变的是**包长分布**，对抗按包长做的流量分析，代价是流量放大和对端重组开销。
+
+  ⚠️ **上面"空密码自动用 SNI"的规则只对 salamander 生效。** `gecko` 走原生逻辑，**密码留空 = 混淆静默失效**（配置看着是开的，实际没启用，也没有日志）。用 gecko 必须显式写 `password`。除非你确实遇到了按包长的封锁，否则建议继续用 salamander——它能靠 SNI 免配置下发密码。
+- **`realm`（核心 1.14 新增，SingR 不建议开）**。这是给「服务端在 NAT 后面、没有公网端口」的场景做打洞用的：需要你自己搭一台 realm control server，服务端向它注册、用 STUN 发现公网地址、可选 UPnP/NAT-PMP 开端口。SingR 节点通常是有公网 IP 的 VPS，用不上；面板也下发不了这个配置。
+  ⚠️ 更要紧的是它**和面板热重载冲突**：realm 是在构建 QUIC service 时创建的，而面板每次改端口或 `host=`（SNI）都会重建整个 service，于是**每次都会重跑一遍 STUN、重新注册、重做端口映射**；只改 SNI 时还会先关旧服务腾出 UDP 端口，中间有一段没有 realm 会话且无法回滚的真空期。要用就把面板侧端口和 `host=` 固定死。
 - **带宽 `up_mbps` / `down_mbps`**：`0` = 不限 / 让客户端自报（走 BBR 或 Brutal）。面板的 `node_speedlimit` 仍然独立生效（每用户限速叠加在 Hysteria2 自身拥塞控制之上）。
 - **端口跳跃（可选，纯运维，代码不管）**。Hysteria2 进程只绑 1 个 UDP 端口；端口跳跃是用防火墙把一段端口 NAT 到真实端口实现的。
 
@@ -689,7 +697,7 @@ u<用户ID>
 
 - `relay_server` 和 `relay_port` 不会自动创建出站和路由。
 - 不会从面板动态创建缺失的入站；`server.json` 必须先声明对应 `intag` 的入站（超集默认已含 anytls/hysteria2 两个）。
-- 不支持运行中热切换入站类型；TLS 证书材料、obfs、带宽、masquerade、端口跳跃 NAT 也仍然只在启动 / 运维时配置，不随面板热更新。
+- 不支持运行中热切换入站类型；TLS 证书材料、obfs、带宽、masquerade、realm、端口跳跃 NAT 也仍然只在启动 / 运维时配置，不随面板热更新。
 
 ## 测试
 

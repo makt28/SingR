@@ -3,7 +3,7 @@ package anytls
 import (
 	"fmt"
 
-	anytls "github.com/makt28/sing-anytls"
+	anytls "github.com/anytls/sing-anytls"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/poet/api"
 )

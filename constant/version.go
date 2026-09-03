@@ -5,4 +5,4 @@ package constant
 // 所以这里的默认值就是 `singr version` 和启动日志里显示的「sing-box core version」。
 // 保持与当前同步的上游基线一致（见 AGENTS.md / memory 的 sing-box 基线记录）；
 // 每次 resync 上游核心时一并更新此处。
-var Version = "1.13.14"
+var Version = "1.14.0"

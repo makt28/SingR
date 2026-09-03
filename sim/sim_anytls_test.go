@@ -24,8 +24,8 @@ import (
 	"testing"
 	"time"
 
-	anytls "github.com/makt28/sing-anytls"
-	"github.com/makt28/sing-anytls/padding"
+	anytls "github.com/anytls/sing-anytls"
+	"github.com/anytls/sing-anytls/padding"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
