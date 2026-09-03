@@ -494,6 +494,55 @@ node_inbound_exists() {
     jq -e --arg t "$1" '[.inbounds[]? | select(.tag==$t)] | length > 0' "${SERVER_CONFIG}" >/dev/null 2>&1
 }
 
+# 证书剩余有效天数，向下取整。回显整数（已过期为负）；判定不了就回显空串，调用方
+# 退回到只显示 OK —— 列个节点表不该因为解析不出日期就报错。
+#
+# 过期与否单独用 openssl x509 -checkend 0 判定（node_cert_expired），它不依赖任何
+# 日期解析，在哪都准；天数才走下面的 date 换算。两种 date 都试：Linux 服务器是
+# GNU date -d，macOS 上跑脚本是 BSD date -j -f。openssl 的 notAfter 形如
+# "Sep  5 02:37:00 2026 GMT"，单数日会有两个空格，%e 认这个。
+node_cert_days_left() {
+    local cert="$1" end_date end_epoch now_epoch
+    [[ -s "${cert}" ]] || return 0
+    command -v openssl >/dev/null 2>&1 || return 0
+    end_date="$(openssl x509 -enddate -noout -in "${cert}" 2>/dev/null)" || return 0
+    end_date="${end_date#notAfter=}"
+    [[ -n "${end_date}" ]] || return 0
+    end_epoch="$(date -d "${end_date}" +%s 2>/dev/null)"
+    [[ -n "${end_epoch}" ]] || end_epoch="$(date -j -f "%b %e %H:%M:%S %Y %Z" "${end_date}" +%s 2>/dev/null)"
+    [[ "${end_epoch}" =~ ^-?[0-9]+$ ]] || return 0
+    now_epoch="$(date +%s)"
+    printf '%s' "$(( (end_epoch - now_epoch) / 86400 ))"
+}
+
+# 0 = 证书已过期。openssl 不在或读不了证书时返回 1（当作没过期），宁可漏报也不误报。
+node_cert_expired() {
+    local cert="$1"
+    [[ -s "${cert}" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    openssl x509 -checkend 0 -noout -in "${cert}" >/dev/null 2>&1 && return 1
+    # -checkend 非零也可能是"读不出证书"，那种情况不该报成已过期。
+    openssl x509 -enddate -noout -in "${cert}" >/dev/null 2>&1
+}
+
+# 证书状态列的文案："OK 剩 87 天" / 不足 30 天转黄 / 已过期转红。
+# openssl 缺失或日期解析不了时退回原来的纯 OK。
+node_cert_status() {
+    local cert="$1" days
+    if node_cert_expired "${cert}"; then
+        printf '%s' "${red}已过期${plain}"
+        return 0
+    fi
+    days="$(node_cert_days_left "${cert}")"
+    if [[ -z "${days}" ]]; then
+        printf '%s' "${green}OK${plain}"
+    elif [[ "${days}" -lt 30 ]]; then
+        printf '%s' "${yellow}OK 剩 ${days} 天${plain}"
+    else
+        printf '%s' "${green}OK 剩 ${days} 天${plain}"
+    fi
+}
+
 # 回显某 inbound 实际生效的 "<certpath>|<keypath>"，空值按上面的默认规则补齐。
 node_effective_cert() {
     local tag="$1" cert key
@@ -565,7 +614,7 @@ node_list() {
             cert="${paths%%|*}"
             key="${paths##*|}"
             if [[ -s "${cert}" && -s "${key}" ]]; then
-                mark="${green}OK${plain}"
+                mark="$(node_cert_status "${cert}")"
             else
                 mark="${red}缺失${plain}"
             fi

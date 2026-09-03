@@ -129,6 +129,23 @@ singr del @2                  # @序号取自上面 list 的 # 列，最省事
                               # 也可用 NodeID 或 InTag：singr del anytls-in-57
 ```
 
+`singr list` 的 CERT 列会顺带算出证书还有几天到期：
+
+```text
+  #   NodeID   PROTO      DOMAIN                  INTAG            CERT
+  1   1        anytls     https://a.example.com   anytls-in        OK 剩 86 天
+  2   7        hysteria2  https://a.example.com   hysteria2-in-7   OK 剩 11 天
+  3   8        anytls     https://b.example.com   anytls-in-8      已过期
+  4   9        anytls     https://b.example.com   anytls-in-9      缺失
+  5   99       anytls     https://b.example.com   ghost-in         无 inbound
+```
+
+- 不足 30 天转黄，已过期转红。
+- `缺失` = 路径上没有文件；`无 inbound` = `panel.json` 的 `intag` 在 `server.json`
+  里找不到对应入站（这种节点会让整个进程起不来，是配置写错了）。
+- 天数靠 `openssl` 读取；机器上没有 `openssl` 或证书读不出来时只显示 `OK`，不影响
+  其他列。
+
 `singr add` 不带参数（或从菜单进入）会逐项询问。每个节点独立拥有用户表、流量统计、
 限速桶和审计规则，**不同节点的用户 ID 撞车也不会串账**。
 
