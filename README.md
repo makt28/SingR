@@ -92,7 +92,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
 
 > 0.2.5 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、把 `direct` 出站的老 `domain_strategy` 字段迁移成 `domain_resolver`（保留原策略值，缺省 `prefer_ipv6`）、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4），同时跟上 sing-box 1.12+ 的新配置写法。
 >
-> ⚠️ **0.6.0（核心 1.14）起这个迁移是硬性的**：sing-box 1.14 会直接拒绝启动带老 `domain_strategy` 出站字段的配置（报 `legacy domain strategy options is deprecated`）。迁移依赖 `jq`，**机器上没装 `jq` 时迁移只会打一条警告然后跳过**，升级后节点将起不来。升级前请先确认 `jq` 已安装。
+> ⚠️ **0.6.0（核心 1.14）起这个迁移是硬性的**：sing-box 1.14 会直接拒绝启动带老 `domain_strategy` 出站字段的配置（报 `legacy domain strategy options is deprecated`）。正常情况下不用操心——脚本会先装好依赖（含 `jq`）再执行迁移。只有在依赖安装失败时（发行版不受支持、装不上包等）迁移才会**只打一条警告就跳过**，此时节点升级后起不来。所以升级时如果看到 `未安装 jq，跳过 server.json 迁移` 这行警告，**先别急着重启**，手动把 `direct` 出站的 `domain_strategy` 改成 `domain_resolver` 再启动。
 
 `SingR` 和 `singr` 两个管理命令等价，大小写都可以。
 
