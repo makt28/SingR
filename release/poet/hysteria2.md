@@ -93,10 +93,19 @@ password follows an SNI hot-reload; an explicit password stays fixed.
 
 ## Bandwidth
 
-`up_mbps` / `down_mbps` of `0` means unlimited / let the client self-report
-its bandwidth (BBR or Brutal). Per-user speed limiting still comes from the
-panel `node_speedlimit` and is enforced independently of hysteria2's own
-congestion control.
+`up_mbps` / `down_mbps` are **caps**, not target rates. The effective Brutal
+rate is the smaller of the cap and what the client declares: downstream
+(server→client) runs at `min(client declared rx, up_mbps)`, upstream at
+`min(down_mbps, client declared tx)` — and a client declaring `0` falls back
+to BBR.
+
+`0` therefore means **no cap at all**, not "conservative": a client declaring
+1000 Mbps really does send at a loss-insensitive Brutal 1000 Mbps. The default
+template ships `300` for both, capping every client's Brutal rate at 300 Mbps.
+Raise it on a gigabit node, set `0` only if you want no ceiling.
+
+Per-user speed limiting still comes from the panel `node_speedlimit` and is
+enforced independently of hysteria2's own congestion control.
 
 ## Port hopping (optional, deployment-only)
 

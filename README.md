@@ -477,8 +477,8 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
       "listen": "::",
       "listen_port": 0,
       "users": [],
-      "up_mbps": 0,
-      "down_mbps": 0,
+      "up_mbps": 300,
+      "down_mbps": 300,
       "ignore_client_bandwidth": false,
       "tls": {
         "enabled": true,
@@ -584,7 +584,11 @@ Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发�
   ⚠️ **上面"空密码自动用 SNI"的规则只对 salamander 生效。** `gecko` 走原生逻辑，**密码留空 = 混淆静默失效**（配置看着是开的，实际没启用，也没有日志）。用 gecko 必须显式写 `password`。除非你确实遇到了按包长的封锁，否则建议继续用 salamander——它能靠 SNI 免配置下发密码。
 - **`realm`（核心 1.14 新增，SingR 不建议开）**。这是给「服务端在 NAT 后面、没有公网端口」的场景做打洞用的：需要你自己搭一台 realm control server，服务端向它注册、用 STUN 发现公网地址、可选 UPnP/NAT-PMP 开端口。SingR 节点通常是有公网 IP 的 VPS，用不上；面板也下发不了这个配置。
   ⚠️ 更要紧的是它**和面板热重载冲突**：realm 是在构建 QUIC service 时创建的，而面板每次改端口或 `host=`（SNI）都会重建整个 service，于是**每次都会重跑一遍 STUN、重新注册、重做端口映射**；只改 SNI 时还会先关旧服务腾出 UDP 端口，中间有一段没有 realm 会话且无法回滚的真空期。要用就把面板侧端口和 `host=` 固定死。
-- **带宽 `up_mbps` / `down_mbps`**：`0` = 不限 / 让客户端自报（走 BBR 或 Brutal）。面板的 `node_speedlimit` 仍然独立生效（每用户限速叠加在 Hysteria2 自身拥塞控制之上）。
+- **带宽 `up_mbps` / `down_mbps`**：这两个值是**上限**，不是目标速率——实际速率取「客户端自报值」与它的较小者：下行（服务端→客户端）按 `min(客户端自报下载, up_mbps)` 跑 Brutal，上行按 `min(down_mbps, 客户端自报上传)` 跑 Brutal（客户端自报 0 则退回 BBR）。
+
+  `0` = **上限无穷大**，完全听客户端的：一个自报 1000 Mbps 的客户端就真会按 Brutal 1000 Mbps 定速发包（Brutal 无视丢包）。所以 `0` 是没有护栏的那个值，不是"保守"的那个。默认模板给的是 `300`，即把每个客户端的 Brutal 速率按到 300 Mbps 以内；千兆节点想跑满就自行调大，想完全放开才填 `0`。
+
+  面板的 `node_speedlimit` 仍然独立生效（每用户限速叠加在 Hysteria2 自身拥塞控制之上）。
 - **端口跳跃（可选，纯运维，代码不管）**。Hysteria2 进程只绑 1 个 UDP 端口；端口跳跃是用防火墙把一段端口 NAT 到真实端口实现的。
 
   **推荐用内置管理器**：`SingR porthop`（或管理菜单第 13 项），输入 起始端口 / 结束端口 / 目标（真实）端口即可，自动下 v4+v6 的 REDIRECT 规则、写进 `/etc/singr/porthop.rules`，并由生成的 `singr-porthop.service` 开机重放。规则都带 `singr-porthop` 的 iptables comment 标记，所以列出 / 删除只动 SingR 自己的规则，不碰你其它防火墙规则；持久化由 SingR 自管，不依赖 `iptables-persistent` / `iptables-services`。

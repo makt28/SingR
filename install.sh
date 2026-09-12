@@ -345,8 +345,8 @@ EOF
       "listen": "::",
       "listen_port": 0,
       "users": [],
-      "up_mbps": 0,
-      "down_mbps": 0,
+      "up_mbps": 300,
+      "down_mbps": 300,
       "ignore_client_bandwidth": false,
       "obfs": {
         "type": "salamander",
