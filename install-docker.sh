@@ -132,6 +132,35 @@ validate() {
     esac
 }
 
+# jq：singr add/del/list 和 certs_sync 都靠它——没有 jq 时 certs_sync 整体跳过，
+# certbot 续期后证书不会同步进容器。vim：查看/改 /etc/singr-docker 下的配置。
+# 尽力而为、逐个装：宿主机包管理器五花八门，装不上只警告，不挡 docker 安装；
+# 脚本里的 node_require_jq 仍是兜底。已存在的跳过，重跑不会白跑一次 apt update。
+install_tools() {
+    local pkg missing=()
+    for pkg in jq vim; do
+        command -v "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    log_info "安装依赖工具：${missing[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1 || true
+        for pkg in "${missing[@]}"; do apt-get install -y -qq "${pkg}" >/dev/null 2>&1 || true; done
+    elif command -v dnf >/dev/null 2>&1; then
+        for pkg in "${missing[@]}"; do dnf install -y "${pkg}" >/dev/null 2>&1 || true; done
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y epel-release >/dev/null 2>&1 || true  # CentOS 7 的 jq 在 EPEL
+        for pkg in "${missing[@]}"; do yum install -y "${pkg}" >/dev/null 2>&1 || true; done
+    elif command -v apk >/dev/null 2>&1; then
+        for pkg in "${missing[@]}"; do apk add --no-cache "${pkg}" >/dev/null 2>&1 || true; done
+    fi
+
+    for pkg in "${missing[@]}"; do
+        command -v "${pkg}" >/dev/null 2>&1 || log_warn "未能安装 ${pkg}，请手动安装（不影响本次安装）。"
+    done
+}
+
 install_docker() {
     if command -v docker >/dev/null 2>&1; then
         log_info "检测到 docker：$(docker --version 2>/dev/null || true)"
@@ -269,6 +298,7 @@ main() {
     parse_args "$@"
     validate
     guard_existing_install
+    install_tools
     install_docker
     write_conf
     copy_certs
