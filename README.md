@@ -171,44 +171,56 @@ singr del @2                  # @序号取自上面 list 的 # 列，最省事
 
 ### 证书续期
 
-TLS 证书材料不热重载，**续期后必须重启才生效**，两种部署方式都是如此。
+SingR 会监视证书文件，**文件一变就自动重新加载，不用重启**，也不需要 certbot 的
+`--deploy-hook`。两种部署方式都直接引用你给的证书路径（不复制），certbot 原地更新
+文件即可。
 
-裸机直接引用你给的证书路径（不复制），certbot 原地更新文件即可：
+- **裸机**：`singr add --cert-path` 的路径原样写进 `server.json`。
+- **Docker**：路径同样原样写进 `server.json`，容器按**原路径只读挂载**证书所在的
+  目录（certbot 的 `live/` 软链会顺带挂上它指向的 `archive/` 目录），所以容器里
+  看到的路径和宿主机一模一样。证书路径变了（`singr add`、`singr config` 改了
+  `server.json`）时，`singr restart` 会自动按新路径重建容器。证书请放在单独的目录里，
+  `/etc`、`/usr`、`/tmp` 这类系统目录本身不能挂进容器。
+
+> **例外：把 `default.pem` 软链到 certbot 的情况。** 进程监视的是配置里写的那个文件
+> 所在的目录（这里是 `certs/`），而 certbot 续期时换的是 `live/` 里的软链，`certs/`
+> 目录本身没有变化，所以监视不到。这种用法要么继续挂
+> `certbot renew --deploy-hook "singr restart"`，要么直接把 certbot 的路径写进
+> `server.json`（`singr add --cert-path` 就是这么做的）。
+
+#### 默认证书的远程更新源
+
+TLS 留空的节点用的是默认证书 `certs/default.pem` + `default.key`。如果证书由别处
+统一签发、通过 https 分发，可以让 SingR 自己去拉：
 
 ```sh
-certbot renew --deploy-hook "singr restart"
+singr cert-source --cert-url https://example.com/a.pem --key-url https://example.com/a.key
 ```
 
-用默认路径的裸机节点，把 `default.pem` / `default.key` 软链到 certbot 的 live 目录
-就同样是原地更新：
+- 立即下载一次，校验通过（是有效证书、没过期、和私钥配对）才放进默认路径。
+- 装一个每天跑一次的 systemd timer（`singr-cert-update.timer`）：本地证书**剩余不足
+  7 天**才去下载，远端比本地新才替换，替换后重启 SingR 并确认起来了，起不来就换回旧证书。
+- 地址存在 `cert-source.json`（权限 600，地址里可以带 token），只接受 `https://`。
+- 只管默认证书，显式写了证书路径的节点不受影响。
+- 管理菜单第 15 项「默认证书更新源」可以查看状态、更换、立即更新或清除；
+  `singr cert-update --force` 不看剩余天数立即更新。
 
-```sh
-ln -sf /etc/letsencrypt/live/a.example.com/fullchain.pem /etc/singr/certs/default.pem
-ln -sf /etc/letsencrypt/live/a.example.com/privkey.pem   /etc/singr/certs/default.key
-```
+装机时可以直接带上：`install-docker.sh ... --cert-url URL --key-url URL`，或
+`singr add ... --cert-url URL --key-url URL`（与 `--cert-path` 二选一）。
 
-Docker 因为容器只挂载 `/etc/singr-docker`，宿主机别处（如 `/root/`、
-`/etc/letsencrypt/`）的文件容器内看不见，所以证书必须复制进挂载目录——**软链也不
-行**，链接目标同样在容器外。`singr` 会记住你给的源路径（记在
-`/etc/singr-docker/certs.json`），每次 `start` / `restart` / `update` 之前自动重新
-复制一遍。挂上这行就全自动了（只有证书真的变了才会重启）：
+#### 从旧版 Docker 升级
 
-```sh
-certbot renew --deploy-hook "singr cert-sync"
-```
+旧版 Docker 是把证书**复制**进 `/etc/singr-docker`，再靠 `certs.json` + `singr cert-sync`
+在重启前重新复制。升级管理脚本后第一次执行任意 `singr` 命令会自动迁移：
 
-> **两种情况需要补登记证书源。** 证书源只在 `singr add --cert-path` 和首次安装带
-> `--cert-path` 时登记：从旧版本升级上来的机器 `certs.json` 并不存在，而直接把证书
-> 放到默认路径 `certs/default.pem` 的节点也没有源可同步。两种情况下同步都是空转的
-> （`singr cert-sync` 检测到未登记会直接告诉你）。给每个节点补登记一次即可：
->
-> ```sh
-> singr cert @1 --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
->               --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
-> ```
->
-> 同一个命令也用于更换某个节点的证书源，不必 `del` 再 `add`。
-
+- 用 `--cert-path` 添加的节点改为直接引用原来的证书源，容器重建后挂载源目录；旧副本
+  收进 `certs/.migrated-<时间>/`。
+- 证书源已不存在的节点、以及用默认证书的节点（首次安装带 `--cert-path` 的就是这种），
+  迁移后**不再自动续期**。它们会记在 `/etc/singr-docker/cert-migration-notice.txt`，
+  `singr list` 也会提示。处理方法：`singr cert-source` 配置更新源，或用 `singr config`
+  把证书路径写成 certbot 的原路径后 `singr restart`。
+- `singr cert` / `singr cert-sync` 已删除；certbot 里残留的 `--deploy-hook "singr cert-sync"`
+  不会报错，可以顺手删掉。
 
 ## Docker 部署
 
@@ -245,8 +257,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/install-do
   --api-url https://your-sspanel.example.com \
   --api-key your-apikey \
   --node-id 44 \
-  --protocol anytls          # 或 hysteria2
-# 放好证书后： singr restart
+  --protocol anytls \        # 或 hysteria2
+  --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
+  --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
+# 证书也可以用 --cert-url/--key-url 从 https 地址下载（见「默认证书的远程更新源」），
+# 或者都不给、之后放到默认路径再 singr restart
 ```
 
 之后的管理和裸机无差别：
@@ -299,7 +314,8 @@ flag（方式一）与 `SINGR_*` 环境变量（方式二/三）一一对应，�
 | `--node-id` | `SINGR_NODE_ID` | 节点 ID（必填） | |
 | `--protocol` | `SINGR_PROTOCOL` | `anytls` 或 `hysteria2`（必填） | |
 | `--sni` | `SINGR_SNI` | 入站 `server_name` | 空 |
-| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书/私钥路径（容器内路径） | 空 = 用默认路径 `certs/default.pem` + `default.key` |
+| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书/私钥路径。方式一里是宿主机路径，脚本按原路径挂进容器；方式二/三里是容器内路径，挂载要自己做 | 空 = 用默认路径 `certs/default.pem` + `default.key` |
+| `--cert-url` / `--key-url` | （无） | 仅方式一：下载为默认证书并每日检查更新，与 `--cert-path` 二选一 | |
 | `--speed-limit` / `--device-limit` | `SINGR_SPEED_LIMIT` / `SINGR_DEVICE_LIMIT` | 限速 / 设备数 | 0 |
 | `--enable-device-limit` | `SINGR_ENABLE_DEVICE_LIMIT` | 是否硬限设备 | false |
 | `--update-periodic` | `SINGR_UPDATE_PERIODIC` | 面板同步周期（秒） | 60 |
@@ -531,7 +547,7 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 - AnyTLS：端口变化时先在新端口起 listener、成功后才关旧端口（失败自动回滚）；SNI 变化只重建 TLS、不重启 listener。日志 `anytls listener hot-reloaded to port ...` / `anytls TLS hot-reloaded with SNI ...`。
 - Hysteria2：因为 TLS 焊在 QUIC service 里，端口/SNI 变化会**重建整个 service**并把当前用户表重新灌进去（端口变化先起新后关旧；同端口仅 SNI 变化要先关旧再起新，有极短重启窗口）。日志 `hysteria2 listener hot-reloaded to port ...` / `hysteria2 TLS hot-reloaded with SNI ...`。
 
-**两种协议的证书材料、入站类型、路由规则、obfs/带宽/masquerade/realm 都不会被热更新。**
+**面板热更新不涉及证书材料、入站类型、路由规则、obfs/带宽/masquerade/realm。**（证书文件本身变了，进程会自动重新加载，见「证书续期」。）
 
 ### AnyTLS padding 方案（抗指纹）
 
@@ -632,6 +648,9 @@ inbound/anytls[anytls-in]: no TLS certificate configured, using default /etc/sin
 需要按节点用不同证书时（比如多节点不同域名），用 `singr add --cert-path/--key-path`
 指定，或直接在 `server.json` 里写具体路径——**非空的路径不会被改写**，所以老机器
 升级上来什么都不用动。
+
+默认证书也可以交给 `singr cert-source` 从 https 地址自动下载、到期前自动更新，见
+「证书续期」一节。
 
 证书应覆盖 SSPanel 节点地址中的 `host=` 值。没有可信证书时可以临时使用自签证书，但客户端必须允许不安全证书或信任该证书。
 
@@ -750,7 +769,7 @@ u<用户ID>
 
 - `relay_server` 和 `relay_port` 不会自动创建出站和路由。
 - 不会从面板动态创建缺失的入站；`server.json` 必须先声明对应 `intag` 的入站（超集默认已含 anytls/hysteria2 两个）。
-- 不支持运行中热切换入站类型；TLS 证书材料、obfs、带宽、masquerade、realm、端口跳跃 NAT 也仍然只在启动 / 运维时配置，不随面板热更新。
+- 不支持运行中热切换入站类型；TLS 证书路径、obfs、带宽、masquerade、realm、端口跳跃 NAT 也仍然只在启动 / 运维时配置，不随面板热更新（证书文件内容变化会自动重新加载）。
 
 ## 测试
 

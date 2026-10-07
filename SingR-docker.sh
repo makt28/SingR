@@ -84,11 +84,18 @@ container_exists()  { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 
 # 才算真在跑（restarting/exited/created 都不算）。
 container_running() { [[ "$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null)" == "running" ]]; }
 
-# 删旧建新（update / 首次 bootstrap 共用）。RUN_FLAGS 是首启引导参数；因为
-# entrypoint 只在 panel.json 不存在时生成，重建不会覆盖已有配置。
+# 删旧建新（update / 首次 bootstrap / 证书挂载变化共用）。RUN_FLAGS 是首启引导参数；
+# 因为 entrypoint 只在 panel.json 不存在时生成，重建不会覆盖已有配置。
+#
+# 除了整体挂载 ${CONFIG_DIR}，还把 server.json 引用的证书所在目录按原路径只读挂进去
+# （cert_mount_dirs），容器里看到的证书路径和宿主机一模一样。
 container_recreate() {
     require_docker
-    certs_sync >/dev/null 2>&1
+    local -a cert_mounts=()
+    local d
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] && cert_mounts+=(--mount "type=bind,source=${d},target=${d},readonly")
+    done < <(cert_mount_dirs)
     docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
     docker run -d \
         --name "${CONTAINER}" \
@@ -97,6 +104,7 @@ container_recreate() {
         --log-opt max-size="${LOG_MAX_SIZE}" \
         --log-opt max-file="${LOG_MAX_FILE}" \
         -v "${CONFIG_DIR}:${CONFIG_DIR}" \
+        "${cert_mounts[@]}" \
         "${IMAGE}" "${RUN_FLAGS[@]}"
 }
 
@@ -162,19 +170,10 @@ start() {
     local rc=0
     if container_running; then
         echo -e "${green}${APP_NAME} 已运行，无需再次启动${plain}"
-    elif container_exists; then
-        certs_sync >/dev/null 2>&1
-        if docker start "${CONTAINER}" >/dev/null && verify_running; then
-            echo -e "${green}${APP_NAME} 启动成功${plain}"
-        else
-            echo -e "${red}${APP_NAME} 启动失败（容器未在运行），请用 singr log 查看日志${plain}"; rc=1
-        fi
+    elif container_ensure && verify_running; then
+        echo -e "${green}${APP_NAME} 启动成功${plain}"
     else
-        if container_recreate && verify_running; then
-            echo -e "${green}${APP_NAME} 已创建并启动${plain}"
-        else
-            echo -e "${red}${APP_NAME} 创建后未能运行（可能缺证书），请用 singr log 查看日志${plain}"; rc=1
-        fi
+        echo -e "${red}${APP_NAME} 启动失败（容器未在运行，可能缺证书），请用 singr log 查看日志${plain}"; rc=1
     fi
     if [[ $# == 0 ]]; then before_show_menu; fi
     return ${rc}
@@ -195,21 +194,11 @@ stop() {
 restart() {
     require_docker
     local rc=0
-    # 证书是宿主机证书的副本，重启前重新同步一遍，否则 certbot 续期后容器会一直
-    # 用着安装当天那张证书（TLS 证书材料不热重载，只有重启才会重新读文件）。
-    certs_sync >/dev/null 2>&1
-    if container_exists; then
-        if docker restart "${CONTAINER}" >/dev/null && verify_running; then
-            echo -e "${green}${APP_NAME} 重启成功${plain}"
-        else
-            echo -e "${red}${APP_NAME} 重启失败（容器未在运行），请用 singr log 查看日志${plain}"; rc=1
-        fi
+    # 证书挂载变了（singr config 改了证书路径等）就重建，否则就地重启。
+    if container_ensure && verify_running; then
+        echo -e "${green}${APP_NAME} 重启成功${plain}"
     else
-        if container_recreate && verify_running; then
-            echo -e "${green}${APP_NAME} 已创建并启动${plain}"
-        else
-            echo -e "${red}${APP_NAME} 创建后未能运行（可能缺证书），请用 singr log 查看日志${plain}"; rc=1
-        fi
+        echo -e "${red}${APP_NAME} 重启失败（容器未在运行，可能缺证书），请用 singr log 查看日志${plain}"; rc=1
     fi
     if [[ $# == 0 ]]; then before_show_menu; fi
     return ${rc}
@@ -322,6 +311,7 @@ uninstall_singr() {
         rm -f "${PORTHOP_SERVICE_FILE}"
         systemctl daemon-reload 2>/dev/null || true
     fi
+    cert_timer_remove
 
     rm -rf "${CONFIG_DIR}"
     echo -e "${green}卸载成功${plain}"
@@ -422,12 +412,15 @@ show_status() {
 # 把所有节点一起带下线。因此本块的每次写入都走"备份 → 重启 → 校验 → 失败回滚"。
 #
 # 后端差异由下列钩子承担，各脚本自行实现，不在本块内：
-#   node_backend_place_cert <tag> <cert_src> <key_src>  -> 仅在 stdout 回显
-#                                                          "<certpath>|<keypath>"，其余输出走 stderr
-#   node_backend_forget_cert <tag>                      -> 清理该 tag 的证书登记
+#   node_backend_place_cert <tag> <cert_src> <key_src>  -> 校验证书路径对该后端可用，仅在
+#                                                          stdout 回显 "<certpath>|<keypath>"，其余输出走 stderr
 #   node_backend_restart                                -> 重启后端
 #   node_backend_verify                                 -> 0=确实起来了（须能识别 crash-loop）
+#   node_backend_running                                -> 0=后端当前在运行
 #   node_cert_renew_hint                                -> 打印该后端的证书续期建议
+#
+# 两种后端都原地引用证书（不复制）：server.json 写的就是证书的真实路径。docker 靠
+# 同路径只读挂载证书所在目录让容器看到它们，见 SingR-docker.sh 的 cert_mount_dirs。
 
 node_require_jq() {
     command -v jq >/dev/null 2>&1 && return 0
@@ -502,7 +495,16 @@ node_inbound_exists() {
 # GNU date -d，macOS 上跑脚本是 BSD date -j -f。openssl 的 notAfter 形如
 # "Sep  5 02:37:00 2026 GMT"，单数日会有两个空格，%e 认这个。
 node_cert_days_left() {
-    local cert="$1" end_date end_epoch now_epoch
+    local end_epoch now_epoch
+    end_epoch="$(node_cert_end_epoch "$1")"
+    [[ -n "${end_epoch}" ]] || return 0
+    now_epoch="$(date +%s)"
+    printf '%s' "$(( (end_epoch - now_epoch) / 86400 ))"
+}
+
+# 证书 notAfter 的 epoch 秒；判定不了就回显空串。
+node_cert_end_epoch() {
+    local cert="$1" end_date end_epoch
     [[ -s "${cert}" ]] || return 0
     command -v openssl >/dev/null 2>&1 || return 0
     end_date="$(openssl x509 -enddate -noout -in "${cert}" 2>/dev/null)" || return 0
@@ -511,8 +513,7 @@ node_cert_days_left() {
     end_epoch="$(date -d "${end_date}" +%s 2>/dev/null)"
     [[ -n "${end_epoch}" ]] || end_epoch="$(date -j -f "%b %e %H:%M:%S %Y %Z" "${end_date}" +%s 2>/dev/null)"
     [[ "${end_epoch}" =~ ^-?[0-9]+$ ]] || return 0
-    now_epoch="$(date +%s)"
-    printf '%s' "$(( (end_epoch - now_epoch) / 86400 ))"
+    printf '%s' "${end_epoch}"
 }
 
 # 0 = 证书已过期。openssl 不在或读不了证书时返回 1（当作没过期），宁可漏报也不误报。
@@ -634,6 +635,11 @@ node_list() {
         echo -e "${mark}"
         i=$((i + 1))
     done < <(jq -r '(.nodes // [])[] | [((.apiconfig.nodeid // "?")|tostring), (.apiconfig.apihost // "?"), (.intag // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null)
+    # docker 版从复制模型迁移时，没法自动续期的证书记在这个文件里（见 certs_migrate）。
+    # 列表是运维最常看的地方，提示挂在这里才不会被错过；处理完删掉文件即可。
+    if [[ -s "${CONFIG_DIR}/cert-migration-notice.txt" ]]; then
+        echo -e "  ${yellow}有证书在迁移后不再自动续期，详见 ${CONFIG_DIR}/cert-migration-notice.txt（处理完删掉该文件）${plain}"
+    fi
 }
 
 # 菜单里用的简版：装好之前/没有 jq 时安静跳过，不要在主菜单上刷红字。
@@ -763,6 +769,7 @@ node_add() {
     node_configs_ready || return 1
 
     local api_url="" api_key="" node_id="" protocol="" sni="" cert_src="" key_src=""
+    local cert_url="" key_url=""
     local panel_type="SSpanel" node_type="V2ray" timeout="20" speed_limit="0"
     local device_limit="0" enable_device_limit="false" update_periodic="60"
 
@@ -775,6 +782,8 @@ node_add() {
             --sni) sni="$2"; shift 2 ;;
             --cert-path) cert_src="$2"; shift 2 ;;
             --key-path) key_src="$2"; shift 2 ;;
+            --cert-url) cert_url="$2"; shift 2 ;;
+            --key-url) key_url="$2"; shift 2 ;;
             --panel-type) panel_type="$2"; shift 2 ;;
             --node-type) node_type="$2"; shift 2 ;;
             --timeout) timeout="$2"; shift 2 ;;
@@ -793,7 +802,7 @@ node_add() {
         [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
         [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 (--protocol): " protocol
         [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
-        if [[ -z "${cert_src}" && -z "${key_src}" ]]; then
+        if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
             echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
             read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
         fi
@@ -827,6 +836,21 @@ node_add() {
         echo -e "${red}--cert-path 与 --key-path 必须同时给出（都不给则使用默认路径）${plain}"
         return 1
     fi
+    # --cert-url/--key-url 不是第三种证书模式，而是"顺手配置默认证书更新源"：证书下载到
+    # 默认路径，本节点 TLS 留空走默认证书。所以和 --cert-path 互斥。
+    if [[ -n "${cert_url}" && -z "${key_url}" ]] || [[ -z "${cert_url}" && -n "${key_url}" ]]; then
+        echo -e "${red}--cert-url 与 --key-url 必须同时给出${plain}"
+        return 1
+    fi
+    if [[ -n "${cert_src}" && -n "${cert_url}" ]]; then
+        echo -e "${red}--cert-path 与 --cert-url 只能二选一${plain}"
+        return 1
+    fi
+    # 路径原样写进 server.json，由后端进程解析：systemd 的工作目录是 /，容器里更是
+    # 另一个命名空间，相对路径到那边就指错了。这里按当前目录补成绝对路径，但不解析
+    # 符号链接 —— certbot 的 live/ 软链要保留原样，续期换的正是软链。
+    [[ -n "${cert_src}" && "${cert_src}" != /* ]] && cert_src="${PWD}/${cert_src}"
+    [[ -n "${key_src}" && "${key_src}" != /* ]] && key_src="${PWD}/${key_src}"
 
     if jq -e --arg h "${api_url}" --argjson id "${node_id}" \
         '[(.nodes // [])[] | select((.apiconfig.apihost // "") == $h and (.apiconfig.nodeid // -1) == $id)] | length > 0' \
@@ -856,9 +880,25 @@ node_add() {
         eff_cert="${cert_path}"
         eff_key="${key_path}"
     else
-        # 写空值，由二进制在启动时补成默认路径；不复制文件也不登记证书源。
+        # 写空值，由二进制在启动时补成默认路径。
         cert_path=""
         key_path=""
+        if [[ -n "${cert_url}" ]]; then
+            # 更新源是全局的（只有一张默认证书）：已配了同一个就沿用，配了别的就拒绝
+            # —— 不能因为加一个节点就悄悄换掉其他节点正在用的证书。
+            if [[ -s "${CERT_SOURCE}" ]]; then
+                if [[ "$(cert_source_get cert_url)" == "${cert_url}" && "$(cert_source_get key_url)" == "${key_url}" ]]; then
+                    echo -e "${green}沿用已配置的默认证书更新源${plain}"
+                else
+                    echo -e "${red}已配置了另一个默认证书更新源：$(cert_url_mask "$(cert_source_get cert_url)")${plain}"
+                    echo -e "${yellow}默认证书只有一张，更新源是全局的。要更换请用 singr cert-source。${plain}"
+                    return 1
+                fi
+            else
+                # 不在这里重启：下面的 node_apply 会重启并校验。
+                cert_source_set "${cert_url}" "${key_url}" no || return 1
+            fi
+        fi
         eff_cert="$(node_default_cert_path)"
         eff_key="$(node_default_key_path)"
     fi
@@ -871,8 +911,8 @@ node_add() {
         echo -e "${yellow}没有证书进程起不来。放好证书后重试：${plain}"
         echo -e "  cp 证书 ${CERT_DIR}/default.pem"
         echo -e "  cp 私钥 ${CERT_DIR}/default.key"
-        echo -e "${yellow}（.crt 后缀也认；或用 --cert-path/--key-path 指定其他路径）${plain}"
-        node_backend_forget_cert "${tag}"
+        echo -e "${yellow}（.crt 后缀也认；或用 --cert-path/--key-path 指定其他路径，"
+        echo -e "  或用 --cert-url/--key-url 从远程地址下载并每日检查更新）${plain}"
         return 1
     fi
 
@@ -880,7 +920,6 @@ node_add() {
     if ! node_write_server "${tag}" "${proto}" "${sni}" "${cert_path}" "${key_path}"; then
         echo -e "${red}写入 ${SERVER_CONFIG} 失败${plain}"
         node_restore
-        node_backend_forget_cert "${tag}"
         return 1
     fi
     if ! node_write_panel "${tag}" "${proto}" "${api_url}" "${api_key}" "${node_id}" \
@@ -888,7 +927,6 @@ node_add() {
         "${update_periodic}" "${enable_device_limit}"; then
         echo -e "${red}写入 ${PANEL_CONFIG} 失败${plain}"
         node_restore
-        node_backend_forget_cert "${tag}"
         return 1
     fi
 
@@ -901,7 +939,6 @@ node_add() {
         node_cert_renew_hint
         return 0
     fi
-    node_backend_forget_cert "${tag}"
     return 1
 }
 
@@ -1004,7 +1041,6 @@ node_del() {
 
     echo -e "${green}已删除节点 ${sel}（InTag=${tag}）${plain}"
     if node_apply; then
-        node_backend_forget_cert "${tag}"
         echo
         node_list
         return 0
@@ -1033,259 +1069,625 @@ node_menu() {
 }
 # <<<<<<<<<<<<<<<< SYNC BLOCK: 节点管理 <<<<<<<<<<<<<<<<
 
-# ---- 节点管理：docker 后端实现（SYNC BLOCK 的四个钩子 + 证书同步）----
+# ---- 节点管理：docker 后端实现（SYNC BLOCK 的钩子 + 证书挂载）----
 #
-# 容器只挂载 ${CONFIG_DIR}，宿主机别处（/root、/etc/letsencrypt）的文件在容器内
-# 不可见，所以证书必须复制进来。复制会切断与源文件的联系，因此把源路径登记到
-# ${CERTS_MAP}，由 certs_sync 在每次 start / restart / 重建容器之前重新复制一遍
-# ——否则 certbot 续期之后，容器会一直用着安装当天的那张证书。
+# 证书和裸机一样原地引用：server.json 里写的就是宿主机上的真实路径，容器靠"同路径
+# 只读挂载"看到它们。要挂哪些目录由 cert_mount_dirs 从 server.json 现算，不另存一份
+# 登记；container_ensure 发现挂载集合变了就重建容器（挂载在 docker run 时就定死了，
+# docker restart 改不了）。
 #
-# 不用 bind mount 单个证书文件来代替复制：certbot 是原子替换（rename），文件级
-# bind mount 会让容器一直守着旧 inode，看着挂上了其实永远读不到新证书。
-
-CERTS_MAP="${CONFIG_DIR}/certs.json"
-
-certs_map_set() {
-    local tag="$1" c="$2" k="$3" tmp
-    node_require_jq || return 1
-    mkdir -p "${CONFIG_DIR}"
-    [[ -f "${CERTS_MAP}" ]] || echo '{}' >"${CERTS_MAP}"
-    tmp="$(mktemp)" || return 1
-    jq --arg t "${tag}" --arg c "${c}" --arg k "${k}" '.[$t] = {cert: $c, key: $k}' \
-        "${CERTS_MAP}" >"${tmp}" && mv -f "${tmp}" "${CERTS_MAP}" || return 1
-    chmod 600 "${CERTS_MAP}" 2>/dev/null || true
-}
-
-certs_map_del() {
-    local tag="$1" tmp
-    [[ -f "${CERTS_MAP}" ]] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
-    tmp="$(mktemp)" || return 0
-    jq --arg t "${tag}" 'del(.[$t])' "${CERTS_MAP}" >"${tmp}" && mv -f "${tmp}" "${CERTS_MAP}"
-}
-
-# 把登记的宿主机证书重新复制到 server.json 为各 inbound 指定的容器内路径。
-# 返回 0=确实有文件被更新，1=无变化。
+# 只挂目录，不挂文件：certbot 之类都是 rename 原子替换，文件级 bind mount 钉住的是
+# 旧 inode，容器里永远读不到新证书。挂目录则续期后容器内立刻可见，二进制自己监视
+# 证书文件（common/tls/std_server.go 的 fswatch）并重新加载，不用重启。
 #
-# 两条容错是刻意的：
-#   · 源文件不存在 → 只警告，保留旧副本。源被移走不该让重启失败，节点带着旧证书
-#     跑总比起不来强。
-#   · 没有 jq → 整体 no-op（只警告一次）。装 docker 的机器不一定有 jq，普通的
-#     start/restart 不该因此挂掉。
-certs_sync() {
-    local changed=1
-    [[ -f "${CERTS_MAP}" ]] || return 1
-    if ! command -v jq >/dev/null 2>&1; then
-        echo -e "${yellow}[证书] 未安装 jq，跳过证书同步（续期后需手动复制到 ${CERT_DIR}）${plain}"
-        return 1
-    fi
-    [[ -f "${SERVER_CONFIG}" ]] || return 1
+# 旧版本是"复制进挂载目录 + certs.json 登记源 + certs_sync 每次重启前重新复制"，
+# 前提是"证书不热重载，反正要重启"——这个前提不成立。certs_migrate 负责把旧机器
+# 迁过来。
 
-    local tag src_cert src_key dst_paths dst_cert dst_key
-    while IFS=$'\t' read -r tag src_cert src_key; do
-        [[ -z "${tag}" ]] && continue
-        # 目标路径按二进制的解析规则来：server.json 里为空的 inbound 用的是默认
-        # 路径（首装 install-docker.sh 走的就是这条），不是"没有目标"——按空跳过
-        # 会让证书续期同步静默失效。
-        node_inbound_exists "${tag}" || continue
-        dst_paths="$(node_effective_cert "${tag}")"
-        dst_cert="${dst_paths%%|*}"
-        dst_key="${dst_paths##*|}"
-        [[ -n "${dst_cert}" && -n "${dst_key}" ]] || continue
-        # 目标必须落在挂载目录内，否则容器根本看不见。
-        case "${dst_cert}" in
-            "${CONFIG_DIR}"/*) ;;
-            *)
-                echo -e "${yellow}[证书] ${tag}: 目标 ${dst_cert} 不在 ${CONFIG_DIR} 下，容器内不可见，跳过${plain}"
-                continue
-                ;;
-        esac
-        [[ "${src_cert}" == "${dst_cert}" ]] && continue
-        if [[ ! -s "${src_cert}" || ! -s "${src_key}" ]]; then
-            echo -e "${yellow}[证书] ${tag}: 源文件不存在（${src_cert}），保留现有副本${plain}"
-            continue
-        fi
-        if ! cmp -s "${src_cert}" "${dst_cert}" 2>/dev/null || ! cmp -s "${src_key}" "${dst_key}" 2>/dev/null; then
-            mkdir -p "$(dirname "${dst_cert}")" "$(dirname "${dst_key}")"
-            if install -m 644 "${src_cert}" "${dst_cert}" && install -m 600 "${src_key}" "${dst_key}"; then
-                echo -e "${green}[证书] ${tag}: 已从 ${src_cert} 更新${plain}"
-                changed=0
-            else
-                echo -e "${red}[证书] ${tag}: 复制失败${plain}"
-            fi
-        fi
-    done < <(jq -r 'to_entries[] | [.key, (.value.cert // ""), (.value.key // "")] | @tsv' "${CERTS_MAP}" 2>/dev/null)
-    return ${changed}
-}
+CERTS_MAP="${CONFIG_DIR}/certs.json"   # 旧版本的证书源登记，只有 certs_migrate 还认它
+CERT_MIGRATION_NOTICE="${CONFIG_DIR}/cert-migration-notice.txt"
 
-# 给一个已存在的节点登记 / 更换宿主机证书源。
-#
-# 为什么必须有这个动词：certs.json 只由 install-docker.sh（首装）和 singr add
-# （新节点）写入。从旧版本升级上来的机器，管理脚本更新后有了 certs_sync，但
-# certs.json 不存在，于是整体 no-op —— 证书续期依旧不生效，而且不会报任何错。
-# 这个动词用来补登记，顺带也用于换证书源（不必 del 再 add）。
-#
-# 节点用 @序号 指定最省事（singr list 的 # 列）；NodeID 在多面板下会重复，
-# node_resolve_tag 遇到歧义会拒绝并列出候选，不会挑错节点。
-node_cert_register() {
-    require_docker
-    node_require_jq || return 1
-    node_configs_ready || return 1
-
-    local sel="${1:-}"
-    [[ $# -gt 0 ]] && shift
-    local cert_src="" key_src=""
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --cert-path) cert_src="$2"; shift 2 ;;
-            --key-path) key_src="$2"; shift 2 ;;
-            *) echo -e "${red}未知参数：$1${plain}"; return 1 ;;
-        esac
-    done
-
-    if [[ -z "${sel}" ]] && [[ -t 0 ]]; then
-        node_list || return 1
-        echo
-        read -r -p "输入要登记证书的 @序号 / NodeID / InTag（回车取消）: " sel
-        [[ -z "${sel}" ]] && return 0
-    fi
-    [[ -n "${sel}" ]] || {
-        echo -e "${red}用法：singr cert <@序号|NodeID|InTag> --cert-path PATH --key-path PATH${plain}"
-        return 1
-    }
-
-    local tag
-    tag="$(node_resolve_tag "${sel}")" || return 1
-
-    if [[ -t 0 ]]; then
-        [[ -z "${cert_src}" ]] && read -r -p "宿主机证书路径 (--cert-path): " cert_src
-        [[ -z "${key_src}" ]] && read -r -p "宿主机私钥路径 (--key-path): " key_src
-    fi
-    [[ -s "${cert_src}" ]] || { echo -e "${red}找不到证书文件：${cert_src}${plain}"; return 1; }
-    [[ -s "${key_src}" ]] || { echo -e "${red}找不到私钥文件：${key_src}${plain}"; return 1; }
-
-    # 目标路径以 server.json 里该 inbound 的配置为准，为空则是默认路径（见
-    # node_effective_cert）；不在挂载目录下就没法同步。
-    node_inbound_exists "${tag}" || {
-        echo -e "${red}server.json 里没有 tag 为 ${tag} 的 inbound${plain}"
-        return 1
-    }
-    local dst_paths dst_cert dst_key
-    dst_paths="$(node_effective_cert "${tag}")"
-    dst_cert="${dst_paths%%|*}"
-    dst_key="${dst_paths##*|}"
-    [[ -n "${dst_cert}" && -n "${dst_key}" ]] || {
-        echo -e "${red}inbound ${tag} 只配了 certificate_path 或 key_path 其中一个，进程起不来。${plain}"
-        echo -e "${yellow}用 singr config 把两个都填上（或都留空以使用默认路径）再执行本命令。${plain}"
-        return 1
-    }
-    case "${dst_cert}" in
-        "${CONFIG_DIR}"/*) ;;
-        *)
-            echo -e "${red}该 inbound 的证书路径 ${dst_cert} 不在 ${CONFIG_DIR} 下，容器内不可见。${plain}"
-            echo -e "${yellow}请先用 singr config 把它改到 ${CERT_DIR}/ 下，再执行本命令。${plain}"
-            return 1
+# 目录 d 能否同路径挂进容器。不能时把原因回显到 stdout 并返回 0（"有问题"）。
+#   · `:` 和 `,` 是 --mount 的分隔符，没法转义。
+#   · 系统目录：同路径挂载会把容器里的同名目录整个盖掉 —— /etc 盖掉就没了 CA 证书，
+#     /usr 盖掉连二进制都没了，/tmp 只读会让 entrypoint 的 mktemp 失败。
+cert_mount_problem() {
+    local d="$1"
+    case "${d}" in
+        *:* | *,*)
+            printf '%s' "${d} 含 : 或 ,，docker --mount 无法表达"
+            return 0
+            ;;
+        / | /bin | /boot | /dev | /etc | /lib | /lib32 | /lib64 | /libx32 | /opt | /proc | /run | /sbin | /sys | /tmp | /usr | /var | \
+            /bin/* | /dev/* | /lib/* | /lib64/* | /proc/* | /run/* | /sbin/* | /sys/* | /usr/* | /opt/singr | /opt/singr/*)
+            printf '%s' "${d} 是系统目录，同路径挂载会盖掉容器里的同名目录；请把证书放进单独的子目录"
+            return 0
             ;;
     esac
-
-    # 同一个目标路径不能登记两个不同的源。默认路径（certs/default.pem）是所有没有
-    # 显式指定证书的节点共用的，两个源会在每次 certs_sync 里互相覆盖 —— 每跑一次
-    # 就判定"证书变了"并重启容器，挂在 certbot 上就是无限重启。在这里拒绝，比让
-    # 用户去查为什么容器每天重启好得多。
-    if [[ -s "${CERTS_MAP}" ]]; then
-        local other other_src other_dst
-        while IFS=$'\t' read -r other other_src; do
-            [[ -z "${other}" || "${other}" == "${tag}" ]] && continue
-            [[ "${other_src}" == "${cert_src}" ]] && continue
-            node_inbound_exists "${other}" || continue
-            other_dst="$(node_effective_cert "${other}")"
-            other_dst="${other_dst%%|*}"
-            [[ "${other_dst}" == "${dst_cert}" ]] || continue
-            echo -e "${red}节点 ${other} 已经把另一个证书源登记到同一个目标路径：${dst_cert}${plain}"
-            echo -e "${yellow}两个源会在每次证书同步时互相覆盖，让 singr cert-sync 每跑一次就重启一次容器。${plain}"
-            echo -e "${yellow}先给其中一个节点指定独立的证书路径，再登记：${plain}"
-            echo -e "  singr del <节点> 后用 singr add ... --cert-path ... --key-path ... 重新添加"
-            return 1
-        done < <(jq -r 'to_entries[] | [.key, (.value.cert // "")] | @tsv' "${CERTS_MAP}" 2>/dev/null)
-    fi
-
-    certs_map_set "${tag}" "${cert_src}" "${key_src}" || return 1
-    echo -e "${green}已登记 ${tag} 的证书源：${cert_src}${plain}"
-    cert_sync_cmd 0
+    return 1
 }
 
-# 供 certbot --deploy-hook 使用：同步证书，只有确实变了才重启容器。
-cert_sync_cmd() {
-    require_docker
-    # 有节点却没有任何证书源登记 —— 这是从旧版本升级上来的机器的正常状态：证书源
-    # 只在首装（install-docker.sh）和 singr add 时登记。此时同步是空转的，必须说
-    # 出来，否则用户挂上 certbot 钩子还以为万事大吉，续期其实从来没生效过。
-    if [[ ! -s "${CERTS_MAP}" ]] && command -v jq >/dev/null 2>&1 &&
-        [[ -f "${PANEL_CONFIG}" ]] && [[ "$(jq -r '(.nodes // []) | length' "${PANEL_CONFIG}" 2>/dev/null || echo 0)" != "0" ]]; then
-        echo -e "${yellow}尚未登记任何证书源（${CERTS_MAP} 不存在），证书同步不会做任何事。${plain}"
-        echo -e "${yellow}这是从旧版本升级上来的机器的正常状态。给每个节点补登记一次即可：${plain}"
-        echo -e "  singr cert @1 --cert-path /路径/fullchain.pem --key-path /路径/privkey.pem"
-        echo -e "${yellow}（@1 是 singr list 里的 # 序号）${plain}"
-        if [[ $# == 0 ]]; then before_show_menu; fi
+# 一个证书文件要挂的目录：它所在的目录，加上解析符号链接后真实文件所在的目录。
+# certbot 的 live/<域名>/fullchain.pem 是指向 ../../archive/<域名>/ 的软链，只挂
+# live/<域名> 容器里就是断链。落在 ${CONFIG_DIR} 下的已经整体挂载，不再输出。
+cert_dirs_for() {
+    local p="$1" d real=""
+    [[ -e "${p}" ]] && real="$(readlink -f "${p}" 2>/dev/null)"
+    for d in "$(dirname "${p}")" "${real:+$(dirname "${real}")}"; do
+        [[ -n "${d}" ]] || continue
+        case "${d}/" in "${CONFIG_DIR}/"*) continue ;; esac
+        printf '%s\n' "${d}"
+    done
+}
+
+# 添加节点 / 首次安装时的预检：0 = 这个证书路径挂得进容器。不行时原因打到 stderr。
+cert_path_mountable() {
+    local p="$1" d why
+    if [[ "${p}" != /* ]]; then
+        echo -e "${red}证书路径必须是绝对路径：${p}${plain}" >&2
         return 1
     fi
-    if certs_sync; then
-        echo -e "${green}证书有更新，重启容器使其生效（TLS 证书材料不热重载）${plain}"
-        restart 0
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        if why="$(cert_mount_problem "${d}")"; then
+            echo -e "${red}无法把证书目录挂进容器：${why}${plain}" >&2
+            return 1
+        fi
+    done < <(cert_dirs_for "${p}")
+    return 0
+}
+
+# 容器需要的证书挂载目录，每行一个：排序去重，并去掉已被其他目录包含的子目录。
+#
+# 来源：server.json 存在就只看它（含 TLS 为空、走默认证书的 inbound —— default.pem
+# 可以是指向别处的软链）；还不存在（首次安装、entrypoint 尚未生成配置）就看 RUN_FLAGS
+# 里交给 entrypoint 的 --cert-path / --key-path。两者不能取并集：RUN_FLAGS 永久留在
+# docker.conf 里，用户事后换了证书、删了旧目录，--mount 遇到不存在的源会直接拒绝
+# 建容器。同理，不存在的目录不挂，交给 entrypoint 报出"缺证书：<路径>"。
+cert_mount_dirs() {
+    local -a paths=()
+    local p d why tag pair i
+    if [[ -f "${SERVER_CONFIG}" ]]; then
+        if ! command -v jq >/dev/null 2>&1; then
+            echo -e "${yellow}[证书] 未安装 jq，无法计算证书挂载${plain}" >&2
+            return 0
+        fi
+        while IFS= read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            pair="$(node_effective_cert "${tag}")"
+            paths+=("${pair%%|*}" "${pair##*|}")
+        done < <(jq -r '.inbounds[]? | select(.tls.enabled == true) | (.tag // empty)' "${SERVER_CONFIG}" 2>/dev/null)
     else
-        echo -e "${green}证书无变化，无需重启${plain}"
+        for ((i = 0; i < ${#RUN_FLAGS[@]}; i++)); do
+            case "${RUN_FLAGS[i]}" in
+                --cert-path | --key-path) paths+=("${RUN_FLAGS[i + 1]:-}") ;;
+            esac
+        done
     fi
-    if [[ $# == 0 ]]; then before_show_menu; fi
+    for p in "${paths[@]}"; do
+        [[ -n "${p}" ]] || continue
+        if [[ "${p}" != /* ]]; then
+            echo -e "${yellow}[证书] 不是绝对路径，容器内无法解析：${p}${plain}" >&2
+            continue
+        fi
+        while IFS= read -r d; do
+            [[ -n "${d}" && -d "${d}" ]] || continue
+            if why="$(cert_mount_problem "${d}")"; then
+                echo -e "${yellow}[证书] 跳过挂载：${why}${plain}" >&2
+                continue
+            fi
+            printf '%s\n' "${d}"
+        done < <(cert_dirs_for "${p}")
+    done | LC_ALL=C sort -u |
+        awk '{ for (k in kept) if (index($0, kept[k] "/") == 1) next; kept[NR] = $0; print }'
+}
+
+# 容器当前的证书挂载（不含整体挂载的 ${CONFIG_DIR}），格式同 cert_mount_dirs。
+container_cert_mounts() {
+    docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "${CONTAINER}" 2>/dev/null |
+        grep -vxF "${CONFIG_DIR}" | grep -v '^$' | LC_ALL=C sort -u
+}
+
+# 让容器跑在当前配置上：挂载没变就 docker restart / start，变了（或容器不存在）就
+# 重建。start / restart / 节点增删都走这里，所以 singr config、singr add 改了证书
+# 路径之后，下一次重启自然带上新挂载。
+container_ensure() {
+    if container_exists && [[ "$(cert_mount_dirs 2>/dev/null)" == "$(container_cert_mounts)" ]]; then
+        if container_running; then
+            docker restart "${CONTAINER}" >/dev/null
+        else
+            docker start "${CONTAINER}" >/dev/null
+        fi
+    else
+        container_recreate >/dev/null
+    fi
 }
 
 node_backend_place_cert() {
-    local tag="$1" cert_src="$2" key_src="$3" dst_cert dst_key
-    [[ -s "${cert_src}" ]] || {
-        echo -e "${red}找不到证书文件：${cert_src}${plain}" >&2
-        return 1
-    }
-    [[ -s "${key_src}" ]] || {
-        echo -e "${red}找不到私钥文件：${key_src}${plain}" >&2
-        return 1
-    }
-    mkdir -p "${CERT_DIR}"
-    dst_cert="${CERT_DIR}/${tag}.crt"
-    dst_key="${CERT_DIR}/${tag}.key"
-    install -m 644 "${cert_src}" "${dst_cert}" >&2 || return 1
-    install -m 600 "${key_src}" "${dst_key}" >&2 || return 1
-    certs_map_set "${tag}" "${cert_src}" "${key_src}" >&2 || return 1
-    printf '%s|%s' "${dst_cert}" "${dst_key}"
-}
-
-node_backend_forget_cert() {
-    local tag="$1"
-    certs_map_del "${tag}"
-    rm -f "${CERT_DIR}/${tag}.crt" "${CERT_DIR}/${tag}.key"
+    local cert_src="$2" key_src="$3" p
+    for p in "${cert_src}" "${key_src}"; do
+        [[ -s "${p}" ]] || {
+            echo -e "${red}找不到证书文件：${p}${plain}" >&2
+            return 1
+        }
+        cert_path_mountable "${p}" || return 1
+    done
+    printf '%s|%s' "${cert_src}" "${key_src}"
 }
 
 node_backend_restart() {
-    if container_exists; then
-        certs_sync >/dev/null 2>&1
-        docker restart "${CONTAINER}" >/dev/null 2>&1 || true
-    else
-        container_recreate >/dev/null 2>&1 || true
-    fi
+    container_ensure || true
 }
 
 node_backend_verify() { verify_running; }
 
+node_backend_running() { container_running; }
+
 node_cert_renew_hint() {
-    echo -e "${yellow}证书续期提示：容器内的证书是宿主机证书的副本，且 TLS 证书材料不热重载。"
-    echo -e "用 --cert-path 添加的节点已记住源路径（${CERTS_MAP}），每次 start / restart /"
-    echo -e "update 都会重新复制。把这行挂到 certbot 上即可全自动（只在证书真的变了时才重启）："
-    echo -e "  certbot renew --deploy-hook \"singr cert-sync\""
-    echo -e ""
-    echo -e "如果用的是默认路径（add 时没给 --cert-path），则没有登记源路径，续期不会自动"
-    echo -e "生效——容器只挂载 ${CONFIG_DIR}，软链到 /etc/letsencrypt 在容器内是断的。"
-    echo -e "补一次登记即可（@1 是 singr list 的 # 序号）："
-    echo -e "  singr cert @1 --cert-path /etc/letsencrypt/live/域名/fullchain.pem \\"
-    echo -e "                --key-path  /etc/letsencrypt/live/域名/privkey.pem${plain}"
+    echo -e "${yellow}证书续期提示：容器按原路径挂载证书所在目录，续期（certbot renew 等）后进程会"
+    echo -e "自动重新加载，无需重启，也不需要 --deploy-hook（default.pem 软链到 certbot 的除外，"
+    echo -e "那种情况监视不到 live/ 里的变化，仍需 --deploy-hook \"singr restart\"）。默认证书可以用"
+    echo -e "  singr cert-source"
+    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。${plain}"
 }
+
+# 把旧版本（复制模型）的机器迁到原地引用。certs.json 存在才跑，跑完改名，所以是一次
+# 性的。调用点在脚本入口（见末尾分发），任何一条 singr 命令都会触发 —— 包括 certbot
+# 钩子里残留的 `singr cert-sync`。只挂在 start/restart 上的话，升级了脚本却没重启的
+# 机器会一直用着不再同步的旧副本，直到证书过期。
+#
+# 逐条处理 {"<intag>": {"cert": 源, "key": 源}}：
+#   · inbound 已不存在            → 残留登记，丢弃
+#   · inbound 用默认证书（TLS 为空）→ 丢弃登记。default.pem 只剩一份不再同步的旧副本，
+#                                    记进提示文件
+#   · 显式路径指向挂载目录里的副本 → 改写回源路径，副本移进 certs/.migrated-<时间>/
+#   · 源已不存在 / 源目录挂不进容器 → 保留副本和现有路径，记进提示文件
+# 有改写且容器在运行，就重建并校验；起不来则还原 server.json、按旧挂载重建，保留
+# certs.json，下次再试。
+certs_migrate() {
+    [[ -f "${CERTS_MAP}" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    command -v docker >/dev/null 2>&1 || return 0
+
+    local stamp notices="" rewritten=0 tag src_cert src_key cur_cert cur_key tmp c
+    local -a copies=()
+    stamp="$(date +%Y%m%d%H%M%S)"
+    echo -e "${yellow}[证书] 检测到旧版本的证书登记 ${CERTS_MAP}，迁移为原地引用（容器直接挂载证书所在目录）...${plain}"
+
+    if [[ -f "${SERVER_CONFIG}" ]]; then
+        cp -f "${SERVER_CONFIG}" "${SERVER_CONFIG}.migrate-bak" || return 0
+        while IFS=$'\t' read -r tag src_cert src_key; do
+            [[ -n "${tag}" ]] || continue
+            node_inbound_exists "${tag}" || continue
+            cur_cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+            cur_key="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+            if [[ -z "${cur_cert}" && -z "${cur_key}" ]]; then
+                notices+="${tag}: 使用默认证书 $(node_default_cert_path)，它是 ${src_cert} 的旧副本，今后不再自动同步。
+    处理办法：singr cert-source 配置默认证书更新源；或用 singr config 把该 inbound 的
+    certificate_path / key_path 写成 ${src_cert} / ${src_key} 后重启。
+"
+                continue
+            fi
+            case "${cur_cert}" in "${CONFIG_DIR}"/*) ;; *) continue ;; esac
+            [[ "${src_cert}" == "${cur_cert}" ]] && continue
+            if [[ ! -s "${src_cert}" || ! -s "${src_key}" ]]; then
+                notices+="${tag}: 证书源 ${src_cert} 已不存在，继续使用副本 ${cur_cert}，今后不再自动同步。
+"
+                continue
+            fi
+            if ! cert_path_mountable "${src_cert}" 2>/dev/null || ! cert_path_mountable "${src_key}" 2>/dev/null; then
+                notices+="${tag}: 证书源 ${src_cert} 所在目录挂不进容器，继续使用副本 ${cur_cert}，今后不再自动同步。
+"
+                continue
+            fi
+            tmp="$(mktemp)" || continue
+            if jq --arg t "${tag}" --arg c "${src_cert}" --arg k "${src_key}" '
+                .inbounds |= map(if .tag == $t then (.tls.certificate_path = $c | .tls.key_path = $k) else . end)
+            ' "${SERVER_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${SERVER_CONFIG}"; then
+                rewritten=1
+                copies+=("${cur_cert}" "${cur_key}")
+                echo -e "${green}[证书] ${tag}: 改为直接引用 ${src_cert}${plain}"
+            else
+                rm -f "${tmp}"
+            fi
+        done < <(jq -r 'to_entries[] | [.key, (.value.cert // ""), (.value.key // "")] | @tsv' "${CERTS_MAP}" 2>/dev/null)
+    fi
+
+    if [[ "${rewritten}" == 1 ]] && container_running; then
+        container_recreate >/dev/null
+        if ! verify_running; then
+            echo -e "${red}[证书] 迁移后容器未能正常启动，已还原 server.json；${CERTS_MAP} 保留，下次执行 singr 命令时重试${plain}"
+            mv -f "${SERVER_CONFIG}.migrate-bak" "${SERVER_CONFIG}"
+            container_recreate >/dev/null
+            verify_running || echo -e "${red}[证书] 还原后仍未能启动，请立即用 singr log 排查${plain}"
+            return 1
+        fi
+    fi
+    rm -f "${SERVER_CONFIG}.migrate-bak"
+
+    # 不再被任何 inbound 引用的旧副本收起来（不删：里面有私钥，留给运维决定）。
+    for c in "${copies[@]}"; do
+        [[ -f "${c}" ]] || continue
+        jq -e --arg p "${c}" '[.inbounds[]?.tls | (.certificate_path // ""), (.key_path // "")] | index($p) != null' \
+            "${SERVER_CONFIG}" >/dev/null 2>&1 && continue
+        mkdir -m 700 -p "${CERT_DIR}/.migrated-${stamp}" && mv -f "${c}" "${CERT_DIR}/.migrated-${stamp}/"
+    done
+    mv -f "${CERTS_MAP}" "${CERTS_MAP}.migrated-${stamp}"
+
+    if [[ -n "${notices}" ]]; then
+        printf '# %s 从复制模型迁移时，以下证书没法自动续期。处理完删掉本文件。\n%s\n' \
+            "$(date '+%F %T')" "${notices}" >>"${CERT_MIGRATION_NOTICE}"
+        echo -e "${yellow}[证书] 以下证书迁移后不再自动续期（已记入 ${CERT_MIGRATION_NOTICE}）：${plain}"
+        printf '%s' "${notices}"
+    fi
+    echo -e "${green}[证书] 迁移完成，不再需要 singr cert-sync / certbot --deploy-hook${plain}"
+    return 0
+}
+
+# >>>>>>>>>>>>>>>> SYNC BLOCK: 默认证书更新源 >>>>>>>>>>>>>>>>
+# 本块在 SingR.sh 与 SingR-docker.sh 中逐字相同，改一处必须同步另一处。
+#
+# 只管"默认证书"：server.json 里 certificate_path 与 key_path 都为空的 inbound 用的
+# ${CERT_DIR}/default.pem（或 .crt）+ default.key。显式写了证书路径的节点一概不碰。
+#
+# 证书和私钥分别从两个 https 地址下载。地址存在 ${CERT_SOURCE}（0600：地址里常带
+# 鉴权 token），只在这里存一份。systemd timer 每天跑一次 singr cert-update：本地证书
+# 剩余不足 CERT_RENEW_DAYS 天才去下载，远端比本地新才替换，替换后重启并校验，起不来
+# 就换回旧证书。
+#
+# 依赖节点管理块里的 node_default_cert_path / node_cert_end_epoch，以及后端钩子
+# node_backend_restart / node_backend_verify / node_backend_running。
+
+CERT_SOURCE="${CONFIG_DIR}/cert-source.json"
+CERT_TIMER="singr-cert-update"
+CERT_TIMER_DIR="${CERT_TIMER_DIR:-/etc/systemd/system}"
+CERT_RENEW_DAYS=7
+
+cert_source_get() {
+    jq -r --arg k "$1" '.[$k] // ""' "${CERT_SOURCE}" 2>/dev/null
+}
+
+# 显示用：藏掉 query（?token=...）和 userinfo（user:pass@）。
+cert_url_mask() {
+    local u="$1" scheme rest
+    [[ "${u}" == *://* ]] || { printf '%s' "${u}"; return; }
+    scheme="${u%%://*}"
+    rest="${u#*://}"
+    [[ "${rest%%/*}" == *@* ]] && rest="***@${rest#*@}"
+    [[ "${rest}" == *\?* ]] && rest="${rest%%\?*}?***"
+    printf '%s://%s' "${scheme}" "${rest}"
+}
+
+# 私钥要走这条链路，只接受 https。--proto =https 连重定向到 http 也一并拒绝。
+cert_source_fetch() {
+    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+        -o "$2" "$1"
+}
+
+# 证书与私钥是否成对可用。不可用时把原因打到 stdout 并返回 1。
+# -passin pass: 让加密私钥直接失败，而不是在 timer 里卡住等人输口令。
+cert_check_pair() {
+    local c="$1" k="$2" cpub kpub
+    openssl x509 -noout -in "${c}" >/dev/null 2>&1 || { echo "证书不是有效的 PEM 证书"; return 1; }
+    openssl pkey -in "${k}" -passin pass: -noout >/dev/null 2>&1 || { echo "私钥无效（或带口令加密）"; return 1; }
+    openssl x509 -checkend 0 -noout -in "${c}" >/dev/null 2>&1 || { echo "证书已过期"; return 1; }
+    cpub="$(openssl x509 -in "${c}" -noout -pubkey 2>/dev/null)"
+    kpub="$(openssl pkey -in "${k}" -passin pass: -pubout 2>/dev/null)"
+    [[ -n "${cpub}" && "${cpub}" == "${kpub}" ]] || { echo "证书与私钥不匹配"; return 1; }
+    return 0
+}
+
+cert_fingerprint() {
+    openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null
+}
+
+# 正在使用默认证书的节点：每行 "<intag>\t<server_name>"。
+cert_default_inbounds() {
+    [[ -f "${PANEL_CONFIG}" && -f "${SERVER_CONFIG}" ]] || return 0
+    jq -r --slurpfile s "${SERVER_CONFIG}" '
+        (.nodes // [])[] | (.intag // "") as $t | select($t != "")
+        | ($s[0].inbounds // [])[] | select(.tag == $t)
+        | select(((.tls.certificate_path // "") == "") and ((.tls.key_path // "") == ""))
+        | [$t, (.tls.server_name // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null
+}
+
+# 新证书没覆盖到的 SNI 只警告不拦：SNI 也可能由面板 host= 下发，server.json 里看不到。
+# 只认明确的 "does NOT match"；openssl 不支持 -checkhost（LibreSSL）时判定不了，不报。
+cert_warn_sni() {
+    local c="$1" tag sni
+    while IFS=$'\t' read -r tag sni; do
+        [[ -n "${sni}" ]] || continue
+        if openssl x509 -noout -in "${c}" -checkhost "${sni}" 2>/dev/null | grep -q 'does NOT match'; then
+            echo -e "${yellow}[证书] 注意：新证书不包含节点 ${tag} 的 SNI ${sni}，客户端校验会失败${plain}"
+        fi
+    done < <(cert_default_inbounds)
+}
+
+# 下载、校验并换上默认证书。
+#   mode    auto  —— 定时任务：本地剩余不足 CERT_RENEW_DAYS 天才下载，且远端须比本地新
+#           force —— 立即下载，只要和本地不是同一张就替换（首次配置、手动更新）
+#   restart yes   —— 后端在运行就重启并校验，起不来换回旧证书
+#           no    —— 只换文件（singr add 随后会自己重启校验；首次安装时容器还不存在）
+cert_default_update() {
+    local mode="$1" restart="$2" cert_url="$3" key_url="$4"
+    local cur_cert cur_key new_cert new_key why days cur_end new_end
+    command -v openssl >/dev/null 2>&1 || { echo -e "${red}[证书] 需要 openssl${plain}"; return 1; }
+    command -v curl >/dev/null 2>&1 || { echo -e "${red}[证书] 需要 curl${plain}"; return 1; }
+
+    # 定时任务与手动执行撞在一起时，后来的直接退出。
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${CONFIG_DIR}/.cert-update.lock"
+        flock -n 9 || { echo -e "${yellow}[证书] 另一个证书更新正在进行，跳过${plain}"; return 0; }
+    fi
+
+    cur_cert="$(node_default_cert_path)"
+    cur_key="$(node_default_key_path)"
+    if [[ "${mode}" == "auto" && -s "${cur_cert}" ]] &&
+        openssl x509 -checkend $((CERT_RENEW_DAYS * 86400)) -noout -in "${cur_cert}" >/dev/null 2>&1; then
+        echo -e "${green}[证书] 默认证书剩余 $(node_cert_days_left "${cur_cert}") 天，未到 ${CERT_RENEW_DAYS} 天更新线，无需下载${plain}"
+        return 0
+    fi
+
+    [[ -d "${CERT_DIR}" ]] || mkdir -m 700 -p "${CERT_DIR}" || return 1
+    # 下到同目录的临时文件，换上去才是同一文件系统内的 rename。
+    new_cert="$(mktemp "${CERT_DIR}/.download.XXXXXX")" || return 1
+    new_key="$(mktemp "${CERT_DIR}/.download.XXXXXX")" || { rm -f "${new_cert}"; return 1; }
+    if ! cert_source_fetch "${cert_url}" "${new_cert}"; then
+        rm -f "${new_cert}" "${new_key}"
+        echo -e "${red}[证书] 下载证书失败：$(cert_url_mask "${cert_url}")，现有证书未改动${plain}"
+        return 1
+    fi
+    if ! cert_source_fetch "${key_url}" "${new_key}"; then
+        rm -f "${new_cert}" "${new_key}"
+        echo -e "${red}[证书] 下载私钥失败：$(cert_url_mask "${key_url}")，现有证书未改动${plain}"
+        return 1
+    fi
+    if ! why="$(cert_check_pair "${new_cert}" "${new_key}")"; then
+        rm -f "${new_cert}" "${new_key}"
+        echo -e "${red}[证书] 下载到的${why}，现有证书未改动${plain}"
+        return 1
+    fi
+
+    if [[ -s "${cur_cert}" ]]; then
+        if [[ "$(cert_fingerprint "${new_cert}")" == "$(cert_fingerprint "${cur_cert}")" ]]; then
+            rm -f "${new_cert}" "${new_key}"
+            if [[ "${mode}" == "auto" ]]; then
+                echo -e "${yellow}[证书] 默认证书剩余 $(node_cert_days_left "${cur_cert}") 天，但远端还是同一张证书，远端尚未续期${plain}"
+                return 1
+            fi
+            echo -e "${green}[证书] 远端证书与本地相同，无需替换${plain}"
+            return 0
+        fi
+        if [[ "${mode}" == "auto" ]]; then
+            cur_end="$(node_cert_end_epoch "${cur_cert}")"
+            new_end="$(node_cert_end_epoch "${new_cert}")"
+            if [[ -n "${cur_end}" && -n "${new_end}" && "${new_end}" -le "${cur_end}" ]]; then
+                rm -f "${new_cert}" "${new_key}"
+                echo -e "${yellow}[证书] 远端证书不比本地新，不替换（远端尚未续期？）${plain}"
+                return 1
+            fi
+        fi
+    fi
+
+    days="$(node_cert_days_left "${new_cert}")"
+    if [[ -n "${days}" && "${days}" -lt "${CERT_RENEW_DAYS}" ]]; then
+        echo -e "${yellow}[证书] 注意：远端证书只剩 ${days} 天，远端该续期了${plain}"
+    fi
+    cert_warn_sni "${new_cert}"
+
+    # 留一份旧证书，重启起不来时换回去。
+    local have_bak=0
+    if [[ -s "${cur_cert}" && -s "${cur_key}" ]]; then
+        cp -p "${cur_cert}" "${CERT_DIR}/.default-prev.cert" &&
+            cp -p "${cur_key}" "${CERT_DIR}/.default-prev.key" && have_bak=1
+    fi
+    chmod 644 "${new_cert}"
+    chmod 600 "${new_key}"
+    if ! mv -f "${new_key}" "${cur_key}" || ! mv -f "${new_cert}" "${cur_cert}"; then
+        rm -f "${new_cert}" "${new_key}"
+        [[ "${have_bak}" == 1 ]] && mv -f "${CERT_DIR}/.default-prev.cert" "${cur_cert}" &&
+            mv -f "${CERT_DIR}/.default-prev.key" "${cur_key}"
+        echo -e "${red}[证书] 写入 ${cur_cert} 失败，已保留原证书${plain}"
+        return 1
+    fi
+    echo -e "${green}[证书] 已更新默认证书 ${cur_cert}（剩余 $(node_cert_days_left "${cur_cert}") 天）${plain}"
+
+    if [[ "${restart}" == "yes" ]] && node_backend_running; then
+        node_backend_restart
+        if ! node_backend_verify; then
+            echo -e "${red}[证书] 换上新证书后 ${APP_NAME} 未能正常启动${plain}"
+            if [[ "${have_bak}" == 1 ]]; then
+                mv -f "${CERT_DIR}/.default-prev.cert" "${cur_cert}"
+                mv -f "${CERT_DIR}/.default-prev.key" "${cur_key}"
+                node_backend_restart
+                if node_backend_verify; then
+                    echo -e "${yellow}[证书] 已换回旧证书，${APP_NAME} 已恢复运行。请用 singr log 查看原因${plain}"
+                else
+                    echo -e "${red}[证书] 换回旧证书后仍未能启动，请立即用 singr log 排查${plain}"
+                fi
+            fi
+            return 1
+        fi
+        echo -e "${green}[证书] ${APP_NAME} 已重启，新证书生效${plain}"
+    fi
+    rm -f "${CERT_DIR}/.default-prev.cert" "${CERT_DIR}/.default-prev.key"
+    return 0
+}
+
+cert_timer_install() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${yellow}[证书] 未检测到 systemd，无法安装每日检查。请自行每天执行一次：${SELF_CMD} cert-update${plain}"
+        return 0
+    fi
+    cat >"${CERT_TIMER_DIR}/${CERT_TIMER}.service" <<EOF
+[Unit]
+Description=SingR default certificate update check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${SELF_CMD} cert-update
+EOF
+    cat >"${CERT_TIMER_DIR}/${CERT_TIMER}.timer" <<EOF
+[Unit]
+Description=Daily SingR default certificate update check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now "${CERT_TIMER}.timer" >/dev/null 2>&1 ||
+        echo -e "${yellow}[证书] 启用 ${CERT_TIMER}.timer 失败，请检查 systemctl status ${CERT_TIMER}.timer${plain}"
+}
+
+cert_timer_remove() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    [[ -f "${CERT_TIMER_DIR}/${CERT_TIMER}.timer" ]] || return 0
+    systemctl disable --now "${CERT_TIMER}.timer" >/dev/null 2>&1 || true
+    rm -f "${CERT_TIMER_DIR}/${CERT_TIMER}.timer" "${CERT_TIMER_DIR}/${CERT_TIMER}.service"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# 配置（或更换）默认证书更新源并立即下载一次。下载和校验都通过才写配置；失败什么
+# 都不改。restart 见 cert_default_update。
+cert_source_set() {
+    local cert_url="$1" key_url="$2" restart="${3:-yes}" u users tmp
+    node_require_jq || return 1
+    for u in "${cert_url}" "${key_url}"; do
+        if [[ "${u}" != https://* ]]; then
+            echo -e "${red}更新源地址必须是 https://（私钥不能明文传输）：$(cert_url_mask "${u}")${plain}"
+            return 1
+        fi
+    done
+
+    # 第一次接管：默认证书已经在被节点使用，换掉会影响它们，得让人确认。
+    if [[ ! -s "${CERT_SOURCE}" && -s "$(node_default_cert_path)" ]]; then
+        users="$(cert_default_inbounds | cut -f1 | paste -sd' ' -)"
+        if [[ -n "${users}" ]]; then
+            echo -e "${yellow}以下节点正在使用默认证书 $(node_default_cert_path)，配置更新源后它会被换成远端证书：${plain}"
+            echo "  ${users}"
+            if [[ -t 0 ]]; then
+                confirm "确定继续吗" "n" || return 1
+            else
+                echo -e "${red}非交互模式下不替换正在使用的默认证书。请在终端里执行 singr cert-source${plain}"
+                return 1
+            fi
+        fi
+    fi
+
+    cert_default_update force "${restart}" "${cert_url}" "${key_url}" || return 1
+
+    tmp="$(mktemp "${CONFIG_DIR}/.cert-source.XXXXXX")" || return 1
+    chmod 600 "${tmp}"
+    if ! jq -n --arg c "${cert_url}" --arg k "${key_url}" '{cert_url: $c, key_url: $k}' >"${tmp}" ||
+        ! mv -f "${tmp}" "${CERT_SOURCE}"; then
+        rm -f "${tmp}"
+        echo -e "${red}写入 ${CERT_SOURCE} 失败（证书已更新，但不会自动续期）${plain}"
+        return 1
+    fi
+    cert_timer_install
+    echo -e "${green}已配置默认证书更新源，每天检查一次，剩余不足 ${CERT_RENEW_DAYS} 天时自动下载更新${plain}"
+}
+
+cert_source_clear() {
+    rm -f "${CERT_SOURCE}"
+    cert_timer_remove
+    echo -e "${green}已清除默认证书更新源，现有证书文件保留，不再自动更新${plain}"
+}
+
+cert_source_show() {
+    local c
+    c="$(node_default_cert_path)"
+    echo -e "${green}默认证书：${plain}${c} + $(node_default_key_path)"
+    if [[ -s "${c}" ]]; then
+        echo -e "  状态：$(node_cert_status "${c}")"
+    else
+        echo -e "  状态：${red}不存在${plain}"
+    fi
+    if [[ -s "${CERT_SOURCE}" ]]; then
+        echo -e "${green}更新源：${plain}"
+        echo "  证书：$(cert_url_mask "$(cert_source_get cert_url)")"
+        echo "  私钥：$(cert_url_mask "$(cert_source_get key_url)")"
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${CERT_TIMER}.timer"; then
+            echo -e "  每日检查：${green}已启用${plain}（剩余不足 ${CERT_RENEW_DAYS} 天时下载）"
+        else
+            echo -e "  每日检查：${red}未启用${plain}"
+        fi
+    else
+        echo -e "${yellow}更新源：未配置${plain}"
+    fi
+}
+
+# singr cert-source [--cert-url URL --key-url URL [--no-restart] | --clear]
+cert_source_cmd() {
+    local cert_url="" key_url="" restart="yes" clear=0 sel
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cert-url) cert_url="$2"; shift 2 ;;
+            --key-url) key_url="$2"; shift 2 ;;
+            --no-restart) restart="no"; shift ;;
+            --clear) clear=1; shift ;;
+            *)
+                echo -e "${red}未知参数：$1${plain}"
+                echo "用法：singr cert-source [--cert-url URL --key-url URL | --clear]"
+                return 1
+                ;;
+        esac
+    done
+    node_require_jq || return 1
+    if [[ "${clear}" == 1 ]]; then
+        cert_source_clear
+        return 0
+    fi
+    if [[ -n "${cert_url}" || -n "${key_url}" ]]; then
+        if [[ -z "${cert_url}" || -z "${key_url}" ]]; then
+            echo -e "${red}--cert-url 与 --key-url 必须同时给出${plain}"
+            return 1
+        fi
+        cert_source_set "${cert_url}" "${key_url}" "${restart}"
+        return
+    fi
+
+    cert_source_show
+    [[ -t 0 ]] || return 0
+    echo -e "
+  1. 设置 / 更换更新源
+  2. 立即下载更新
+  3. 清除更新源
+  0. 返回
+"
+    read -r -p "请输入选择 [0-3]: " sel
+    case "${sel}" in
+        1)
+            read -r -p "证书地址 (https://...): " cert_url
+            read -r -p "私钥地址 (https://...): " key_url
+            [[ -n "${cert_url}" && -n "${key_url}" ]] || { echo -e "${red}两个地址都要填${plain}"; return 1; }
+            cert_source_set "${cert_url}" "${key_url}" yes
+            ;;
+        2) cert_update_cmd --force ;;
+        3) cert_source_clear ;;
+        *) return 0 ;;
+    esac
+}
+
+# singr cert-update [--force]：定时任务调用的就是不带参数的这个。
+cert_update_cmd() {
+    local mode="auto"
+    [[ "${1:-}" == "--force" ]] && mode="force"
+    if [[ ! -s "${CERT_SOURCE}" ]]; then
+        echo -e "${yellow}未配置默认证书更新源，无事可做（用 singr cert-source 配置）${plain}"
+        return 0
+    fi
+    node_require_jq || return 1
+    cert_default_update "${mode}" yes "$(cert_source_get cert_url)" "$(cert_source_get key_url)"
+}
+# <<<<<<<<<<<<<<<< SYNC BLOCK: 默认证书更新源 <<<<<<<<<<<<<<<<
 
 # ---------------- Hysteria2 端口跳跃管理（宿主机 iptables，与裸机版一致）------
 porthop_check_tools() {
@@ -1466,12 +1868,13 @@ show_usage() {
     echo "singr add [参数]            添加节点（不带参数则逐项询问）"
     echo "singr del <@序号>           删除节点，序号取自 singr list 的 # 列"
     echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
-    echo "singr cert <@序号> ...      登记/更换该节点的宿主机证书源"
-    echo "singr cert-sync             重新复制宿主机证书，变了才重启（certbot 钩子）"
+    echo "singr cert-source           查看/配置默认证书的远程更新源"
+    echo "singr cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
     echo "------------------------------------------"
     echo "添加节点参数："
     echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2"
-    echo "  --sni HOST --cert-path PATH --key-path PATH"
+    echo "  --sni HOST --cert-path PATH --key-path PATH（宿主机路径，容器按原路径挂载）"
+    echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
     echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"
     echo "  [--speed-limit 0] [--device-limit 0] [--enable-device-limit false]"
     echo "  [--update-periodic 60]"
@@ -1479,28 +1882,41 @@ show_usage() {
 }
 
 show_menu() {
+    local line="  ${green}──────────────────────────────────────${plain}"
     echo -e "
   ${green}${APP_NAME} 后端管理脚本（Docker）${plain}
+${line}
   0. 修改配置
+${line}
   2. 更新 SingR（拉镜像重建）
   3. 卸载 SingR
+${line}
   4. 启动 SingR
   5. 停止 SingR
   6. 重启 SingR
   7. 查看 SingR 状态
   8. 查看 SingR 日志
+${line}
   9. 设置开机自启
  10. 取消开机自启
+${line}
  11. 查看 SingR 版本
  12. 更新管理脚本
+${line}
  13. Hysteria2 端口跳跃管理
  14. 节点管理（查看 / 添加 / 删除）
-"
-    show_status
-    echo
-    node_list_brief
-    echo
-    read -r -p "请输入选择 [0-14]: " num
+ 15. 默认证书更新源
+${line}"
+    show_status | sed 's/^/  /'
+    echo -e "${line}"
+    # 没装好 / 没有 jq 时节点列表是空的，别留下两条挨着的分割线。
+    local nodes
+    nodes="$(node_list_brief)"
+    if [[ -n "${nodes}" ]]; then
+        printf '%s\n' "${nodes}"
+        echo -e "${line}"
+    fi
+    read -r -p "请输入选择 [0-15]: " num
     case "${num}" in
         0) config ;;
         2) update_singr ;;
@@ -1516,9 +1932,18 @@ show_menu() {
         12) update_shell ;;
         13) porthop_menu && before_show_menu ;;
         14) node_menu && before_show_menu ;;
-        *) echo -e "${red}请输入正确的数字 [0-14]${plain}" && before_show_menu ;;
+        15) cert_source_cmd; before_show_menu ;;
+        *) echo -e "${red}请输入正确的数字 [0-15]${plain}" && before_show_menu ;;
     esac
 }
+
+# 旧版本证书登记的一次性迁移（见 certs_migrate）。卸载、更新脚本自身、开机重放端口
+# 跳跃规则这几条不触发：前两者马上就不需要它了，后者跑在开机路径上，dockerd 此时
+# 也正在拉起容器，不该在这里重建。
+case "${1:-}" in
+    uninstall | update_shell | porthop-apply | porthop-flush) ;;
+    *) certs_migrate ;;
+esac
 
 if [[ $# -gt 0 ]]; then
     case "$1" in
@@ -1537,12 +1962,13 @@ if [[ $# -gt 0 ]]; then
         list | nodes) node_list ;;
         add) shift; node_add "$@" ;;
         del | delete | rm) node_del "${2:-}" ;;
-        cert-sync | certsync) cert_sync_cmd 0 ;;
-        cert) shift; node_cert_register "$@" ;;
+        cert-source) shift; cert_source_cmd "$@" ;;
+        cert-update) cert_update_cmd "${2:-}" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;
         porthop-flush) porthop_flush_all ;;
         _bootstrap) container_recreate ;;   # 供 install-docker.sh 首次创建调用
+        _cert-mount-check) cert_path_mountable "${2:-}" && cert_path_mountable "${3:-}" ;;   # 供 install-docker.sh 预检
         *) show_usage ;;
     esac
 else

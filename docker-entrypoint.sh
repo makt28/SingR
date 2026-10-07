@@ -220,20 +220,19 @@ while IFS= read -r tag; do
         hint=""
         if [[ "${using_default}" == 1 ]]; then
             hint="
-这个 inbound 在 server.json 里没有配置证书，用的是默认路径。把证书放进去即可：
-  cp 证书 ${CERT_DIR}/default.pem      # .crt 后缀也认
+这个 inbound 在 server.json 里没有配置证书，用的是默认路径。在宿主机上把证书放进去：
+  cp 证书 ${CERT_DIR}/default.pem      # .crt 后缀也认，也可以是指向别处的软链
   cp 私钥 ${CERT_DIR}/default.key
-容器只挂载了 ${CONFIG_DIR}，所以要放在这个目录下——软链到 /etc/letsencrypt 在
-容器内是断的。想让 certbot 续期自动生效，用 singr cert 登记宿主机源路径。"
+或用 singr cert-source 配置远程更新源。放好后在宿主机执行 singr restart。"
         else
-            # 证书路径不在挂载目录内 → 多半是宿主机路径（如 /root/xxx），容器里根本看不到。
+            # 证书在挂载目录外：宿主机上的 singr 会按原路径把证书目录挂进来。到这里还
+            # 找不到，要么宿主机上文件确实不在，要么容器是在改证书路径之前建的。
             case "${active_cert}" in
                 "${CONFIG_DIR}"/*) ;;
                 *) hint="
-注意：证书路径 ${active_cert} 不在挂载目录 ${CONFIG_DIR} 下。容器只挂载了
-${CONFIG_DIR}，宿主机上别处（如 /root/）的文件在容器内不可见。请把证书复制到
-${CERT_DIR}/ 下，或用 singr add 的 --cert-path/--key-path（脚本会复制进挂载目录
-并登记源路径，之后每次重启自动重新同步）。" ;;
+证书路径 ${active_cert} 在 ${CONFIG_DIR} 之外，容器靠宿主机按原路径只读挂载它所在的
+目录才能看到。请确认宿主机上这两个文件存在，然后在宿主机执行 singr restart（会按
+server.json 重新计算挂载并重建容器）。" ;;
             esac
         fi
         die "节点 inbound '${tag}' 缺少 TLS 证书（容器内路径）：${active_cert} / ${active_key}${hint}

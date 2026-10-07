@@ -24,11 +24,12 @@ fail() { echo "  FAIL - $1"; echo "         want: [$2]"; echo "         got:  [$
 check() { [[ "$2" == "$3" ]] && pass "$1" || fail "$1" "$2" "$3"; }
 
 # ---- 抽出 SYNC BLOCK ----
+# 不给名字就取"节点管理"块。
 extract_block() {
-    local file="$1" start end
-    start="$(grep -n '^# >>>>>>>>>>>>>>>> SYNC BLOCK' "${file}" | head -1 | cut -d: -f1)"
-    end="$(grep -n '^# <<<<<<<<<<<<<<<< SYNC BLOCK' "${file}" | head -1 | cut -d: -f1)"
-    [[ -n "${start}" && -n "${end}" ]] || { echo "找不到 SYNC BLOCK 标记：${file}" >&2; exit 1; }
+    local file="$1" name="${2:-节点管理}" start end
+    start="$(grep -n "^# >>>>>>>>>>>>>>>> SYNC BLOCK: ${name} " "${file}" | head -1 | cut -d: -f1)"
+    end="$(grep -n "^# <<<<<<<<<<<<<<<< SYNC BLOCK: ${name} " "${file}" | head -1 | cut -d: -f1)"
+    [[ -n "${start}" && -n "${end}" ]] || { echo "找不到 SYNC BLOCK「${name}」标记：${file}" >&2; exit 1; }
     sed -n "${start},${end}p" "${file}"
 }
 
@@ -45,11 +46,13 @@ mkdir -p "${CERT_DIR}"
 run() { bash -c "source '${TMP}/block.sh'; $1" 2>/dev/null; }
 
 echo "== SYNC BLOCK 在两个脚本里逐字相同 =="
-if diff <(extract_block "${REPO_DIR}/SingR.sh") <(extract_block "${REPO_DIR}/SingR-docker.sh") >/dev/null; then
-    pass "SingR.sh 与 SingR-docker.sh 的 SYNC BLOCK 一致"
-else
-    fail "SingR.sh 与 SingR-docker.sh 的 SYNC BLOCK 一致" "identical" "differs"
-fi
+for name in 节点管理 默认证书更新源; do
+    if diff <(extract_block "${REPO_DIR}/SingR.sh" "${name}") <(extract_block "${REPO_DIR}/SingR-docker.sh" "${name}") >/dev/null; then
+        pass "SingR.sh 与 SingR-docker.sh 的 SYNC BLOCK「${name}」一致"
+    else
+        fail "SingR.sh 与 SingR-docker.sh 的 SYNC BLOCK「${name}」一致" "identical" "differs"
+    fi
+done
 
 echo "== 默认路径探测顺序（须与 Go 侧 defaultCertificateNames 一致）=="
 check "都不存在时落到 default.pem" "${CERT_DIR}/default.pem" "$(run 'node_default_cert_path')"

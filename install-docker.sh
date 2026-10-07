@@ -16,7 +16,7 @@
 # 本脚本只负责装第一个节点。已经装过之后再跑会被拒绝（重复运行不会让新参数生效，
 # 却会先删掉正在服务的容器）。同一台机上再加节点请用：
 #   singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 \
-#             --sni HOST --cert-path PATH --key-path PATH
+#             --sni HOST [--cert-path PATH --key-path PATH | --cert-url URL --key-url URL]
 # 查看/删除：singr list / singr del <NodeID>
 #
 # App parameters (written into panel.json on first container start):
@@ -32,9 +32,12 @@
 #   --enable-device-limit BOOL (default false)
 #   --update-periodic N        (default 60)
 #   --sni HOST                 inbound server_name
-#   --cert-path PATH           宿主机证书路径，安装时复制进挂载目录（任意路径均可，
-#                              如 /root/foo.pem）——容器只挂载 /etc/singr-docker
+#   --cert-path PATH           宿主机证书路径（如 /etc/letsencrypt/live/域名/fullchain.pem）。
+#                              原样写进 server.json，容器按原路径只读挂载它所在的目录，
+#                              certbot 续期后容器内立刻可见并自动重新加载
 #   --key-path PATH            宿主机私钥路径，同上
+#   --cert-url URL             从 https 地址下载证书作为默认证书（certs/default.pem），
+#   --key-url URL              并每天检查、剩余不足 7 天时自动更新。与 --cert-path 二选一
 #   --log-level LEVEL          (default info)
 # Container options:
 #   --image REF                (default ghcr.io/makt28/singr:latest)
@@ -53,7 +56,6 @@ die()      { echo -e "${red}$*${plain}" >&2; exit 1; }
 CONFIG_DIR="/etc/singr-docker"
 CERT_DIR="${CONFIG_DIR}/certs"
 DOCKER_CONF="${CONFIG_DIR}/docker.conf"
-CERTS_MAP="${CONFIG_DIR}/certs.json"
 
 RELEASE_REPO="${SINGR_RELEASE_REPO:-makt28/SingR}"
 RELEASE_BRANCH="${SINGR_RELEASE_BRANCH:-main}"
@@ -70,7 +72,8 @@ LOG_MAX_FILE="5"
 
 # --- app flags (forwarded verbatim to the container entrypoint) -------------
 API_URL=""; API_KEY=""; NODE_ID=""; PROTOCOL=""
-CERT_SRC=""; KEY_SRC=""       # 宿主机上的证书源路径，安装时复制进挂载目录
+CERT_SRC=""; KEY_SRC=""       # 宿主机证书路径，交给 entrypoint 写进 server.json
+CERT_URL=""; KEY_URL=""       # 默认证书更新源，只存进 cert-source.json，不进 RUN_FLAGS
 declare -a APP_FLAGS=()
 
 check_root() { [[ "${EUID}" -eq 0 ]] || die "错误：必须使用 root 用户运行此脚本。"; }
@@ -84,7 +87,7 @@ guard_existing_install() {
     die "检测到 ${CONFIG_DIR}/panel.json 已存在：本机已经装过 SingR（Docker）。
 重复运行安装脚本不会让新参数生效，反而会先删掉正在运行的容器。请改用：
   · 新增节点：  singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 \\
-                          --sni HOST --cert-path PATH --key-path PATH
+                          --sni HOST [--cert-path PATH --key-path PATH]
   · 查看节点：  singr list
   · 删除节点：  singr del <NodeID>
   · 升级镜像：  singr update
@@ -106,8 +109,10 @@ parse_args() {
             --enable-device-limit) APP_FLAGS+=(--enable-device-limit "$2"); shift 2;;
             --update-periodic)     APP_FLAGS+=(--update-periodic "$2"); shift 2;;
             --sni)          APP_FLAGS+=(--sni "$2"); shift 2;;
-            --cert-path)    CERT_SRC="$2"; shift 2;;   # 复制进挂载目录，不透传路径
+            --cert-path)    CERT_SRC="$2"; shift 2;;   # 校验、补成绝对路径后再交给 entrypoint
             --key-path)     KEY_SRC="$2"; shift 2;;
+            --cert-url)     CERT_URL="$2"; shift 2;;
+            --key-url)      KEY_URL="$2"; shift 2;;
             --log-level)    APP_FLAGS+=(--log-level "$2"); shift 2;;
             --image)          IMAGE="$2"; shift 2;;
             --container-name) CONTAINER="$2"; shift 2;;
@@ -126,19 +131,42 @@ validate() {
     [[ -n "${API_URL}" ]]  || die "缺少 --api-url。"
     [[ -n "${API_KEY}" ]]  || die "缺少 --api-key。"
     [[ "${NODE_ID}" =~ ^[0-9]+$ ]] || die "缺少合法 --node-id（整数）。"
+    validate_certs
     case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
         anytls|hysteria2|hy2) ;;
         *) die "缺少或非法 --protocol（anytls / hysteria2）。";;
     esac
 }
 
-# jq：singr add/del/list 和 certs_sync 都靠它——没有 jq 时 certs_sync 整体跳过，
-# certbot 续期后证书不会同步进容器。vim：查看/改 /etc/singr-docker 下的配置。
+# 证书参数：路径一对、URL 一对，各自要么都给要么都不给，两种方式二选一。
+#
+# 路径原样写进容器里的 server.json，同时也是挂载源，所以必须是绝对路径（按当前目录
+# 补全，但不解析软链：certbot 的 live/ 软链要保留，续期换的正是它）。能否挂进容器
+# 要等管理脚本装好后由它判断（singr _cert-mount-check），规则只维护一份。
+validate_certs() {
+    if [[ -n "${CERT_SRC}" || -n "${KEY_SRC}" ]]; then
+        [[ -n "${CERT_SRC}" && -n "${KEY_SRC}" ]] || die "--cert-path 与 --key-path 必须同时给出。"
+        [[ -z "${CERT_URL}${KEY_URL}" ]] || die "--cert-path 与 --cert-url 只能二选一。"
+        [[ "${CERT_SRC}" == /* ]] || CERT_SRC="${PWD}/${CERT_SRC}"
+        [[ "${KEY_SRC}" == /* ]] || KEY_SRC="${PWD}/${KEY_SRC}"
+        [[ -s "${CERT_SRC}" ]] || die "找不到证书文件：${CERT_SRC}"
+        [[ -s "${KEY_SRC}" ]] || die "找不到私钥文件：${KEY_SRC}"
+        APP_FLAGS+=(--cert-path "${CERT_SRC}" --key-path "${KEY_SRC}")
+    fi
+    if [[ -n "${CERT_URL}" || -n "${KEY_URL}" ]]; then
+        [[ -n "${CERT_URL}" && -n "${KEY_URL}" ]] || die "--cert-url 与 --key-url 必须同时给出。"
+        [[ "${CERT_URL}" == https://* && "${KEY_URL}" == https://* ]] || die "--cert-url / --key-url 必须是 https:// 地址（私钥不能明文传输）。"
+    fi
+}
+
+# jq：singr add/del/list 和证书挂载计算都靠它——没有 jq 时算不出证书目录，容器里
+# 看不到 /etc/singr-docker 以外的证书。openssl：校验下载的证书、显示剩余天数。
+# vim：查看/改 /etc/singr-docker 下的配置。
 # 尽力而为、逐个装：宿主机包管理器五花八门，装不上只警告，不挡 docker 安装；
 # 脚本里的 node_require_jq 仍是兜底。已存在的跳过，重跑不会白跑一次 apt update。
 install_tools() {
     local pkg missing=()
-    for pkg in jq vim; do
+    for pkg in jq openssl vim; do
         command -v "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
     done
     [[ ${#missing[@]} -eq 0 ]] && return 0
@@ -225,10 +253,16 @@ print_usage() {
     echo ""
     log_info "SingR（Docker）安装完成。"
     echo ""
-    echo -e "${yellow}⚠ 证书：没有证书容器不会启动（与裸机一致）。${plain}"
-    echo    "  请把证书放到：${CERT_DIR}/default.pem 与 ${CERT_DIR}/default.key"
-    echo    "  （证书用 .crt 后缀也认；也可用 singr add 的 --cert-path/--key-path 指定别的路径）"
-    echo    "  放好后执行：singr restart"
+    if [[ -n "${CERT_URL}" ]]; then
+        log_info "证书：已从远程地址下载到 ${CERT_DIR}/default.pem，每天检查一次，剩余不足 7 天时自动更新（singr cert-source 查看）。"
+    elif [[ -n "${CERT_SRC}" ]]; then
+        log_info "证书：直接引用 ${CERT_SRC}，容器按原路径挂载其所在目录，续期后自动生效。"
+    else
+        echo -e "${yellow}⚠ 证书：没有证书容器不会启动（与裸机一致）。${plain}"
+        echo    "  请把证书放到：${CERT_DIR}/default.pem 与 ${CERT_DIR}/default.key"
+        echo    "  （证书用 .crt 后缀也认；或用 singr cert-source 配置远程更新源）"
+        echo    "  放好后执行：singr restart"
+    fi
     echo ""
     echo "常用管理命令："
     echo "------------------------------------------"
@@ -244,55 +278,6 @@ print_usage() {
     echo "配置目录：${CONFIG_DIR}"
 }
 
-# 把 --cert-path/--key-path 指向的宿主机证书复制进挂载目录 ${CERT_DIR}，用默认名
-# （default.pem / default.key）——容器只挂载 ${CONFIG_DIR}，宿主机别处（如 /root/）
-# 的文件容器内不可见。首装铺下去的 server.json 把 certificate_path/key_path 留空，
-# 二进制会自己解析到这两个文件（cmd/sing-box/cmd_run.go 的
-# applyDefaultCertificatePaths），所以复制完无需再向容器透传 --cert-path。
-copy_certs() {
-    local proto
-    case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
-        hysteria2|hy2) proto="hysteria2" ;;
-        *)             proto="anytls" ;;
-    esac
-    mkdir -p "${CERT_DIR}"
-    if [[ -n "${CERT_SRC}" ]]; then
-        [[ -s "${CERT_SRC}" ]] || die "找不到证书文件：${CERT_SRC}"
-        install -m 644 "${CERT_SRC}" "${CERT_DIR}/default.pem"
-        log_info "已复制证书 -> ${CERT_DIR}/default.pem"
-    fi
-    if [[ -n "${KEY_SRC}" ]]; then
-        [[ -s "${KEY_SRC}" ]] || die "找不到私钥文件：${KEY_SRC}"
-        install -m 600 "${KEY_SRC}" "${CERT_DIR}/default.key"
-        log_info "已复制私钥 -> ${CERT_DIR}/default.key"
-    fi
-    record_cert_sources "${proto}-in"
-}
-
-# 登记宿主机证书源路径，供 `singr` 的 certs_sync 在每次 start/restart/update 前
-# 重新复制。不登记的话复制就是一次性的：certbot 续期后容器会一直用着安装当天
-# 那张证书，而且无从得知源文件在哪。
-#
-# 这里不用 jq 写：装 docker 的宿主机不一定有 jq，而首装时只有一个条目，here-doc
-# 足够。singr add 之后的写入才走 jq。含引号/反斜杠的路径直接拒绝，避免拼出坏 JSON。
-record_cert_sources() {
-    local tag="$1"
-    [[ -n "${CERT_SRC}" && -n "${KEY_SRC}" ]] || return 0
-    case "${CERT_SRC}${KEY_SRC}" in
-        *'"'* | *'\'*)
-            log_warn "证书路径含引号或反斜杠，跳过源路径登记；证书续期后需手动执行 singr cert-sync 或重新复制。"
-            return 0
-            ;;
-    esac
-    cat > "${CERTS_MAP}" <<EOF
-{
-  "${tag}": { "cert": "${CERT_SRC}", "key": "${KEY_SRC}" }
-}
-EOF
-    chmod 600 "${CERTS_MAP}" 2>/dev/null || true
-    log_info "已登记证书源路径：${CERTS_MAP}（重启时自动重新同步）"
-}
-
 main() {
     check_root
     parse_args "$@"
@@ -301,8 +286,18 @@ main() {
     install_tools
     install_docker
     write_conf
-    copy_certs
     install_management_script
+
+    if [[ -n "${CERT_SRC}" ]]; then
+        /usr/bin/SingR _cert-mount-check "${CERT_SRC}" "${KEY_SRC}" ||
+            die "证书路径无法挂进容器，请把证书放进单独的目录后重试。"
+    fi
+    # 容器还不存在，所以 --no-restart；下载或校验失败直接中止 —— 此时 panel.json 还没
+    # 生成，修好地址后可以直接重跑本脚本。
+    if [[ -n "${CERT_URL}" ]]; then
+        /usr/bin/SingR cert-source --cert-url "${CERT_URL}" --key-url "${KEY_URL}" --no-restart ||
+            die "默认证书下载失败，安装中止。确认地址可访问后重跑本脚本。"
+    fi
 
     log_info "拉取镜像：${IMAGE}"
     docker pull "${IMAGE}" || die "镜像拉取失败：${IMAGE}"
