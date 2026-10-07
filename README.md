@@ -1,135 +1,127 @@
 # SingR
 
-项目地址：<https://github.com/makt28/SingR>
+基于 sing-box 的 **旧版 SSPanel（`/mod_mu` 接口）后端**。面板里节点类型照旧填 `V2ray`，SingR 根据节点地址里的 `path` 把它跑成 AnyTLS 或 Hysteria2：
 
-SingR 是基于 sing-box 的 SSPanel 后端，面向旧版 SSPanel `/mod_mu` 接口。
+| 节点地址里的 `path` | 实际运行的协议 |
+| --- | --- |
+| `path=/anytls` | AnyTLS（TCP） |
+| `path=/hy2` | Hysteria2（QUIC/UDP） |
 
-它的主要用途是：在 SSPanel 里继续把节点配置成 `V2ray`，但通过节点地址里的 `path` 别名，把节点作为 sing-box 的 **AnyTLS** 或 **Hysteria2** 入站运行：
+两种协议共用同一套用户同步、流量上报、限速和审计。项目地址：<https://github.com/makt28/SingR>
 
-- `path=/anytls` → AnyTLS 入站（TCP）
-- `path=/hy2` → Hysteria2 入站（QUIC/UDP）
+---
 
-两种协议共用同一套用户同步、流量上报、限速、审计逻辑；面板侧两种节点除了 `path` 和 `intag`/`outtag` 之外没有区别（节点类型都保持 `V2ray`）。
+## 快速开始
 
-## 工作方式
+### 第 1 步：在 SSPanel 里配节点
 
-SSPanel 节点地址示例（AnyTLS）：
-
-```text
-sa.example.com;14555;0;ws;;path=/anytls|host=example.com|relay_server=relay.example.com|relay_port=42132
-```
-
-Hysteria2 只需把 `path` 换成 `hy2`：
+节点类型保持 `V2ray`，节点地址按旧格式填写：
 
 ```text
-sa.example.com;14555;0;ws;;path=/hy2|host=example.com
+节点域名;监听端口;0;ws;;path=/anytls|host=TLS域名
 ```
 
-SingR 会按旧 SSPanel V2ray 格式解析：
+例如：
 
-- `14555` 作为监听端口。
-- `ws` 表示旧版 WebSocket 传输模式。
-- `path=/anytls`（或 `anytls`）触发 AnyTLS 兼容模式；`path=/hy2`（或 `hy2`）触发 Hysteria2 兼容模式。
-- `host=example.com` 会作为 TLS `server_name`。
-- `relay_server` 和 `relay_port` 会被解析保存，但当前不会自动生成 relay 出站或路由。
-
-触发兼容模式后：
-
-- 面板节点类型仍可保持为 `V2ray`。
-- SingR 内部有效节点类型会变为 `anytls` 或 `hysteria2`。
-- 用户认证密码优先使用 SSPanel 用户的 `uuid`，为空时才回退到 `passwd`。
-- 用户运行时名固定为 `u<用户ID>`；流量和在线 IP 仍会上报到旧 SSPanel `/mod_mu` 接口。
-
-### 一份 server.json 同时支持两种协议
-
-默认的 `/etc/singr/server.json` 是一个**超集**，同时声明了 `anytls-in` 和 `hysteria2-in` 两个入站。启动时 SingR 只会真正创建 **`panel.json` 里被引用到的那些入站**（按 `intag` 过滤），没用到的协议入站根本不会创建，也就不需要证书、不占端口。
-
-也就是说：**切换 / 增加协议只改 `panel.json`，不用动 `server.json`**。`panel.json` 里有 AnyTLS 节点就起 AnyTLS，有 Hysteria2 节点就起 Hysteria2，两个都有就都起（多节点共存，见下）。
-
-## 环境要求
-
-- Linux 服务器，推荐 systemd 环境。
-- Go `1.25.5` 或更高版本，用于源码编译（CI 与发布构建使用 `1.26.8`；Go 1.27 已验证可编译，但暂未用于发布）。
-- 一个可访问的旧 SSPanel 面板。
-- SSPanel 节点类型配置为 `V2ray`。
-- AnyTLS 需要 TLS 证书。生产环境建议使用可信证书；自签证书需要客户端开启允许不安全证书或手动信任证书。
-
-## 编译安装
-
-也可以使用安装脚本（脚本要求 root 运行，下面命令均假设已是 root；非 root 请自行加 `sudo`）：
-
-```sh
-bash install.sh
+```text
+sa.example.com;14555;0;ws;;path=/anytls|host=example.com
+sa.example.com;14556;0;ws;;path=/hy2|host=example.com
 ```
 
-脚本会优先使用当前源码目录下已编译好的 `sing-box`，没有二进制时会尝试从源码编译。也可以显式指定二进制：
+- `14555`：监听端口。
+- `path=/anytls` 或 `path=/hy2`：选择协议（不带 `/` 也认）。
+- `host=`：TLS 的 SNI，证书需要覆盖这个域名。
+- 末尾还可以追加 `|relay_server=...|relay_port=...`，SingR 会解析保存，但目前不会据此生成中转。
 
-```sh
-env SINGR_BINARY=/path/to/sing-box bash install.sh
-```
+### 第 2 步：准备证书
 
-仓库已内置默认 Release 地址（`makt28/SingR`），发布到 GitHub Release 后直接指定版本即可下载安装：
+AnyTLS 和 Hysteria2 都必须有 TLS 证书，没有证书进程不会启动。三种方式任选一种：
 
-```sh
-bash install.sh v0.3.1
-```
+| 方式 | 做法 |
+| --- | --- |
+| 放到默认路径 | 证书放 `/etc/singr/certs/default.pem`、私钥放 `default.key`（Docker 是 `/etc/singr-docker/certs/`） |
+| 指定已有证书 | 安装或添加节点时带 `--cert-path` / `--key-path`，例如 certbot 的 `live/` 目录 |
+| 从 https 地址下载 | 带 `--cert-url` / `--key-url`，SingR 会每天检查，到期前自动更新 |
 
-如需从其它仓库（fork）下载，再显式覆盖：
+详见下文[「证书」](#证书)。
 
-```sh
-env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.3.1
-```
+### 第 3 步：安装（裸机和 Docker 二选一）
 
-正式发布后，也可以直接拉取最新版本安装：
+**裸机（systemd）**，需要 root：
 
 ```sh
 bash <(curl -Ls https://raw.githubusercontent.com/makt28/SingR/main/install.sh)
-```
-
-> Release 同时提供 `SingR-linux-<arch>.tar.gz` 和 `.zip`；安装脚本优先下载 `tar.gz`（保留可执行权限、不依赖 `unzip`）。脚本还会安装 `vim` 和 `iptables`（v4/v6 同包，供 Hysteria2 端口跳跃管理使用）。
-
-脚本会安装二进制到 `/usr/local/SingR/singr`，安装管理命令到 `/usr/bin/SingR` 和 `/usr/bin/singr`，生成 `/etc/singr/panel.json`、`/etc/singr/server.json` 和 `singr.service`。已有配置不会被覆盖。
-
-> 0.2.5 起，`install.sh` / `singr update` 在保留已有 `server.json` 的同时会自动迁移老配置：补上 `dns` 块、把 `direct` 出站的老 `domain_strategy` 字段迁移成 `domain_resolver`（保留原策略值，缺省 `prefer_ipv6`）、关闭 `auto_detect_interface`，老配置会被备份成 `server.json.bak.<时间戳>`。这是为了让节点出口正确走 IPv6（旧默认配置只会走 IPv4），同时跟上 sing-box 1.12+ 的新配置写法。
->
-> ⚠️ **0.6.0（核心 1.14）起这个迁移是硬性的**：sing-box 1.14 会直接拒绝启动带老 `domain_strategy` 出站字段的配置（报 `legacy domain strategy options is deprecated`）。正常情况下不用操心——脚本会先装好依赖（含 `jq`）再执行迁移。只有在依赖安装失败时（发行版不受支持、装不上包等）迁移才会**只打一条警告就跳过**，此时节点升级后起不来。所以升级时如果看到 `未安装 jq，跳过 server.json 迁移` 这行警告，**先别急着重启**，手动把 `direct` 出站的 `domain_strategy` 改成 `domain_resolver` 再启动。
-
-`SingR` 和 `singr` 两个管理命令等价，大小写都可以。
-
-管理命令示例：
-
-```sh
-singr status
-singr log
-singr update
-singr restart
-singr porthop      # Hysteria2 端口跳跃管理（增/删/查跳跃规则）
-```
-
-管理菜单里对应的是第 13 项「Hysteria2 端口跳跃管理」。
-
-## 多节点（一个进程带多个面板节点）
-
-一台机器可以同时对接多个面板节点，共用同一个 SingR 进程。裸机和 Docker 用法完全
-一致，管理菜单里对应第 14 项「节点管理」。
-
-```sh
-singr list                    # 查看当前节点（NodeID / 协议 / 域名 / InTag / 证书状态）
 
 singr add \
-  --api-url https://panel-b.example.com \
+  --api-url https://your-sspanel.example.com \
   --api-key your-apikey \
-  --node-id 57 \
+  --node-id 44 \
   --protocol anytls \
-  --sni b.example.com \
-  --cert-path /etc/letsencrypt/live/b.example.com/fullchain.pem \
-  --key-path  /etc/letsencrypt/live/b.example.com/privkey.pem
-
-singr del @2                  # @序号取自上面 list 的 # 列，最省事
-                              # 也可用 NodeID 或 InTag：singr del anytls-in-57
+  --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
+  --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
 ```
 
-`singr list` 的 CERT 列会顺带算出证书还有几天到期：
+`singr add` 不带参数时会逐项询问。`--protocol` 可选 `anytls` 或 `hysteria2`。
+
+**Docker**：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/install-docker.sh) \
+  --api-url https://your-sspanel.example.com \
+  --api-key your-apikey \
+  --node-id 44 \
+  --protocol anytls \
+  --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
+  --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
+```
+
+Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全一样。配置在 `/etc/singr-docker`，与裸机的 `/etc/singr` 互不影响。一台机器选一种即可。
+
+### 第 4 步：客户端填写
+
+| 项 | 填什么 |
+| --- | --- |
+| 地址 | 节点域名 |
+| 端口 | 节点地址里的端口；Hysteria2 开了端口跳跃就填区间，如 `40000-60000` |
+| SNI | 节点地址里的 `host=` |
+| 密码 | 用户的 **UUID**（不是 passwd） |
+| Hysteria2 obfs | 默认开启：`obfs=salamander`，`obfs-password=<SNI>`。不填连不上，见[「Hysteria2」](#hysteria2) |
+
+---
+
+## 日常管理
+
+`singr` 和 `SingR` 等价。直接输入 `singr` 打开管理菜单。
+
+| 命令 | 作用 |
+| --- | --- |
+| `singr status` / `start` / `stop` / `restart` | 查看状态、启停 |
+| `singr log` | 查看日志 |
+| `singr update [版本]` | 更新到最新版或指定版本 |
+| `singr config` | 编辑 `panel.json` / `server.json`，保存后可选择重启 |
+| `singr list` | 查看所有节点及证书剩余天数 |
+| `singr add` / `singr del` | 添加 / 删除节点，见[「多节点」](#多节点) |
+| `singr cert-source` | 设置默认证书的下载地址（菜单第 15 项） |
+| `singr cert-update --force` | 立即重新下载默认证书 |
+| `singr porthop` | Hysteria2 端口跳跃规则（菜单第 13 项） |
+| `singr version` | 查看 SingR 和 sing-box 核心版本 |
+| `singr uninstall` | 卸载 |
+
+日志：裸机写在 `/var/log/singr.log`（`singr log` 会先显示 systemd journal，再跟随该文件）；Docker 输出到 stdout，用 `singr log` 或 `docker logs` 查看。
+
+---
+
+## 多节点
+
+一个 SingR 进程可以同时对接多个面板节点，可以跨面板、混用协议。每个节点的用户、流量、限速和审计规则相互独立，不同节点的用户 ID 相同也不会串账。管理菜单第 14 项「节点管理」提供同样的功能。
+
+```sh
+singr list                    # 查看节点
+singr add --api-url ... --api-key ... --node-id 57 --protocol hysteria2 --sni b.example.com
+singr del @2                  # @序号取自 list 的 # 列
+```
+
+`singr list` 输出示例：
 
 ```text
   #   NodeID   PROTO      DOMAIN                  INTAG            CERT
@@ -140,144 +132,188 @@ singr del @2                  # @序号取自上面 list 的 # 列，最省事
   5   99       anytls     https://b.example.com   ghost-in         无 inbound
 ```
 
-- 不足 30 天转黄，已过期转红。
-- `缺失` = 路径上没有文件；`配置不全` = `certificate_path` 和 `key_path` 只写了一个
-  （两个都留空才是"用默认路径"，只写一个二进制会以 `missing key` 拒绝启动）；
-  `无 inbound` = `panel.json` 的 `intag` 在 `server.json` 里找不到对应入站。后两种都
-  会让整个进程起不来。
-- 天数靠 `openssl` 读取；机器上没有 `openssl` 或证书读不出来时只显示 `OK`，不影响
-  其他列。
+CERT 列：
 
-`singr add` 不带参数（或从菜单进入）会逐项询问。每个节点独立拥有用户表、流量统计、
-限速桶和审计规则，**不同节点的用户 ID 撞车也不会串账**。
+- 剩余不足 30 天显示黄色，已过期显示红色。机器上没有 `openssl` 时只显示 `OK`。
+- `缺失`：路径上没有证书文件。
+- `配置不全`：`certificate_path` 和 `key_path` 只写了一个。要么两个都写，要么两个都留空（使用默认路径）。
+- `无 inbound`：`panel.json` 里的 `intag` 在 `server.json` 里找不到对应入站。
+- 后两种都会让进程起不来。
 
-> **指定节点优先用 `@序号`。** NodeID 只在单个面板内唯一——对接多个面板时，两个面板
-> 各有一个 16 号节点是很正常的。此时 `singr del 16` 会**拒绝执行**并列出候选（带 `@序号`
-> 和面板域名），绝不会替你挑一个删掉。`@序号` 和 InTag 则永远唯一。
->
-> shell 里 `#` 是注释起始，`singr del #1` 会被吞掉，所以用 `@1`（写 `'#1'` 加引号也认）。
+必须知道的几点：
 
-几点必须知道的：
+- **任何一个节点起不来，整个进程都会退出。** 所以 `add` / `del` 每次都会先备份，改完重启并检查，失败就自动回滚。
+- **端口要在面板侧错开。** 两个节点下发到同一个端口时，第二个节点会监听失败，进程看起来正常，但这个节点实际连不上。
+- **删除时优先用 `@序号` 或 InTag 指定节点。** NodeID 只在单个面板内唯一，有歧义时 `singr del 16` 会拒绝执行并列出候选。不要写 `#1`，shell 会把 `#` 后面当成注释。
+- 只剩一个节点时不能删除。要换节点，先 `add` 新的再 `del` 旧的。
+- InTag 自动分配：同协议的第一个节点用 `anytls-in`，之后的节点用 `anytls-in-<节点ID>`；hysteria2 同理。
 
-- **端口必须在面板侧错开。** 监听端口由面板下发，两个节点拿到同一个端口时第二个
-  监听会起不来——anytls 会回滚到旧配置（随机端口），进程看着健康，节点其实不可达。
-- **任一节点起不来会拖垮全部节点。** 同进程内只要有一个节点向面板取信息失败，整个
-  进程就会退出并被拉起重试。所以 `singr add` / `singr del` 每次都会先备份配置，改完
-  重启并校验，起不来就**自动回滚**到改动前的状态。
-- **inbound 标签自动分配**：第一个 anytls 节点用 `anytls-in`，第二个用
-  `anytls-in-<节点ID>`，以此类推；hysteria2 同理。
-- 只剩一个节点时不允许删除（没有节点进程无法启动）。要换节点请先 `add` 新的、再
-  `del` 旧的。
+---
 
-### 证书续期
+## 证书
 
-SingR 会监视证书文件，**文件一变就自动重新加载，不用重启**，也不需要 certbot 的
-`--deploy-hook`。两种部署方式都直接引用你给的证书路径（不复制），certbot 原地更新
-文件即可。
+### 默认路径
 
-- **裸机**：`singr add --cert-path` 的路径原样写进 `server.json`。
-- **Docker**：路径同样原样写进 `server.json`，容器按**原路径只读挂载**证书所在的
-  目录（certbot 的 `live/` 软链会顺带挂上它指向的 `archive/` 目录），所以容器里
-  看到的路径和宿主机一模一样。证书路径变了（`singr add`、`singr config` 改了
-  `server.json`）时，`singr restart` 会自动按新路径重建容器。证书请放在单独的目录里，
-  `/etc`、`/usr`、`/tmp` 这类系统目录本身不能挂进容器。
+`server.json` 里 `certificate_path` 和 `key_path` **都留空** 时，使用配置目录下的默认证书：
 
-> **例外：把 `default.pem` 软链到 certbot 的情况。** 进程监视的是配置里写的那个文件
-> 所在的目录（这里是 `certs/`），而 certbot 续期时换的是 `live/` 里的软链，`certs/`
-> 目录本身没有变化，所以监视不到。这种用法要么继续挂
-> `certbot renew --deploy-hook "singr restart"`，要么直接把 certbot 的路径写进
-> `server.json`（`singr add --cert-path` 就是这么做的）。
+```text
+/etc/singr/certs/default.pem   # 找不到时再找 default.crt
+/etc/singr/certs/default.key
+```
 
-#### 默认证书的远程更新源
+Docker 的配置目录是 `/etc/singr-docker`。启动日志会打印实际使用的路径：
 
-TLS 留空的节点用的是默认证书 `certs/default.pem` + `default.key`。如果证书由别处
-统一签发、通过 https 分发，可以让 SingR 自己去拉：
+```text
+inbound/anytls[anytls-in]: no TLS certificate configured, using default /etc/singr/certs/default.pem + /etc/singr/certs/default.key
+```
+
+AnyTLS 和 Hysteria2 默认用同一张证书，只要证书覆盖各自的 SNI 即可。不同节点要用不同证书时，用 `singr add --cert-path` 单独指定。写了具体路径的节点不受默认路径影响。
+
+测试时可以先用自签证书，客户端需要开启「允许不安全证书」：
+
+```sh
+mkdir -m 700 -p /etc/singr/certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout /etc/singr/certs/default.key \
+  -out    /etc/singr/certs/default.pem -subj "/CN=example.com"
+```
+
+### 续期：替换文件即可，无需重启
+
+SingR 会监视证书所在的目录，文件一变就自动加载新证书，不需要重启，也不需要给 certbot 配 `--deploy-hook`。
+
+- 裸机和 Docker 都直接读取你给的证书路径，不会另外复制一份。
+- Docker 会把证书所在目录按原路径只读挂进容器（certbot 的 `live/` 软链指向的 `archive/` 目录也会一起挂上）。证书路径改了以后执行 `singr restart`，容器会按新路径重建。
+- 证书请放在单独的目录里。`/etc`、`/usr`、`/tmp` 这类系统目录不能直接挂进容器。
+
+> **例外：** 如果 `certs/default.pem` 是指向 certbot 证书的软链，续期时变化发生在 certbot 的 `live/` 目录，`certs/` 目录本身没变，所以监视不到。这种情况请直接把 certbot 的路径写进配置（`singr add --cert-path`），或者继续在 certbot 里配 `--deploy-hook "singr restart"`。
+
+### 从 https 地址自动更新默认证书
+
+证书由别的机器统一签发、通过 https 分发时，可以让 SingR 自己下载：
 
 ```sh
 singr cert-source --cert-url https://example.com/a.pem --key-url https://example.com/a.key
 ```
 
-- 立即下载一次，校验通过（是有效证书、没过期、和私钥配对）才放进默认路径。
-- 装一个每天跑一次的 systemd timer（`singr-cert-update.timer`）：本地证书**剩余不足
-  7 天**才去下载，远端比本地新才替换。**只换文件、不重启**：运行中的进程会自动重新加载，
-  用其他证书的节点完全不受影响。
-- 地址存在 `cert-source.json`（权限 600，地址里可以带 token），只接受 `https://`。
-- 只管默认证书，显式写了证书路径的节点不受影响。
-- 管理菜单第 15 项「默认证书更新源」可以查看状态、更换、立即更新或清除；
-  `singr cert-update --force` 不看剩余天数立即更新。
+- 设置后立即下载一次。只有证书有效、没过期、和私钥配对，才会放进默认路径。
+- 之后每天检查一次（systemd timer `singr-cert-update.timer`）。本地证书剩余不足 7 天时才去下载，远端证书比本地新才替换。
+- 只替换文件，不重启进程，用其他证书的节点不受影响。
+- 只管默认证书，写了具体路径的节点不受影响。
+- 只接受 `https://` 地址。地址存放在 `cert-source.json`（权限 600），里面可以带 token。
+- 安装时可以直接带上：`install-docker.sh ... --cert-url URL --key-url URL`，或 `singr add ... --cert-url URL --key-url URL`。不能和 `--cert-path` 同时使用。
 
-装机时可以直接带上：`install-docker.sh ... --cert-url URL --key-url URL`，或
-`singr add ... --cert-url URL --key-url URL`（与 `--cert-path` 二选一）。
+---
 
-#### 从旧版 Docker 升级
+## Hysteria2
 
-旧版 Docker 是把证书**复制**进 `/etc/singr-docker`，再靠 `certs.json` + `singr cert-sync`
-在重启前重新复制。升级管理脚本后第一次执行任意 `singr` 命令会自动迁移：
+下面这些参数面板下发不了，需要写在本地 `server.json` 的 `hysteria2-in` 入站里。
 
-- 用 `--cert-path` 添加的节点改为直接引用原来的证书源，容器重建后挂载源目录；旧副本
-  收进 `certs/.migrated-<时间>/`。
-- 证书源已不存在的节点、以及用默认证书的节点（首次安装带 `--cert-path` 的就是这种），
-  迁移后**不再自动续期**。它们会记在 `/etc/singr-docker/cert-migration-notice.txt`，
-  `singr list` 也会提示。处理方法：`singr cert-source` 配置更新源，或用 `singr config`
-  把证书路径写成 certbot 的原路径后 `singr restart`。
-- `singr cert` / `singr cert-sync` 已删除；certbot 里残留的 `--deploy-hook "singr cert-sync"`
-  不会报错，可以顺手删掉。
+### obfs（默认开启）
 
-## Docker 部署
+默认模板里已经写好：
 
-除裸机 systemd 安装外，SingR 还提供 Docker 镜像，发布在 **`ghcr.io/makt28/singr`**
-（多架构 `linux/amd64` + `linux/arm64`）。
-
-- 稳定版：`ghcr.io/makt28/singr:latest`（发 Release 后自动更新），也可锁定
-  `:vX.Y.Z`。
-- 配置目录 `/etc/singr-docker`，与裸机的 `/etc/singr` **完全隔离**，互不影响，
-  一台机器二选一即可。
-
-> **证书是必须的（三种方式通用）**：和裸机二进制一致，没有 TLS 证书容器不会
-> 启动。放到默认路径即可：
-> ```sh
-> mkdir -m 700 -p /etc/singr-docker/certs
-> cp fullchain.pem /etc/singr-docker/certs/default.pem   # .crt 后缀也认
-> cp privkey.pem   /etc/singr-docker/certs/default.key
-> ```
-> 也可以自签测试证书（生产建议用真证书，anytls/hy2 对 TLS 指纹敏感）：
-> ```sh
-> openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
->   -keyout /etc/singr-docker/certs/default.key \
->   -out    /etc/singr-docker/certs/default.pem -subj "/CN=example.com"
-> ```
-
-### 方式一：管理脚本一键（推荐）
-
-自动装 docker、拉镜像、建容器，并装上与裸机**完全一致**的 `singr` 管理命令
-（`singr start/stop/restart/config/log/update/porthop`），底层驱动的是容器而非
-systemd。
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/install-docker.sh) \
-  --api-url https://your-sspanel.example.com \
-  --api-key your-apikey \
-  --node-id 44 \
-  --protocol anytls \        # 或 hysteria2
-  --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
-  --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
-# 证书也可以用 --cert-url/--key-url 从 https 地址下载（见「默认证书的远程更新源」），
-# 或者都不给、之后放到默认路径再 singr restart
+```json
+"obfs": { "type": "salamander", "password": "" }
 ```
 
-之后的管理和裸机无差别：
+- `password` 留空：用 TLS SNI（面板下发的 `host=`）作为密码。
+- 填了值：用填的值。
+- 删掉整个 `obfs` 块：关闭 obfs。
+
+开着 obfs 时，所有客户端都必须带上相同的 obfs 设置，否则完全连不上。订阅里加上 `obfs=salamander&obfs-password=<SNI 或你填的值>`。
+
+另一种混淆 `gecko` 会把 UDP 包切片填充，用来对抗按包长分析的封锁。用它时**必须显式填 `password`**：留空不会自动用 SNI，混淆会静默失效，也不报错。没遇到按包长封锁的话，继续用 salamander 就行。
+
+### 带宽 `up_mbps` / `down_mbps`
+
+这两个值是 **上限**：实际速率取它和客户端自报值中较小的那个。默认 `300`。
+
+- 千兆节点想跑满，就调大。
+- `0` 表示不设上限，客户端报多少就按多少发（Brutal 拥塞控制不管丢包），所以 `0` 不是保守值。
+- 面板的限速（`node_speedlimit`）在此基础上仍然生效。
+- 已经装好的机器保留原来 `server.json` 里的值，新增节点会沿用第一个 hysteria2 入站的设置。
+
+### 端口跳跃
+
+Hysteria2 只监听一个 UDP 端口，端口跳跃靠防火墙把一段端口转发到这个真实端口。
+
+推荐用 `singr porthop`（菜单第 13 项）：输入起始端口、结束端口和真实端口，脚本会同时写好 IPv4 和 IPv6 规则，并在开机时自动恢复。它只管理带 `singr-porthop` 标记的规则，不会动你的其他防火墙规则。
+
+也可以手动加规则（手动加的规则 `singr porthop` 不会管理）：
 
 ```sh
-singr config     # 改 /etc/singr-docker/panel.json，自动 docker restart
-singr log        # docker logs -f
-singr update     # 拉最新镜像重建容器（也可 singr update v0.6.0 指定版本）
-singr porthop    # Hysteria2 端口跳跃
-singr uninstall  # 删容器 + 配置 + 端口跳跃规则
+iptables  -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
+ip6tables -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
 ```
 
-### 方式二：直接 docker run（soga 风格）
+订阅地址写成区间，例如 `hysteria2://<uuid>@host:40000-60000/?sni=...`。如果前面的中转已经在做端口跳跃，落地机上就不要再加。
 
-不装管理脚本，纯 `docker run` + 环境变量：
+### realm：不要开
+
+realm 用于服务器在 NAT 后、没有公网端口的场景。SingR 节点一般有公网 IP，用不上。而且面板每次修改端口或 SNI，realm 都会重新注册一遍，修改 SNI 时还会短暂中断，所以不建议开启。
+
+更多部署示例见 [release/poet/hysteria2.md](release/poet/hysteria2.md)。
+
+---
+
+## 常见问题
+
+**启动后没有监听端口**
+
+- 节点地址里是否有 `ws` 和 `path=/anytls`（或 `/hy2`）。
+- `panel.json` 的 `intag` 是否和 `server.json` 里的入站 `tag` 一致（`singr list` 显示 `无 inbound` 就是不一致）。
+- 日志出现 `invalid anytls listen port from panel` 或 `invalid hysteria2 listen port from panel`，说明面板返回的端口是 0 或超出范围。
+- Hysteria2 走 UDP，用 `ss -lunp | grep singr` 查看（注意是 `-u`）。
+
+**面板连接失败**
+
+- `apihost` 在服务器上能否访问。`apihost` 不要以 `/mod_mu` 结尾。
+- `apikey` 和 `nodeid` 是否正确。
+- 服务器是否设置了 `http_proxy`、`ALL_PROXY` 这类代理环境变量。有的话需要清掉。
+
+**客户端 TLS 失败**
+
+- 客户端 SNI 是否等于节点地址里的 `host=`，证书是否覆盖这个域名。
+- 用自签证书时，客户端是否开启了「允许不安全证书」。
+
+**用户认证失败**
+
+- 密码要填用户的 UUID（UUID 为空时才用 passwd）。
+- Hysteria2 还要检查 obfs 是否和服务端一致。
+
+**节点出口没有 IPv6**
+
+- 先确认服务器本身有 IPv6：`curl -6 ifconfig.co`。
+- `server.json` 的 `direct` 出站需要 `"domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }`，`dns` 需要 `"strategy": "prefer_ipv6"`，`route.auto_detect_interface` 需要是 `false`。默认配置都已经写好，删掉的话出口会只走 IPv4。
+
+---
+
+## 升级注意
+
+- **0.6.0（核心 1.14）起**：`direct` 出站的旧字段 `domain_strategy` 会导致无法启动。`singr update` 会自动把它迁移成 `domain_resolver`，迁移前会备份成 `server.json.bak.<时间戳>`。如果升级时看到 `未安装 jq，跳过 server.json 迁移` 的警告，说明没迁移成功，**先别重启**，手动改好再启动。
+- **旧版 Docker（证书靠复制 + `singr cert-sync`）**：升级管理脚本后，第一次执行任意 `singr` 命令会自动迁移成「直接引用原证书路径」。原证书已经不存在的节点，以及使用默认证书的节点，迁移后不会再自动续期，会记录在 `/etc/singr-docker/cert-migration-notice.txt`，`singr list` 也会提示。处理办法：用 `singr cert-source` 设置下载地址，或用 `singr config` 把证书路径改成 certbot 的原始路径后 `singr restart`。certbot 里残留的 `--deploy-hook "singr cert-sync"` 不会报错，可以删掉。
+
+---
+
+## 进阶
+
+### 安装脚本选项
+
+```sh
+bash install.sh                                        # 优先用当前目录的二进制，没有就从源码编译
+bash install.sh v0.7.0                                 # 从 GitHub Release 安装指定版本
+env SINGR_BINARY=/path/to/sing-box bash install.sh     # 使用指定的二进制
+env SINGR_RELEASE_REPO=owner/repo bash install.sh v0.7.0   # 从 fork 的 Release 安装
+```
+
+安装位置：二进制在 `/usr/local/SingR/singr`，管理命令在 `/usr/bin/singr`，配置在 `/etc/singr/`，另外会生成 `singr.service`。已有的配置文件不会被覆盖。脚本还会安装 `jq`、`vim`、`iptables`。
+
+### Docker 的另外两种用法
+
+镜像地址是 `ghcr.io/makt28/singr`，支持 amd64 和 arm64。`:latest` 跟随正式发布，也可以用 `:vX.Y.Z` 固定版本。
+
+**直接 `docker run`**（不装管理脚本）：
 
 ```sh
 docker run -d --name singr \
@@ -291,118 +327,84 @@ docker run -d --name singr \
   ghcr.io/makt28/singr:latest
 ```
 
-管理用原生命令：`docker logs -f singr` / `docker restart singr` / `docker pull ... && docker rm -f singr && <重新 run>`。
+**docker compose**：修改仓库里 [`docker-compose.yml`](docker-compose.yml) 中的 `SINGR_*`，证书放在 `singr-data/certs/default.pem` 和 `default.key`，然后执行 `docker compose up -d`。
 
-### 方式三：docker compose
+参数对照（安装脚本参数 ↔ 环境变量）：
 
-仓库根目录有 [`docker-compose.yml`](docker-compose.yml)，改好里面的 `SINGR_*`
-后：
-
-```sh
-mkdir -p singr-data/certs   # 证书放 singr-data/certs/default.pem 与 default.key
-docker compose up -d
-docker compose logs -f
-```
-
-### 参数 / 环境变量对照
-
-flag（方式一）与 `SINGR_*` 环境变量（方式二/三）一一对应，任选其一：
-
-| flag | 环境变量 | 说明 | 默认 |
+| 参数 | 环境变量 | 说明 | 默认 |
 | --- | --- | --- | --- |
-| `--api-url` | `SINGR_API_URL` | 面板 apihost（必填） | |
+| `--api-url` | `SINGR_API_URL` | 面板地址（必填） | |
 | `--api-key` | `SINGR_API_KEY` | 面板 apikey（必填） | |
 | `--node-id` | `SINGR_NODE_ID` | 节点 ID（必填） | |
 | `--protocol` | `SINGR_PROTOCOL` | `anytls` 或 `hysteria2`（必填） | |
 | `--sni` | `SINGR_SNI` | 入站 `server_name` | 空 |
-| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书/私钥路径。方式一里是宿主机路径，脚本按原路径挂进容器；方式二/三里是容器内路径，挂载要自己做 | 空 = 用默认路径 `certs/default.pem` + `default.key` |
-| `--cert-url` / `--key-url` | （无） | 仅方式一：下载为默认证书并每日检查更新，与 `--cert-path` 二选一 | |
+| `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书路径。用安装脚本时填宿主机路径；用 `docker run` / compose 时填容器内路径，需要自己挂载 | 空，即使用默认路径 |
+| `--cert-url` / `--key-url` | — | 仅安装脚本支持，见「证书」 | |
 | `--speed-limit` / `--device-limit` | `SINGR_SPEED_LIMIT` / `SINGR_DEVICE_LIMIT` | 限速 / 设备数 | 0 |
-| `--enable-device-limit` | `SINGR_ENABLE_DEVICE_LIMIT` | 是否硬限设备 | false |
+| `--enable-device-limit` | `SINGR_ENABLE_DEVICE_LIMIT` | 是否强制限制设备数 | false |
 | `--update-periodic` | `SINGR_UPDATE_PERIODIC` | 面板同步周期（秒） | 60 |
-| `--image` | —— | 镜像地址（仅方式一） | `ghcr.io/makt28/singr:latest` |
+| `--image` | — | 镜像地址（仅安装脚本） | `ghcr.io/makt28/singr:latest` |
 
-三种方式共同点：`--network=host`（面板动态下发端口、Hysteria2 走 UDP，必须
-host 网络）、日志走 stdout（`docker logs` 查看，配合 `--log-opt` 轮转）。首次
-启动用上面的参数生成 `/etc/singr-docker/panel.json`，**之后配置以该文件为准**
-（改文件 + 重启即可，参数只做首次引导），更新/重建容器配置不丢。
+说明：
 
-Hysteria2 端口跳跃是宿主机 iptables NAT（host 网络下容器与宿主机共享网络栈），
-方式一用 `singr porthop` 管理。方式二/三没有装管理脚本，可以只把脚本取下来用
-（**不要**再跑一次 `install-docker.sh`：它检测到已有 `/etc/singr-docker/panel.json`
-会直接拒绝，因为重复安装不会让新参数生效，却会先删掉正在服务的容器）：
+- 必须用 host 网络：端口由面板下发，Hysteria2 还要走 UDP。
+- 上面的参数只在第一次启动时用来生成 `/etc/singr-docker/panel.json`，之后一律以这个文件为准。
+- 要加节点请用 `singr add`。不要重跑 `install-docker.sh`：它检测到已安装会直接拒绝。
+- 不装管理脚本的话，也可以单独下载它来用 `singr porthop`：
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/SingR-docker.sh -o /usr/bin/SingR
-chmod +x /usr/bin/SingR && ln -sf /usr/bin/SingR /usr/bin/singr
-```
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/SingR-docker.sh -o /usr/bin/SingR
+  chmod +x /usr/bin/SingR && ln -sf /usr/bin/SingR /usr/bin/singr
+  ```
 
-或者直接手动配 iptables。
+### 手动编译和运行
 
-> 首次启动的参数只做引导，**之后一切以 `/etc/singr-docker/panel.json` 为准**。要加
-> 节点请用 `singr add`（见上面「多节点」），不要重跑安装脚本。
-
-## 手动编译安装
-
-克隆或上传源码后，在项目根目录执行：
+需要 Go 1.25.5 或更高版本（发布构建用的是 1.26.8）。
 
 ```sh
-git clone https://github.com/makt28/SingR.git
-cd SingR
-go mod download
+git clone https://github.com/makt28/SingR.git && cd SingR
 make build
-```
-
-编译完成后会在当前目录生成 `sing-box` 二进制。建议安装为 `/usr/local/bin/singr`：
-
-```sh
 install -m 755 ./sing-box /usr/local/bin/singr
+mkdir -p /etc/singr/certs
+cp release/poet/panel_anytls.json /etc/singr/panel.json   # 用 hysteria2 就换成 panel_hysteria2.json
+cp release/poet/server.json       /etc/singr/server.json
+/usr/local/bin/singr run -c /etc/singr/server.json -p /etc/singr/panel.json
 ```
 
-创建配置目录：
+<details>
+<summary>systemd 服务示例</summary>
+
+```ini
+[Unit]
+Description=SingR SSPanel backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/singr run -c /etc/singr/server.json -p /etc/singr/panel.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+# 系统带了代理环境变量时，在这里清空：
+# Environment="http_proxy=" "https_proxy=" "HTTP_PROXY=" "HTTPS_PROXY=" "ALL_PROXY=" "all_proxy="
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```sh
-mkdir -p /etc/singr/certs /var/log
+systemctl daemon-reload && systemctl enable --now singr
 ```
 
-复制示例配置：
+</details>
 
-```sh
-cp release/poet/panel_anytls.json /etc/singr/panel.json
-cp release/poet/server.json /etc/singr/server.json
-```
+### 配置文件说明
 
-`release/poet/server.json` 是 anytls + hysteria2 的超集；`panel.json` 决定实际启用哪个（见上文「一份 server.json 同时支持两种协议」）。只想跑 anytls 的话，`panel_anytls.json` 即可；要跑 hysteria2 用 `panel_hysteria2.json`。
-
-## 配置 SSPanel 节点
-
-在 SSPanel 中把节点类型保持为 `V2ray`，节点地址填写旧格式：
-
-```text
-你的节点域名;监听端口;0;ws;;path=/anytls|host=TLS域名
-```
-
-例如：
-
-```text
-sa.example.com;14555;0;ws;;path=/anytls|host=example.com
-```
-
-如果你需要保留 relay 元数据，可以追加：
-
-```text
-sa.example.com;14555;0;ws;;path=/anytls|host=example.com|relay_server=relay.example.com|relay_port=42132
-```
-
-注意：`relay_server` 和 `relay_port` 目前只会被解析保存，不会自动接管转发逻辑。
-
-## 配置面板连接
-
-编辑 `/etc/singr/panel.json`：
+**`panel.json`**：每个节点对应 `nodes` 里的一项。`singr add` 会自动写好，一般不需要手改。
 
 ```json
 {
-  "name": "connect old sspanel v2ray node and run it as anytls",
   "nodes": [
     {
       "paneltype": "SSpanel",
@@ -420,107 +422,38 @@ sa.example.com;14555;0;ws;;path=/anytls|host=example.com|relay_server=relay.exam
 }
 ```
 
-字段说明：
+- `intag`：必须和 `server.json` 里某个入站的 `tag` 一致。`outtag`：对应的出站 `tag`。
+- Hysteria2 节点就把这两项换成 `hysteria2-in` / `hysteria2-out`。
+- `nodes` 里的每个节点都必须是面板上真实存在的节点，任何一个拉取失败，整个进程都会退出。
 
-- `paneltype`：旧 SSPanel 使用 `SSpanel`。
-- `intag`：必须和 sing-box 主配置里的入站 `tag` 一致（AnyTLS 用 `anytls-in`，Hysteria2 用 `hysteria2-in`）。
-- `outtag`：对应路由使用的出站 `tag`。
-- `apihost`：SSPanel 地址，不要以 `/mod_mu` 结尾。
-- `apikey`：面板 API Key。
-- `nodeid`：SSPanel 节点 ID。
-- `nodetype`：保持为 `V2ray`（AnyTLS / Hysteria2 都是）。
+**`server.json`**：默认同时写好了 `anytls-in` 和 `hysteria2-in` 两个入站，但只有被 `panel.json` 引用到的入站才会真正启动。没用到的入站不需要证书，也不占端口。所以 **换协议或加协议只需要改 `panel.json`**。
 
-Hysteria2 节点只是把 `intag`/`outtag` 换成 `hysteria2-in`/`hysteria2-out`，其余字段一样（`nodeid` 当然是各自面板节点的 ID）。
-
-### 多节点 / 多协议共存
-
-`nodes` 是数组，一个 SingR 进程可以同时跑多个节点，甚至混协议。例如同机同时跑一个 AnyTLS 和一个 Hysteria2 节点：
+<details>
+<summary>默认 server.json</summary>
 
 ```json
 {
-  "name": "singr",
-  "nodes": [
-    {
-      "paneltype": "SSpanel", "intag": "anytls-in", "outtag": "anytls-out",
-      "apiconfig": { "apihost": "https://panel.example.com", "apikey": "key", "nodeid": 1, "nodetype": "V2ray", "disablecustomconfig": true }
-    },
-    {
-      "paneltype": "SSpanel", "intag": "hysteria2-in", "outtag": "hysteria2-out",
-      "apiconfig": { "apihost": "https://panel.example.com", "apikey": "key", "nodeid": 2, "nodetype": "V2ray", "disablecustomconfig": true }
-    }
-  ]
-}
-```
-
-注意：**`nodes` 里的每个节点都必须是面板上真实存在、能拉取到信息的节点**。只要有任意一个节点拉取失败，整个进程会退出。所以默认只放你实际在用的节点，要加再加。
-
-SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`，兼容 XrayR v0.9.0 的旧接口行为。
-
-## 配置 sing-box 入站
-
-默认的 `/etc/singr/server.json` 是 **anytls + hysteria2 超集**，两个入站都声明好，`tag` 分别是 `anytls-in` / `hysteria2-in`，和 `panel.json` 的 `intag` 对应。**实际只创建被 `panel.json` 引用到的入站**，没用到的那个不会创建、不需要证书、不占端口：
-
-```json
-{
-  "log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true,
-    "output": "/var/log/singr.log"
-  },
+  "log": { "disabled": false, "level": "info", "timestamp": true, "output": "/var/log/singr.log" },
   "dns": {
-    "servers": [
-      { "tag": "google", "type": "udp", "server": "8.8.8.8" }
-    ],
+    "servers": [{ "tag": "google", "type": "udp", "server": "8.8.8.8" }],
     "strategy": "prefer_ipv6"
   },
   "inbounds": [
     {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": 0,
-      "users": [],
-      "tls": {
-        "enabled": true,
-        "server_name": "",
-        "certificate_path": "",
-        "key_path": ""
-      }
+      "type": "anytls", "tag": "anytls-in", "listen": "::", "listen_port": 0, "users": [],
+      "tls": { "enabled": true, "server_name": "", "certificate_path": "", "key_path": "" }
     },
     {
-      "type": "hysteria2",
-      "tag": "hysteria2-in",
-      "listen": "::",
-      "listen_port": 0,
-      "users": [],
-      "up_mbps": 300,
-      "down_mbps": 300,
-      "ignore_client_bandwidth": false,
-      "tls": {
-        "enabled": true,
-        "server_name": "",
-        "certificate_path": "",
-        "key_path": ""
-      }
+      "type": "hysteria2", "tag": "hysteria2-in", "listen": "::", "listen_port": 0, "users": [],
+      "up_mbps": 300, "down_mbps": 300, "ignore_client_bandwidth": false,
+      "obfs": { "type": "salamander", "password": "" },
+      "tls": { "enabled": true, "server_name": "", "certificate_path": "", "key_path": "" }
     }
   ],
   "outbounds": [
-    {
-      "type": "direct",
-      "tag": "anytls-out",
-      "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }
-    },
-    {
-      "type": "direct",
-      "tag": "hysteria2-out",
-      "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }
-    },
-    {
-      "type": "direct",
-      "tag": "direct",
-      "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }
-    }
+    { "type": "direct", "tag": "anytls-out",    "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" } },
+    { "type": "direct", "tag": "hysteria2-out", "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" } },
+    { "type": "direct", "tag": "direct",        "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" } }
   ],
   "route": {
     "rules": [
@@ -533,301 +466,39 @@ SingR 请求旧 SSPanel 时会同时带上 `key=<apikey>` 和 `muKey=<apikey>`�
 }
 ```
 
-> 这个「只创建被引用的入站」是 SingR 行为，要带 `-p`（panel 配置）才生效；不带 `-p` 就是原版 sing-box，所有入站都创建。如果 `panel.json` 引用了 `server.json` 里不存在的 `intag`，那个节点会被跳过，全部跳过则进程报错退出。
+</details>
 
-启动时，如果面板节点被识别为 AnyTLS / Hysteria2 兼容模式：
+### 面板改端口或 SNI 时会怎样
 
-- 如果 SSPanel 节点地址里解析到有效端口，`listen_port` 会被该端口覆盖。
-- 如果 SSPanel 节点地址里存在非空 `host=`，`tls.server_name` 会被该值覆盖。
-- 证书路径和私钥路径仍然来自本地 `server.json`，不会从面板获取。
+不用重启，SingR 会自动应用：
 
-也就是说，本地 JSON 可以先写默认值；只有面板对应字段非空、有效时才会替换本地值。
+- **AnyTLS**：先在新端口上开始监听，成功后再关掉旧端口；失败就保留旧配置。只改 SNI 时只换 TLS 配置，连接不受影响。
+- **Hysteria2**：会重建整个服务，并自动恢复用户表。只改 SNI（端口不变）时会短暂中断一下。
 
-从 0.2.5 起，面板的 `port` 和 `host=` 改动支持运行中热更新。
+以下内容不随面板变化，需要改本地配置并重启：入站协议类型、路由规则、obfs、带宽、端口跳跃。证书文件的内容变化会自动加载，见「证书」。
 
-- AnyTLS：端口变化时先在新端口起 listener、成功后才关旧端口（失败自动回滚）；SNI 变化只重建 TLS、不重启 listener。日志 `anytls listener hot-reloaded to port ...` / `anytls TLS hot-reloaded with SNI ...`。
-- Hysteria2：因为 TLS 焊在 QUIC service 里，端口/SNI 变化会**重建整个 service**并把当前用户表重新灌进去（端口变化先起新后关旧；同端口仅 SNI 变化要先关旧再起新，有极短重启窗口）。日志 `hysteria2 listener hot-reloaded to port ...` / `hysteria2 TLS hot-reloaded with SNI ...`。
+### AnyTLS padding（抗指纹）
 
-**面板热更新不涉及证书材料、入站类型、路由规则、obfs/带宽/masquerade/realm。**（证书文件本身变了，进程会自动重新加载，见「证书续期」。）
-
-### AnyTLS padding 方案（抗指纹）
-
-AnyTLS 入站支持在 `server.json` 里设置 `padding_scheme`，用来打乱记录长度分布、削弱指纹：
+在 `anytls-in` 入站里加一行：
 
 ```json
-{
-  "type": "anytls",
-  "tag": "anytls-in",
-  "padding_scheme": ["random"]
-}
+"padding_scheme": ["random"]
 ```
 
-三种取值：
+- `["random"]`：每次启动随机生成一套 padding 方案，避免所有节点用同一套公开的默认方案。
+- 填其他内容：按你写的方案使用。
+- 不写：使用默认方案。
 
-- **`["random"]`**（不区分大小写的哨兵值）：进程**每次启动**随机合成一套 padding 方案。这样每个默认节点不再共用同一套公开默认方案的指纹（长度分布 / md5）。方案的 md5 会在 debug 日志打印。
-- **任意其它非空列表**：按写入内容逐行拼接，作为自定义方案原样使用。
-- **留空 / 不写**：使用 sing-box fork 内置的公开默认方案。
+只需要配服务端，客户端会自动同步。padding 不计入用户流量，也不影响限速。它只能打乱默认方案带来的特征，不能隐藏协议本身是 AnyTLS。
 
-要点：
+### 其他说明
 
-- **服务端权威，客户端自动同步。** 服务端在握手 settings 帧里比对客户端的 `padding-md5`，不一致时主动把自己的方案推给客户端，所以只需配置服务端，客户端下次会话自动更新——这也是「每次启动随机」不需要改客户端的原因。
-- **在 `NewService` 时定型，不参与热更新。** AnyTLS 热更新只换 listener/TLS，方案在进程生命周期内固定，只有重启才变化（正好就是「每次启动」语义）。
-- **不影响流量计费和性能。** padding 帧在子流计数器和限速之下，既不计费也不限速；开销集中在每个会话的前几条记录，之后为零。
-- 只随机化「公开默认方案」这一个指纹，**不隐藏协议本身是 AnyTLS**。稳定的自定义方案同样是合理选择；跨重启变化的形状本身也是一种轻微特征。
+- 用户在节点上的名字是 `u<用户ID>`。新增、删除用户和改密码都会实时生效；删除用户前会先上报他剩余的流量。
+- 流量上报到 `/mod_mu/users/traffic`，在线 IP 上报到 `/mod_mu/users/aliveip`。请求同时带 `key` 和 `muKey` 两个参数，兼容 XrayR 用的旧接口。
+- 运行测试：`go test ./poet/... ./cmd/sing-box`。
 
-### 出口 IPv6
-
-默认配置里的 `direct` 出站都设了 `domain_resolver: { "server": "google", "strategy": "prefer_ipv6" }`（sing-box 1.12 起的新写法；老的出站 `domain_strategy` 字段自核心 1.14 起会被运行时直接拒绝，节点无法启动），并配了 `dns.strategy: prefer_ipv6`。如果你删掉这些字段，sing-box 的串行拨号会在第一个 IPv4 命中后立刻返回，节点出口会退化成 IPv4 only。需要纯 v4 才把 `prefer_ipv6` 换成 `prefer_ipv4` 或显式 `ipv4_only`。
-
-`auto_detect_interface` 在服务器端建议保持 `false`，它是给 client/TUN 场景用的；开着会把 outbound socket 强行绑到默认网卡，并在某些 IPv6-only 目的地下失效。
-
-## Hysteria2 专属说明
-
-Hysteria2 走 QUIC/UDP，和 AnyTLS 有几处不同，这些参数面板下发不了，只能写在本地 `server.json`：
-
-- **必须 TLS**。Hysteria2 没有明文模式，证书放在 `hysteria2-in` 的 `tls` 里。自签证书时客户端要开允许不安全。
-- **obfs（抗 DPI，默认开启，用 SNI 当密码）**。它把 UDP 包打乱让流量不像裸 QUIC，密码是**全节点共享的一个值**（不是 per-user）。默认模板里 obfs 块就写好了，`password` 留空：
-
-  ```json
-  "obfs": { "type": "salamander", "password": "" }
-  ```
-
-  规则:**`password` 留空 → 自动用 TLS SNI(`server_name`,即面板下发的 `host=`)当 obfs 密码;写了具体值 → 用写的那个。** 这样 SSPanel 不用额外字段也能"顺带"下发 obfs 密码。
-
-  ⚠️ **obfs 开着,所有客户端就必须带相同 obfs**,否则连不上(obfs 不匹配 = 彻底连不上,不是降级)。订阅里要同步带 `obfs=salamander&obfs-password=<SNI 或你写的值>`。**完全不想用 obfs,就把整个 `obfs` 块删掉**(删掉才是关闭;留着空密码是"用 SNI 开启")。
-
-  核心 1.14 起还有第二种混淆 `gecko`（`"type": "gecko"`，可选 `min_packet_size` / `max_packet_size`）。它和 salamander 的区别是：salamander 只打乱字节、**不改包长**；gecko 会把每个 UDP 包切成 2–8 个分片并填充（默认 512–1200 字节），改变的是**包长分布**，对抗按包长做的流量分析，代价是流量放大和对端重组开销。
-
-  ⚠️ **上面"空密码自动用 SNI"的规则只对 salamander 生效。** `gecko` 走原生逻辑，**密码留空 = 混淆静默失效**（配置看着是开的，实际没启用，也没有日志）。用 gecko 必须显式写 `password`。除非你确实遇到了按包长的封锁，否则建议继续用 salamander——它能靠 SNI 免配置下发密码。
-- **`realm`（核心 1.14 新增，SingR 不建议开）**。这是给「服务端在 NAT 后面、没有公网端口」的场景做打洞用的：需要你自己搭一台 realm control server，服务端向它注册、用 STUN 发现公网地址、可选 UPnP/NAT-PMP 开端口。SingR 节点通常是有公网 IP 的 VPS，用不上；面板也下发不了这个配置。
-  ⚠️ 更要紧的是它**和面板热重载冲突**：realm 是在构建 QUIC service 时创建的，而面板每次改端口或 `host=`（SNI）都会重建整个 service，于是**每次都会重跑一遍 STUN、重新注册、重做端口映射**；只改 SNI 时还会先关旧服务腾出 UDP 端口，中间有一段没有 realm 会话且无法回滚的真空期。要用就把面板侧端口和 `host=` 固定死。
-- **带宽 `up_mbps` / `down_mbps`**：这两个值是**上限**，不是目标速率——实际速率取「客户端自报值」与它的较小者：下行（服务端→客户端）按 `min(客户端自报下载, up_mbps)` 跑 Brutal，上行按 `min(down_mbps, 客户端自报上传)` 跑 Brutal（客户端自报 0 则退回 BBR）。
-
-  `0` = **上限无穷大**，完全听客户端的：一个自报 1000 Mbps 的客户端就真会按 Brutal 1000 Mbps 定速发包（Brutal 无视丢包）。所以 `0` 是没有护栏的那个值，不是"保守"的那个。默认模板给的是 `300`，即把每个客户端的 Brutal 速率按到 300 Mbps 以内；千兆节点想跑满就自行调大，想完全放开才填 `0`。
-
-  面板的 `node_speedlimit` 仍然独立生效（每用户限速叠加在 Hysteria2 自身拥塞控制之上）。
-- **端口跳跃（可选，纯运维，代码不管）**。Hysteria2 进程只绑 1 个 UDP 端口；端口跳跃是用防火墙把一段端口 NAT 到真实端口实现的。
-
-  **推荐用内置管理器**：`SingR porthop`（或管理菜单第 13 项），输入 起始端口 / 结束端口 / 目标（真实）端口即可，自动下 v4+v6 的 REDIRECT 规则、写进 `/etc/singr/porthop.rules`，并由生成的 `singr-porthop.service` 开机重放。规则都带 `singr-porthop` 的 iptables comment 标记，所以列出 / 删除只动 SingR 自己的规则，不碰你其它防火墙规则；持久化由 SingR 自管，不依赖 `iptables-persistent` / `iptables-services`。
-
-  也可以手动下规则：
-
-  ```sh
-  iptables  -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
-  ip6tables -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports <真实端口>
-  ```
-
-  `<真实端口>` 就是面板下发的那个监听端口。然后订阅地址写成区间，例如 `hysteria2://<uuid>@host:40000-60000/?sni=...`。范围别和真实端口或其它服务冲突；如果前面已有中转（如 nyanpass）在做端口跳跃，就别在落地再加这条 NAT，让跳跃只由一层负责。手动加的规则没有 `singr-porthop` 标记，`SingR porthop` 列表里看不到、也不会去管它。
-
-更详细的部署示例见 [release/poet/hysteria2.md](release/poet/hysteria2.md)。
-
-## 准备 TLS 证书
-
-新装的 `server.json` 把 `certificate_path` / `key_path` **留空**。留空不是"没配
-证书"，而是"用默认路径"——启动时 SingR 会把空值补成配置目录下的
-
-```
-/etc/singr/certs/default.pem    # 找不到再试 default.crt
-/etc/singr/certs/default.key
-```
-
-Docker 部署同理，只是配置目录换成 `/etc/singr-docker`。所以把证书放进去就行：
-
-```sh
-mkdir -m 700 -p /etc/singr/certs
-cp fullchain.pem /etc/singr/certs/default.pem
-cp privkey.pem   /etc/singr/certs/default.key
-chmod 600 /etc/singr/certs/default.key
-```
-
-替换发生在启动时，日志里会有一行
-
-```
-inbound/anytls[anytls-in]: no TLS certificate configured, using default /etc/singr/certs/default.pem + /etc/singr/certs/default.key
-```
-
-需要按节点用不同证书时（比如多节点不同域名），用 `singr add --cert-path/--key-path`
-指定，或直接在 `server.json` 里写具体路径——**非空的路径不会被改写**，所以老机器
-升级上来什么都不用动。
-
-默认证书也可以交给 `singr cert-source` 从 https 地址自动下载、到期前自动更新，见
-「证书续期」一节。
-
-证书应覆盖 SSPanel 节点地址中的 `host=` 值。没有可信证书时可以临时使用自签证书，但客户端必须允许不安全证书或信任该证书。
-
-Hysteria2 节点同理。两个协议默认指向同一张 `default.pem`——只要它覆盖各自的 SNI 就没问题；SNI 不同就得给其中一个显式指定路径。
-
-## 启动
-
-前台运行：
-
-```sh
-env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
-  /usr/local/bin/singr run \
-  -c /etc/singr/server.json \
-  -p /etc/singr/panel.json
-```
-
-如果服务器环境没有代理变量，也可以直接运行：
-
-```sh
-/usr/local/bin/singr run -c /etc/singr/server.json -p /etc/singr/panel.json
-```
-
-确认监听端口：
-
-```sh
-ss -lntp | grep singr
-```
-
-日志默认写入：
-
-```text
-/var/log/singr.log
-```
-
-`SingR log` 会先显示最近的 systemd journal，再跟随 `/var/log/singr.log`。流量上报、在线 IP 上报和用户同步日志由 sing-box logger 写入该文件；`journalctl -u singr` 主要能看到 systemd 和标准输出/错误日志。
-
-## systemd 服务
-
-创建 `/etc/systemd/system/singr.service`：
-
-```ini
-[Unit]
-Description=SingR SSPanel backend
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/singr run -c /etc/singr/server.json -p /etc/singr/panel.json
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启用并启动：
-
-```sh
-systemctl daemon-reload
-systemctl enable --now singr
-systemctl status singr
-```
-
-查看日志：
-
-```sh
-journalctl -u singr -f
-```
-
-如果你的系统继承了本地代理环境变量，建议在 service 中加入：
-
-```ini
-Environment="http_proxy="
-Environment="https_proxy="
-Environment="HTTP_PROXY="
-Environment="HTTPS_PROXY="
-Environment="ALL_PROXY="
-Environment="all_proxy="
-```
-
-## 客户端配置要点
-
-AnyTLS / Hysteria2 客户端都需要：
-
-- 服务器地址：你的节点域名。
-- 端口：SSPanel 节点地址中的端口（Hysteria2 开了端口跳跃则填区间，如 `40000-60000`）。
-- SNI：SSPanel 节点地址中的 `host=` 值；没有 `host=` 时使用本地 `server.json` 的 `tls.server_name`。
-- 密码：SSPanel 用户的 `uuid`。
-- TLS：生产环境使用可信证书；自签证书测试时开启允许不安全证书。
-
-Hysteria2 额外：协议选 `hysteria2`；**默认服务端开着 obfs(用 SNI 当密码)**,客户端必须填 `obfs=salamander` + `obfs-password=<SNI 值>`(或服务端写死的那个值),否则连不上;带宽(up/down)由客户端自填,不影响连通。
-
-## 用户同步和上报
-
-SingR 会从旧 SSPanel 拉取用户列表，并把用户映射成运行时用户名：
-
-```text
-u<用户ID>
-```
-
-例如用户 ID `40493` 会显示为 `u40493`。
-
-已支持（AnyTLS 和 Hysteria2 共用同一套逻辑）：
-
-- 新增和删除用户热更新（增量）。删除用户前会先把累计流量上报到面板。
-- 已有用户的 UUID/password 变化热更新。
-- 节点 `port` / TLS SNI (`host=`) 运行中热更新（AnyTLS 换 listener；Hysteria2 重建 QUIC service 并回灌用户表）。
-- 流量上报到 `/mod_mu/users/traffic?node_id=<nodeid>`。
-- 在线 IP 上报到 `/mod_mu/users/aliveip?node_id=<nodeid>`。
-- 多节点 / 多协议共存（`panel.json` 的 `nodes` 数组）。
-- `server.json` 写成 anytls + hysteria2 超集，按 `panel.json` 引用的 `intag` 只创建需要的入站。
-
-当前未完整接管：
-
-- `relay_server` 和 `relay_port` 不会自动创建出站和路由。
-- 不会从面板动态创建缺失的入站；`server.json` 必须先声明对应 `intag` 的入站（超集默认已含 anytls/hysteria2 两个）。
-- 不支持运行中热切换入站类型；TLS 证书路径、obfs、带宽、masquerade、realm、端口跳跃 NAT 也仍然只在启动 / 运维时配置，不随面板热更新（证书文件内容变化会自动重新加载）。
-
-## 测试
-
-运行离线测试：
-
-```sh
-go test ./poet/... ./cmd/sing-box
-```
-
-如果你有本地面板配置，可以运行集成测试：
-
-```sh
-SINGR_SSPANEL_CONFIG=/etc/singr/panel.json \
-  go test ./poet/api/sspanel -run TestIntegrationGetNodeInfo -v
-```
-
-## 常见问题
-
-### 启动后没有监听面板端口
-
-检查：
-
-- SSPanel 节点地址是否包含 `ws` 和 `path=/anytls`（或 `path=/hy2`）。
-- `/etc/singr/server.json` 是否声明了对应的入站（`type: "anytls"` 或 `type: "hysteria2"`）。
-- 入站 `tag` 是否等于 `/etc/singr/panel.json` 里的 `intag`（超集模式下：`panel.json` 没引用的入站不会创建，这是预期行为）。
-- 首次启动需要面板返回有效 `port`；日志里 `invalid anytls listen port from panel` / `invalid hysteria2 listen port from panel` 说明面板返回了 0 或越界值。
-- Hysteria2 是 UDP,用 `ss -lunp | grep singr`(注意是 `-u`)查监听;端口跳跃只是 NAT,进程仍只绑那个真实端口。
-
-### 节点出口没有 IPv6
-
-检查：
-
-- 服务器本身能否 `curl -6 ifconfig.co`。如果服务器没有 v6 GUA，无论 SingR 怎么配都没用。
-- `server.json` 的 `direct` 出站是否有 `domain_resolver: { "server": "google", "strategy": "prefer_ipv6" }`（老写法 `domain_strategy: prefer_ipv6` 已废弃），`dns` 块是否带 `strategy: prefer_ipv6`，`route.auto_detect_interface` 是否为 `false`。0.2.5 起 `singr update` 会自动迁移老配置，迁移前的备份在 `/etc/singr/server.json.bak.<时间戳>`。
-- 如果是从老版本升级上来的，第一次 `singr update` 后必须 `singr restart`。
-
-### 面板连接失败
-
-检查：
-
-- `apihost` 是否能从服务器访问。
-- `apikey` 是否正确。
-- `nodeid` 是否存在。
-- 服务器是否设置了错误的代理环境变量。必要时按启动命令清空 `http_proxy`、`https_proxy`、`ALL_PROXY` 等变量。
-
-### 客户端 TLS 失败
-
-检查：
-
-- 客户端 SNI 是否等于 SSPanel 节点地址中的 `host=`。
-- 证书是否覆盖该 SNI。
-- 自签证书测试时客户端是否允许不安全证书。
-
-### 用户认证失败
-
-AnyTLS 密码优先使用 SSPanel 用户 `uuid`。请确认客户端填写的是用户 UUID，而不是端口、passwd 或其他字段。
+---
 
 ## 许可证
 
-本项目基于 sing-box 修改，遵循上游 GPL-3.0-or-later 许可证。
+基于 sing-box 修改，遵循上游 GPL-3.0-or-later。

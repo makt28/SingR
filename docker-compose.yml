@@ -3,7 +3,7 @@
 # Equivalent to `install-docker.sh`, using env vars instead of CLI flags (the
 # entrypoint accepts either). Config, panel.json and certs live in the mounted
 # ./singr-data (= /etc/singr-docker inside). Certs are mandatory: put
-# anytls.crt/anytls.key (or hysteria2.crt/.key) under ./singr-data/certs before
+# default.pem/default.key under ./singr-data/certs before
 # `docker compose up`, or the container refuses to start (same as bare-metal).
 #
 # host networking is required: the panel delivers the listen port dynamically
