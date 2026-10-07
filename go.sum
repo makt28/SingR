@@ -211,8 +211,8 @@ github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 h1:6E+4a0GO5zZEnZ
 github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0/go.mod h1:zJYVVT2jmtg6P3p1VtQj7WsuWi/y4VnjVBn7F8KPB3I=
 github.com/makt28/sing-anytls v0.0.0-20260902232654-1958affeb467 h1:JbeaunzAAS6pYtqoPG6bc4875V+O0aenY2dCcc/jBaE=
 github.com/makt28/sing-anytls v0.0.0-20260902232654-1958affeb467/go.mod h1:7rjN6IukwysmdusYsrV51Fgu1uW6vsrdd6ctjnEAln8=
-github.com/makt28/sing-quic v0.0.0-20260902230015-3ed7bbaec392 h1:Cn3yJnQN/48IOhZKM/27oP9aoC/F722KGbvSrhXXHss=
-github.com/makt28/sing-quic v0.0.0-20260902230015-3ed7bbaec392/go.mod h1:rJFeVxbEej2iuyeCJ3drKW+p5rOgtLIW3XhZ6ty7Fig=
+github.com/makt28/sing-quic v0.0.0-20261007203005-ece0fbbf613f h1:nGqK3PmOH8yekBNNbIiqBqBTGlBYkhRDgCQEMe9hT44=
+github.com/makt28/sing-quic v0.0.0-20261007203005-ece0fbbf613f/go.mod h1:rJFeVxbEej2iuyeCJ3drKW+p5rOgtLIW3XhZ6ty7Fig=
 github.com/mattn/go-runewidth v0.0.27 h1:Feg/Oou5zI/wnpgDF6omIU0OokC9GxLC/WRknhVlIR0=
 github.com/mattn/go-runewidth v0.0.27/go.mod h1:3qAiGCV4Koz/yuveO58qUefmUTRm8r0IGEXZ9jeHp/8=
 github.com/mdlayher/netlink v1.11.2 h1:HKh2jqe+omdSWcQ88nrT7INE61B0NXfiSPFdgL4YbNI=
