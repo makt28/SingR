@@ -416,7 +416,6 @@ show_status() {
 #                                                          stdout 回显 "<certpath>|<keypath>"，其余输出走 stderr
 #   node_backend_restart                                -> 重启后端
 #   node_backend_verify                                 -> 0=确实起来了（须能识别 crash-loop）
-#   node_backend_running                                -> 0=后端当前在运行
 #   node_cert_renew_hint                                -> 打印该后端的证书续期建议
 #
 # 两种后端都原地引用证书（不复制）：server.json 写的就是证书的真实路径。docker 靠
@@ -895,8 +894,7 @@ node_add() {
                     return 1
                 fi
             else
-                # 不在这里重启：下面的 node_apply 会重启并校验。
-                cert_source_set "${cert_url}" "${key_url}" no || return 1
+                cert_source_set "${cert_url}" "${key_url}" || return 1
             fi
         fi
         eff_cert="$(node_default_cert_path)"
@@ -1221,8 +1219,6 @@ node_backend_restart() {
 
 node_backend_verify() { verify_running; }
 
-node_backend_running() { container_running; }
-
 node_cert_renew_hint() {
     echo -e "${yellow}证书续期提示：容器按原路径挂载证书所在目录，续期（certbot renew 等）后进程会"
     echo -e "自动重新加载，无需重启，也不需要 --deploy-hook（default.pem 软链到 certbot 的除外，"
@@ -1332,11 +1328,13 @@ certs_migrate() {
 #
 # 证书和私钥分别从两个 https 地址下载。地址存在 ${CERT_SOURCE}（0600：地址里常带
 # 鉴权 token），只在这里存一份。systemd timer 每天跑一次 singr cert-update：本地证书
-# 剩余不足 CERT_RENEW_DAYS 天才去下载，远端比本地新才替换，替换后重启并校验，起不来
-# 就换回旧证书。
+# 剩余不足 CERT_RENEW_DAYS 天才去下载，远端比本地新才替换。
 #
-# 依赖节点管理块里的 node_default_cert_path / node_cert_end_epoch，以及后端钩子
-# node_backend_restart / node_backend_verify / node_backend_running。
+# 只换文件，从不重启。进程监视证书所在目录（common/tls/std_server.go 的 fswatch），
+# 文件一换就自动重新加载；新证书加载失败时进程继续用内存里的旧证书。重启则会让同一
+# 进程里用别的证书的节点也一起断线 —— 默认证书的事不该牵连它们。
+#
+# 依赖节点管理块里的 node_default_cert_path / node_cert_end_epoch / node_cert_days_left。
 
 CERT_SOURCE="${CONFIG_DIR}/cert-source.json"
 CERT_TIMER="singr-cert-update"
@@ -1403,13 +1401,11 @@ cert_warn_sni() {
     done < <(cert_default_inbounds)
 }
 
-# 下载、校验并换上默认证书。
-#   mode    auto  —— 定时任务：本地剩余不足 CERT_RENEW_DAYS 天才下载，且远端须比本地新
-#           force —— 立即下载，只要和本地不是同一张就替换（首次配置、手动更新）
-#   restart yes   —— 后端在运行就重启并校验，起不来换回旧证书
-#           no    —— 只换文件（singr add 随后会自己重启校验；首次安装时容器还不存在）
+# 下载、校验并换上默认证书（只换文件，见块头）。
+#   mode  auto  —— 定时任务：本地剩余不足 CERT_RENEW_DAYS 天才下载，且远端须比本地新
+#         force —— 立即下载，只要和本地不是同一张就替换（首次配置、手动更新）
 cert_default_update() {
-    local mode="$1" restart="$2" cert_url="$3" key_url="$4"
+    local mode="$1" cert_url="$2" key_url="$3"
     local cur_cert cur_key new_cert new_key why days cur_end new_end
     command -v openssl >/dev/null 2>&1 || { echo -e "${red}[证书] 需要 openssl${plain}"; return 1; }
     command -v curl >/dev/null 2>&1 || { echo -e "${red}[证书] 需要 curl${plain}"; return 1; }
@@ -1475,7 +1471,8 @@ cert_default_update() {
     fi
     cert_warn_sni "${new_cert}"
 
-    # 留一份旧证书，重启起不来时换回去。
+    # 留一份旧证书：私钥换上了、证书却没换成时要换回去，否则磁盘上是不配对的一对，
+    # 下次启动直接起不来。
     local have_bak=0
     if [[ -s "${cur_cert}" && -s "${cur_key}" ]]; then
         cp -p "${cur_cert}" "${CERT_DIR}/.default-prev.cert" &&
@@ -1490,26 +1487,7 @@ cert_default_update() {
         echo -e "${red}[证书] 写入 ${cur_cert} 失败，已保留原证书${plain}"
         return 1
     fi
-    echo -e "${green}[证书] 已更新默认证书 ${cur_cert}（剩余 $(node_cert_days_left "${cur_cert}") 天）${plain}"
-
-    if [[ "${restart}" == "yes" ]] && node_backend_running; then
-        node_backend_restart
-        if ! node_backend_verify; then
-            echo -e "${red}[证书] 换上新证书后 ${APP_NAME} 未能正常启动${plain}"
-            if [[ "${have_bak}" == 1 ]]; then
-                mv -f "${CERT_DIR}/.default-prev.cert" "${cur_cert}"
-                mv -f "${CERT_DIR}/.default-prev.key" "${cur_key}"
-                node_backend_restart
-                if node_backend_verify; then
-                    echo -e "${yellow}[证书] 已换回旧证书，${APP_NAME} 已恢复运行。请用 singr log 查看原因${plain}"
-                else
-                    echo -e "${red}[证书] 换回旧证书后仍未能启动，请立即用 singr log 排查${plain}"
-                fi
-            fi
-            return 1
-        fi
-        echo -e "${green}[证书] ${APP_NAME} 已重启，新证书生效${plain}"
-    fi
+    echo -e "${green}[证书] 已更新默认证书 ${cur_cert}（剩余 $(node_cert_days_left "${cur_cert}") 天），运行中的进程会自动重新加载，无需重启${plain}"
     rm -f "${CERT_DIR}/.default-prev.cert" "${CERT_DIR}/.default-prev.key"
     return 0
 }
@@ -1555,9 +1533,9 @@ cert_timer_remove() {
 }
 
 # 配置（或更换）默认证书更新源并立即下载一次。下载和校验都通过才写配置；失败什么
-# 都不改。restart 见 cert_default_update。
+# 都不改。
 cert_source_set() {
-    local cert_url="$1" key_url="$2" restart="${3:-yes}" u users tmp
+    local cert_url="$1" key_url="$2" u users tmp
     node_require_jq || return 1
     for u in "${cert_url}" "${key_url}"; do
         if [[ "${u}" != https://* ]]; then
@@ -1581,7 +1559,7 @@ cert_source_set() {
         fi
     fi
 
-    cert_default_update force "${restart}" "${cert_url}" "${key_url}" || return 1
+    cert_default_update force "${cert_url}" "${key_url}" || return 1
 
     tmp="$(mktemp "${CONFIG_DIR}/.cert-source.XXXXXX")" || return 1
     chmod 600 "${tmp}"
@@ -1624,14 +1602,13 @@ cert_source_show() {
     fi
 }
 
-# singr cert-source [--cert-url URL --key-url URL [--no-restart] | --clear]
+# singr cert-source [--cert-url URL --key-url URL | --clear]
 cert_source_cmd() {
-    local cert_url="" key_url="" restart="yes" clear=0 sel
+    local cert_url="" key_url="" clear=0 sel
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --cert-url) cert_url="$2"; shift 2 ;;
             --key-url) key_url="$2"; shift 2 ;;
-            --no-restart) restart="no"; shift ;;
             --clear) clear=1; shift ;;
             *)
                 echo -e "${red}未知参数：$1${plain}"
@@ -1650,7 +1627,7 @@ cert_source_cmd() {
             echo -e "${red}--cert-url 与 --key-url 必须同时给出${plain}"
             return 1
         fi
-        cert_source_set "${cert_url}" "${key_url}" "${restart}"
+        cert_source_set "${cert_url}" "${key_url}"
         return
     fi
 
@@ -1668,7 +1645,7 @@ cert_source_cmd() {
             read -r -p "证书地址 (https://...): " cert_url
             read -r -p "私钥地址 (https://...): " key_url
             [[ -n "${cert_url}" && -n "${key_url}" ]] || { echo -e "${red}两个地址都要填${plain}"; return 1; }
-            cert_source_set "${cert_url}" "${key_url}" yes
+            cert_source_set "${cert_url}" "${key_url}"
             ;;
         2) cert_update_cmd --force ;;
         3) cert_source_clear ;;
@@ -1685,7 +1662,7 @@ cert_update_cmd() {
         return 0
     fi
     node_require_jq || return 1
-    cert_default_update "${mode}" yes "$(cert_source_get cert_url)" "$(cert_source_get key_url)"
+    cert_default_update "${mode}" "$(cert_source_get cert_url)" "$(cert_source_get key_url)"
 }
 # <<<<<<<<<<<<<<<< SYNC BLOCK: 默认证书更新源 <<<<<<<<<<<<<<<<
 

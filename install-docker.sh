@@ -292,10 +292,9 @@ main() {
         /usr/bin/SingR _cert-mount-check "${CERT_SRC}" "${KEY_SRC}" ||
             die "证书路径无法挂进容器，请把证书放进单独的目录后重试。"
     fi
-    # 容器还不存在，所以 --no-restart；下载或校验失败直接中止 —— 此时 panel.json 还没
-    # 生成，修好地址后可以直接重跑本脚本。
+    # 下载或校验失败直接中止 —— 此时 panel.json 还没生成，修好地址后可以直接重跑本脚本。
     if [[ -n "${CERT_URL}" ]]; then
-        /usr/bin/SingR cert-source --cert-url "${CERT_URL}" --key-url "${KEY_URL}" --no-restart ||
+        /usr/bin/SingR cert-source --cert-url "${CERT_URL}" --key-url "${KEY_URL}" ||
             die "默认证书下载失败，安装中止。确认地址可访问后重跑本脚本。"
     fi
 

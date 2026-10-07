@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 默认证书更新源（SingR.sh / SingR-docker.sh 的 SYNC BLOCK「默认证书更新源」）的回归测试。
 #
-# 下载和后端都换成桩：cert_source_fetch 从本地的"远端目录"拷文件，
-# node_backend_running / restart / verify 读写几个标记文件，systemctl 是空函数。
+# 下载换成桩：cert_source_fetch 从本地的"远端目录"拷文件，systemctl 是空函数。
+# node_backend_restart 也是桩，只记次数 —— 更新默认证书必须只换文件、从不重启
+# （同进程里用别的证书的节点不该被牵连），用例里断言它一次都没被调用。
 # 其余全是真实代码 —— 直接从 SingR.sh 抠出两个 SYNC BLOCK 来跑。
 #
 #   bash scripts/test-cert-source.sh
@@ -47,10 +48,7 @@ mkdir -p "${CFG}/certs" "${REMOTE}" "${STATE}" "${TMP}/systemd"
     # ---- 桩 ----
     # https://remote/<名字> -> ${REMOTE}/<名字>；文件不存在就是下载失败。
     echo "cert_source_fetch() { local f=\"${REMOTE}/\${1##*/}\"; [[ -s \"\${f}\" ]] && cp \"\${f}\" \"\$2\"; }"
-    echo "node_backend_running() { [[ -f '${STATE}/running' ]]; }"
     echo "node_backend_restart() { echo x >> '${STATE}/restarts'; }"
-    # verify_fail_once：下一次校验失败一次（模拟换上新证书后起不来）。
-    echo "node_backend_verify() { if [[ -f '${STATE}/verify_fail_once' ]]; then rm -f '${STATE}/verify_fail_once'; return 1; fi; return 0; }"
     echo 'systemctl() { :; }'
 } > "${TMP}/block.sh"
 
@@ -100,7 +98,7 @@ check "首次配置：写入更新源" "https://remote/cert.pem" "$(jq -r .cert_
 check "更新源文件权限 600" "600" "$(stat -f %Lp "${CFG}/cert-source.json" 2>/dev/null || stat -c %a "${CFG}/cert-source.json")"
 check "私钥权限 600" "600" "$(stat -f %Lp "${CFG}/certs/default.key" 2>/dev/null || stat -c %a "${CFG}/certs/default.key")"
 [[ -f "${TMP}/systemd/singr-cert-update.timer" ]] && pass "装上每日 timer" || fail "装上每日 timer" "timer 文件" "无"
-check "后端没在跑：不重启" "0" "$(restarts)"
+check "首次配置：不重启" "0" "$(restarts)"
 
 reset; put_remote long; rm -f "${REMOTE}/key.pem"
 run "cert_source_set ${URLS}" >/dev/null
@@ -120,24 +118,23 @@ rm -f "${CFG}/server.json" "${CFG}/panel.json"
 echo "== cert-update（定时任务）=="
 setup_source() { jq -n '{cert_url:"https://remote/cert.pem", key_url:"https://remote/key.pem"}' > "${CFG}/cert-source.json"; }
 
-reset; setup_source; put_local long; put_remote long2; touch "${STATE}/running"
+reset; setup_source; put_local long; put_remote long2
 run 'cert_update_cmd' >/dev/null
 check "剩余 90 天：不下载不替换" "$(fp "${TMP}/long.pem")" "$(fp "${CFG}/certs/default.pem")"
-check "剩余 90 天：不重启" "0" "$(restarts)"
 
-reset; setup_source; put_local soon; put_remote soon; touch "${STATE}/running"
+reset; setup_source; put_local soon; put_remote soon
 out="$(run 'cert_update_cmd')"; rc=$?
 [[ "${rc}" != 0 && "${out}" == *"远端尚未续期"* ]] && pass "临期但远端还是同一张：报错不替换" \
     || fail "临期但远端还是同一张：报错不替换" "rc!=0 且提示远端尚未续期" "rc=${rc} ${out}"
 
-reset; setup_source; put_local soon; put_remote long; touch "${STATE}/running"
+reset; setup_source; put_local soon; put_remote long
 run 'cert_update_cmd' >/dev/null
 check "临期 + 远端更新：替换证书" "$(fp "${TMP}/long.pem")" "$(fp "${CFG}/certs/default.pem")"
 check "临期 + 远端更新：替换私钥" "$(openssl pkey -in "${TMP}/long.key" -pubout)" "$(openssl pkey -in "${CFG}/certs/default.key" -pubout)"
-check "临期 + 远端更新：重启一次" "1" "$(restarts)"
+check "临期 + 远端更新：只换文件，不重启" "0" "$(restarts)"
 [[ ! -e "${CFG}/certs/.default-prev.cert" ]] && pass "成功后清掉备份" || fail "成功后清掉备份" "无备份" "还在"
 
-reset; setup_source; put_local soon; put_remote sooner; touch "${STATE}/running"
+reset; setup_source; put_local soon; put_remote sooner
 run 'cert_update_cmd' >/dev/null
 check "远端比本地旧：不替换" "$(fp "${TMP}/soon.pem")" "$(fp "${CFG}/certs/default.pem")"
 
@@ -145,12 +142,6 @@ reset; setup_source; put_local soon; put_remote long; cp "${TMP}/stray.key" "${R
 run 'cert_update_cmd' >/dev/null
 check "远端私钥不匹配：不替换" "$(fp "${TMP}/soon.pem")" "$(fp "${CFG}/certs/default.pem")"
 [[ -z "$(ls -A "${CFG}/certs" | grep download)" ]] && pass "不留下载临时文件" || fail "不留下载临时文件" "无" "$(ls -A "${CFG}/certs")"
-
-reset; setup_source; put_local soon; put_remote long; touch "${STATE}/running" "${STATE}/verify_fail_once"
-run 'cert_update_cmd' >/dev/null; rc=$?
-check "新证书起不来：换回旧证书" "$(fp "${TMP}/soon.pem")" "$(fp "${CFG}/certs/default.pem")"
-check "新证书起不来：重启两次（换上 + 换回）" "2" "$(restarts)"
-[[ "${rc}" != 0 ]] && pass "新证书起不来：返回非 0" || fail "新证书起不来：返回非 0" "非 0" "${rc}"
 
 reset; setup_source; put_remote long
 cp "${TMP}/soon.pem" "${CFG}/certs/default.crt"; cp "${TMP}/soon.key" "${CFG}/certs/default.key"
