@@ -1344,6 +1344,380 @@ cert_update_cmd() {
 }
 # <<<<<<<<<<<<<<<< SYNC BLOCK: 默认证书更新源 <<<<<<<<<<<<<<<<
 
+# >>>>>>>>>>>>>>>> SYNC BLOCK: WARP 出口 >>>>>>>>>>>>>>>>
+# 本块在 SingR.sh 与 SingR-docker.sh 中逐字相同，改一处必须同步另一处。
+#
+# 把 SingR 进程的出站部分或全部交给 Cloudflare WARP。只影响 SingR 自己：WARP 是
+# server.json 里一个 wireguard endpoint（tag=warp，gvisor 用户态协议栈，不建网卡、
+# 不改系统路由），宿主机上其他进程的 v4/v6 完全不受影响。另加几条 route 规则，全部
+# 写在 server.json，面板下发不了。
+#
+# 两个选项：
+#   --via auto|v4|v6     连 WARP 服务器走哪个协议，只决定 peer 地址。auto = 实测握手，
+#                        先 v4 后 v6，用第一个通的。
+#   --takeover v4,v6     哪些出口交给 WARP：
+#       v4,v6  全部走 WARP
+#       v4     目标有 v6 地址就本机 v6 直连，只有 v4 地址才走 WARP（纯 v6 机器 / v4 线路差）
+#       v6     目标有 v4 地址就本机 v4 直连，只有 v6 地址才走 WARP（纯 v4 机器访问纯 v6 站）
+#
+# 单协议接管为什么要 resolve 两次：route 的 resolve 动作之后，出站按顺序拨解析出的地址
+# （route/conn.go 的 DialSerialNetwork），不再看出站自己的 domain_resolver。只解析一次
+# 的话，双栈站的本机协议连不上时会悄悄退回被接管的协议直连，接管就漏了。第二次只留本机
+# 协议的地址（命中 DNS 缓存，几乎零开销）。
+#
+# 规则靠"内容完全相等"识别（sing-box 拒绝未知字段，没法打标记），所以 warp_rules 产出
+# 的形状就是识别依据：以后改形状，旧形状必须留在 warp_known_rules 里，否则 off 删不掉
+# 老机器上的规则。规则插在 route.rules 最前面；node_add 往后追加 inbound 规则、node_del
+# 按 inbound 删，都碰不到它们。
+#
+# WireGuard 握手失败不会让进程启动失败（UDP 无连接），进程照样 active，走 WARP 的流量
+# 却全部发不出去 —— node_backend_verify 看不出来。所以 warp_on 在写配置之前先用二进制的
+# `warp test` 真实握手并经隧道访问 cdn-cgi/trace，不通就不改配置。
+#
+# 账户（私钥、token）存 ${WARP_ACCOUNT}，0600。注册走 Cloudflare 客户端的非官方接口
+# （wgcf 用的同一个），偶尔会 429 限流。
+#
+# 后端差异由下列钩子承担，各脚本自行实现，不在本块内：
+#   warp_backend_exec <args...>  用与运行中同版本的二进制执行子命令，stdin/stdout 透传
+
+WARP_ACCOUNT="${CONFIG_DIR}/warp.json"
+WARP_TAG="warp"
+
+# 接管模式（all|v4|v6）对应的规则，插在 route.rules 最前面。
+warp_rules() {
+    jq -cn --arg t "${WARP_TAG}" --arg m "$1" '
+        if $m == "all" then
+            [{network: ["tcp", "udp"], outbound: $t}]
+        elif $m == "v4" then
+            [{network: ["tcp", "udp"], action: "resolve"},
+             {ip_cidr: ["::/0"], action: "resolve", strategy: "ipv6_only"},
+             {ip_cidr: ["::/0"], invert: true, outbound: $t}]
+        elif $m == "v6" then
+            [{network: ["tcp", "udp"], action: "resolve"},
+             {ip_cidr: ["0.0.0.0/0"], action: "resolve", strategy: "ipv4_only"},
+             {ip_cidr: ["0.0.0.0/0"], invert: true, outbound: $t}]
+        else error("unknown mode: " + $m) end'
+}
+
+# 本块生成过的所有规则形状 —— 只有这些会被 warp_strip 删掉。
+warp_known_rules() {
+    jq -cn --argjson a "$(warp_rules all)" --argjson b "$(warp_rules v4)" --argjson c "$(warp_rules v6)" \
+        '$a + $b + $c | unique'
+}
+
+# 去掉本块写过的 endpoint 和规则（需要 --arg t 与 --argjson known）。
+WARP_STRIP_JQ='
+    .route.rules = ((.route.rules // []) | map(. as $r | select(any($known[]; . == $r) | not)))
+    | .endpoints = ((.endpoints // []) | map(select(.tag != $t)))
+    | if (.endpoints | length) == 0 then del(.endpoints) else . end'
+
+# 当前状态：off | all | v4 | v6 | custom（有 warp endpoint，但规则不是本块写的）。
+warp_mode() {
+    jq -r --arg t "${WARP_TAG}" \
+        --argjson a "$(warp_rules all)" --argjson b "$(warp_rules v4)" --argjson c "$(warp_rules v6)" '
+        (.route.rules // []) as $r
+        | def present($set): all($set[]; . as $x | any($r[]; . == $x));
+        if ([.endpoints[]? | select(.tag == $t)] | length) == 0 then "off"
+        elif present($a) then "all"
+        elif present($b) then "v4"
+        elif present($c) then "v6"
+        else "custom" end' "${SERVER_CONFIG}" 2>/dev/null || echo off
+}
+
+# 当前 peer 走哪个协议：v4 | v6 | 空。
+warp_via() {
+    jq -r --arg t "${WARP_TAG}" '
+        (first(.endpoints[]? | select(.tag == $t) | .peers[0].address) // "")
+        | if . == "" then "" elif test(":") then "v6" else "v4" end' "${SERVER_CONFIG}" 2>/dev/null
+}
+
+warp_mode_label() {
+    case "$1" in
+        all) echo "IPv4 + IPv6 全部走 WARP" ;;
+        v4) echo "接管 IPv4（有 v6 地址的目标仍走本机 v6）" ;;
+        v6) echo "接管 IPv6（有 v4 地址的目标仍走本机 v4）" ;;
+        custom) echo "有 ${WARP_TAG} endpoint，但路由规则不是 singr warp 生成的（手动配置）" ;;
+        *) echo "关闭" ;;
+    esac
+}
+
+# v4 / 4 / ipv4 / 4,6 / v4+v6 / 46 / all -> v4 | v6 | all；其余返回 1。
+warp_norm_takeover() {
+    local s
+    s="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+    case "${s}" in
+        all | both) echo all; return 0 ;;
+    esac
+    [[ "${s}" =~ ^((ipv|v)?[46])([,/+]?(ipv|v)?[46])*$ ]] || return 1
+    if [[ "${s}" == *4* && "${s}" == *6* ]]; then
+        echo all
+    elif [[ "${s}" == *4* ]]; then
+        echo v4
+    else
+        echo v6
+    fi
+}
+
+# 本机原生出口，仅供参考（只认 Linux 的 ip 命令；拿不到就不显示）。
+warp_host_stack() {
+    command -v ip >/dev/null 2>&1 || return 0
+    local v4="无" v6="无"
+    [[ -n "$(ip -4 route show default 2>/dev/null)" ]] && v4="有"
+    [[ -n "$(ip -6 route show default 2>/dev/null)" ]] && v6="有"
+    echo "本机原生出口：IPv4 ${v4} / IPv6 ${v6}"
+}
+
+# 注册一个新账户写到 $1。成功才落盘，失败不留半截文件。
+warp_register_to() {
+    local dst="$1" tmp
+    tmp="$(mktemp "${CONFIG_DIR}/.warp.XXXXXX")" || return 1
+    echo -e "${green}正在注册 WARP 账户...${plain}"
+    if ! warp_backend_exec warp register >"${tmp}" || ! jq -e '.private_key | length > 0' "${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        echo -e "${red}WARP 注册失败（原因见上方）。Cloudflare 偶尔限流（HTTP 429），稍后重试即可；"
+        echo -e "提示 unknown command 说明二进制太旧，先 singr update${plain}"
+        return 1
+    fi
+    chmod 600 "${tmp}" && mv -f "${tmp}" "${dst}"
+}
+
+warp_ensure_account() {
+    [[ -s "${WARP_ACCOUNT}" ]] && return 0
+    warp_register_to "${WARP_ACCOUNT}" || return 1
+    echo -e "${green}已注册，账户保存在 ${WARP_ACCOUNT}${plain}"
+}
+
+warp_show_test() {
+    jq -r '
+        def fam($name; $x):
+            "    \($name) 出口：" + (if $x.ok
+                then "\($x.ip)  warp=\($x.warp)  \($x.colo // "")"
+                else "不通（\($x.error // "未知错误")）" end);
+        .results[]?
+        | "  经 \(.via) 连接 WARP：\(if .ok then "成功" else "失败" end)",
+          fam("IPv4"; .ipv4), fam("IPv6"; .ipv6)' <<<"$1" 2>/dev/null
+}
+
+warp_usage() {
+    echo "用法："
+    echo "  singr warp                                   查看状态 / 交互菜单"
+    echo "  singr warp on --takeover v4|v6|v4,v6 [--via auto|v4|v6]"
+    echo "  singr warp off                               关闭，恢复全部本机直连（账户保留）"
+    echo "  singr warp test [--via auto|v4|v6]           只测试连通性，不改配置"
+    echo "  singr warp register [--force]                注册账户（--force 换一个新账户）"
+}
+
+warp_status() {
+    local mode
+    if [[ -s "${WARP_ACCOUNT}" ]]; then
+        echo -e "WARP 账户：已注册（$(jq -r '(.address // []) | join(", ")' "${WARP_ACCOUNT}" 2>/dev/null)）"
+    else
+        echo -e "WARP 账户：未注册（开启时自动注册）"
+    fi
+    [[ -f "${SERVER_CONFIG}" ]] || return 0
+    mode="$(warp_mode)"
+    if [[ "${mode}" == off ]]; then
+        echo -e "WARP 出口：${yellow}关闭${plain}"
+    else
+        echo -e "WARP 出口：${green}开启${plain}，经 $(warp_via) 连接；$(warp_mode_label "${mode}")"
+    fi
+    warp_host_stack
+}
+
+warp_on() {
+    local via="auto" takeover="" mode res chosen ep tmp
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --via) via="${2:-}"; shift 2 ;;
+            --takeover) takeover="${2:-}"; shift 2 ;;
+            *) echo -e "${red}未知参数：$1${plain}"; warp_usage; return 1 ;;
+        esac
+    done
+    case "${via}" in
+        auto | v4 | v6) ;;
+        4 | ipv4) via=v4 ;;
+        6 | ipv6) via=v6 ;;
+        *) echo -e "${red}--via 只能是 auto、v4 或 v6${plain}"; return 1 ;;
+    esac
+    mode="$(warp_norm_takeover "${takeover}")" || {
+        echo -e "${red}--takeover 取 v4、v6 或 v4,v6（要关闭用 singr warp off）${plain}"
+        return 1
+    }
+    node_require_jq || return 1
+    node_configs_ready || return 1
+    warp_ensure_account || return 1
+
+    echo -e "${green}正在测试 WARP 连通性（真实握手并经隧道访问 Cloudflare，最长约 20 秒）...${plain}"
+    res="$(warp_backend_exec warp test --via "${via}" <"${WARP_ACCOUNT}")"
+    warp_show_test "${res}"
+    if ! jq -e '.ok == true' <<<"${res}" >/dev/null 2>&1; then
+        echo -e "${red}WARP 不通，配置未改动。可以换 --via 再试，或检查本机 UDP 2408 出站是否被拦${plain}"
+        return 1
+    fi
+    chosen="$(jq -r '.via' <<<"${res}")"
+    if [[ "${mode}" != v6 ]] && ! jq -e --arg v "${chosen}" '.results[] | select(.via == $v) | .ipv4.ok' <<<"${res}" >/dev/null 2>&1; then
+        echo -e "${yellow}注意：经 WARP 的 IPv4 测试没通过，接管 IPv4 的流量可能不可用${plain}"
+    fi
+    if [[ "${mode}" != v4 ]] && ! jq -e --arg v "${chosen}" '.results[] | select(.via == $v) | .ipv6.ok' <<<"${res}" >/dev/null 2>&1; then
+        echo -e "${yellow}注意：经 WARP 的 IPv6 测试没通过，接管 IPv6 的流量可能不可用${plain}"
+    fi
+
+    ep="$(warp_backend_exec warp endpoint --via "${chosen}" --tag "${WARP_TAG}" <"${WARP_ACCOUNT}")"
+    jq -e '.type == "wireguard"' <<<"${ep}" >/dev/null 2>&1 || {
+        echo -e "${red}生成 WARP endpoint 失败，配置未改动${plain}"
+        return 1
+    }
+    node_backup || { echo -e "${red}备份配置失败，已取消${plain}"; return 1; }
+    tmp="$(mktemp)" || return 1
+    if ! jq --arg t "${WARP_TAG}" --argjson known "$(warp_known_rules)" \
+        --argjson ep "${ep}" --argjson rules "$(warp_rules "${mode}")" \
+        "${WARP_STRIP_JQ}"' | .endpoints = ((.endpoints // []) + [$ep]) | .route.rules = ($rules + .route.rules)' \
+        "${SERVER_CONFIG}" >"${tmp}"; then
+        rm -f "${tmp}"
+        node_commit
+        echo -e "${red}写入 ${SERVER_CONFIG} 失败，配置未改动${plain}"
+        return 1
+    fi
+    mv -f "${tmp}" "${SERVER_CONFIG}"
+    node_apply || return 1
+    echo -e "${green}WARP 出口已开启：经 ${chosen} 连接，$(warp_mode_label "${mode}")${plain}"
+}
+
+warp_off() {
+    local refs tmp
+    node_require_jq || return 1
+    node_configs_ready || return 1
+    if [[ "$(warp_mode)" == off ]]; then
+        echo -e "${yellow}WARP 出口本来就是关闭的${plain}"
+        return 0
+    fi
+    # 手写的规则 / final 还指着 warp 的话，删掉 endpoint 会让进程起不来。
+    refs="$(jq -c --arg t "${WARP_TAG}" --argjson known "$(warp_known_rules)" '
+        ((.route.rules // [])[] | . as $r | select(any($known[]; . == $r) | not) | select(.outbound == $t)),
+        (select(.route.final == $t) | {final: $t})' "${SERVER_CONFIG}")"
+    if [[ -n "${refs}" ]]; then
+        echo -e "${red}server.json 里还有不是 singr warp 写的配置指向 ${WARP_TAG}，请先用 singr config 手动处理：${plain}"
+        printf '%s\n' "${refs}" | sed 's/^/  /'
+        return 1
+    fi
+    node_backup || { echo -e "${red}备份配置失败，已取消${plain}"; return 1; }
+    tmp="$(mktemp)" || return 1
+    if ! jq --arg t "${WARP_TAG}" --argjson known "$(warp_known_rules)" "${WARP_STRIP_JQ}" \
+        "${SERVER_CONFIG}" >"${tmp}"; then
+        rm -f "${tmp}"
+        node_commit
+        echo -e "${red}写入 ${SERVER_CONFIG} 失败，配置未改动${plain}"
+        return 1
+    fi
+    mv -f "${tmp}" "${SERVER_CONFIG}"
+    node_apply || return 1
+    echo -e "${green}WARP 出口已关闭，全部恢复本机直连。账户保留在 ${WARP_ACCOUNT}，下次开启直接复用${plain}"
+}
+
+warp_test_cmd() {
+    local via="auto" res
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --via) via="${2:-}"; shift 2 ;;
+            *) echo -e "${red}未知参数：$1${plain}"; warp_usage; return 1 ;;
+        esac
+    done
+    node_require_jq || return 1
+    [[ -s "${WARP_ACCOUNT}" ]] || { echo -e "${yellow}还没有 WARP 账户，先 singr warp register 或直接 singr warp on${plain}"; return 1; }
+    # 测试用同一把密钥另起一条隧道，Cloudflare 那边会在两条之间漫游。
+    [[ -f "${SERVER_CONFIG}" && "$(warp_mode)" != off ]] &&
+        echo -e "${yellow}WARP 正在使用中：测试期间（十几秒）走 WARP 的连接可能短暂卡顿${plain}"
+    echo -e "${green}正在测试 WARP 连通性...${plain}"
+    res="$(warp_backend_exec warp test --via "${via}" <"${WARP_ACCOUNT}")"
+    warp_show_test "${res}"
+    jq -e '.ok == true' <<<"${res}" >/dev/null 2>&1
+}
+
+warp_register_cmd() {
+    local tmp
+    node_require_jq || return 1
+    if [[ -s "${WARP_ACCOUNT}" ]]; then
+        if [[ "${1:-}" != "--force" ]]; then
+            echo -e "${yellow}已有 WARP 账户（${WARP_ACCOUNT}）。要换新账户用 singr warp register --force${plain}"
+            return 0
+        fi
+        if [[ -f "${SERVER_CONFIG}" && "$(warp_mode)" != off ]]; then
+            echo -e "${red}WARP 出口正在使用当前账户，先 singr warp off，换完再 singr warp on${plain}"
+            return 1
+        fi
+        tmp="${WARP_ACCOUNT}.new"
+        warp_register_to "${tmp}" || return 1
+        mv -f "${WARP_ACCOUNT}" "${WARP_ACCOUNT}.old"
+        mv -f "${tmp}" "${WARP_ACCOUNT}"
+        echo -e "${green}已换成新账户，旧账户备份在 ${WARP_ACCOUNT}.old${plain}"
+        return 0
+    fi
+    warp_ensure_account
+}
+
+warp_menu_on() {
+    local v t via
+    echo -e "
+连接 WARP 服务器走哪个协议？
+  1. 自动（先试 IPv4，不通再试 IPv6）
+  2. IPv4
+  3. IPv6
+"
+    read -r -p "请选择 [1-3，默认 1]: " v
+    case "${v:-1}" in
+        1) via=auto ;;
+        2) via=v4 ;;
+        3) via=v6 ;;
+        *) echo -e "${red}请输入 1-3${plain}"; return 1 ;;
+    esac
+    echo -e "
+哪些出口交给 WARP？（可多选，逗号分隔，例：4,6）
+  4    IPv4：目标只有 v4 地址才走 WARP，有 v6 的仍走本机 v6（纯 v6 机器 / v4 线路差）
+  6    IPv6：目标只有 v6 地址才走 WARP，有 v4 的仍走本机 v4（纯 v4 机器访问纯 v6 站）
+  4,6  全部走 WARP
+"
+    read -r -p "请输入: " t
+    warp_on --via "${via}" --takeover "${t}"
+}
+
+warp_menu() {
+    local sel
+    node_require_jq || return 1
+    warp_status
+    [[ -t 0 ]] || return 0
+    echo -e "
+  1. 开启 / 修改 WARP 出口
+  2. 关闭 WARP 出口
+  3. 测试 WARP 连通性
+  0. 返回
+"
+    read -r -p "请输入选择 [0-3]: " sel
+    case "${sel}" in
+        1) warp_menu_on ;;
+        2) warp_off ;;
+        3) warp_test_cmd ;;
+        *) return 0 ;;
+    esac
+}
+
+warp_cmd() {
+    case "${1:-}" in
+        "") warp_menu ;;
+        on) shift; warp_on "$@" ;;
+        off) warp_off ;;
+        status) node_require_jq && warp_status ;;
+        test) shift; warp_test_cmd "$@" ;;
+        register) shift; warp_register_cmd "$@" ;;
+        *) warp_usage; return 1 ;;
+    esac
+}
+# <<<<<<<<<<<<<<<< SYNC BLOCK: WARP 出口 <<<<<<<<<<<<<<<<
+
+# ---- WARP 出口：裸机后端实现（SYNC BLOCK 的钩子）----
+warp_backend_exec() {
+    "${BIN_PATH}" "$@"
+}
+
 # ---------------- Hysteria2 端口跳跃管理 ----------------
 # 在 OS 防火墙层把一段 UDP 端口区间 REDIRECT 到真实 Hysteria2 端口（v4+v6）。
 # 规则持久化为 ${PORTHOP_RULES}，由 singr-porthop.service 开机重放，不依赖
@@ -1566,6 +1940,10 @@ show_usage() {
     echo "SingR cert-source           查看/配置默认证书的远程更新源"
     echo "SingR cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
     echo "------------------------------------------"
+    echo "SingR warp                  WARP 出口：查看状态 / 交互菜单"
+    echo "SingR warp on --takeover v4|v6|v4,v6 [--via auto|v4|v6]"
+    echo "SingR warp off|test|register"
+    echo "------------------------------------------"
     echo "添加节点参数："
     echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2"
     echo "  --sni HOST --cert-path PATH --key-path PATH"
@@ -1602,6 +1980,7 @@ ${line}
  13. Hysteria2 端口跳跃管理
  14. 节点管理（查看 / 添加 / 删除）
  15. 默认证书更新源
+ 16. WARP 出口
 ${line}"
     show_status | sed 's/^/  /'
     echo -e "${line}"
@@ -1612,7 +1991,7 @@ ${line}"
         printf '%s\n' "${nodes}"
         echo -e "${line}"
     fi
-    read -r -p "请输入选择 [0-15]: " num
+    read -r -p "请输入选择 [0-16]: " num
     case "${num}" in
         0) check_install && config ;;
         1) check_uninstall && install_singr ;;
@@ -1630,7 +2009,8 @@ ${line}"
         13) porthop_menu && before_show_menu ;;
         14) check_install && node_menu && before_show_menu ;;
         15) check_install && { cert_source_cmd; before_show_menu; } ;;
-        *) echo -e "${red}请输入正确的数字 [0-15]${plain}" && before_show_menu ;;
+        16) check_install && { warp_cmd; before_show_menu; } ;;
+        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" && before_show_menu ;;
     esac
 }
 
@@ -1654,6 +2034,7 @@ if [[ $# -gt 0 ]]; then
         del | delete | rm) check_install 0 && node_del "${2:-}" ;;
         cert-source) check_install 0 && shift && cert_source_cmd "$@" ;;
         cert-update) check_install 0 && cert_update_cmd "${2:-}" ;;
+        warp) check_install 0 && shift && warp_cmd "$@" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;
         porthop-flush) porthop_flush_all ;;

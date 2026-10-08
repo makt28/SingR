@@ -104,6 +104,7 @@ Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全�
 | `singr cert-source` | 设置默认证书的下载地址（菜单第 15 项） |
 | `singr cert-update --force` | 立即重新下载默认证书 |
 | `singr porthop` | Hysteria2 端口跳跃规则（菜单第 13 项） |
+| `singr warp` | 部分或全部出口走 Cloudflare WARP，见[「WARP 出口」](#warp-出口)（菜单第 16 项） |
 | `singr version` | 查看 SingR 和 sing-box 核心版本 |
 | `singr uninstall` | 卸载 |
 
@@ -254,6 +255,46 @@ ip6tables -t nat -A PREROUTING -p udp --dport 40000:60000 -j REDIRECT --to-ports
 realm 用于服务器在 NAT 后、没有公网端口的场景。SingR 节点一般有公网 IP，用不上。而且面板每次修改端口或 SNI，realm 都会重新注册一遍，修改 SNI 时还会短暂中断，所以不建议开启。
 
 更多部署示例见 [release/poet/hysteria2.md](release/poet/hysteria2.md)。
+
+---
+
+## WARP 出口
+
+把节点出口的一部分或全部交给 Cloudflare WARP，适合两种机器：只有单栈、访问不了另一种协议的站；或者 v4 线路差、v6 好（反过来也一样）。
+
+只影响 SingR 自己的出站。WARP 跑在 SingR 进程里（用户态，不建网卡、不改系统路由），机器上其他程序的 IPv4 / IPv6 完全不受影响，Docker 也不需要额外权限。
+
+```bash
+singr warp on --takeover v4
+```
+
+两个选项：
+
+| 选项 | 取值 | 作用 |
+| --- | --- | --- |
+| `--via` | `auto`（默认）/ `v4` / `v6` | 用哪个协议连接 WARP 服务器。`auto` 先试 IPv4，不通再试 IPv6 |
+| `--takeover` | `v4` / `v6` / `v4,v6` | 哪些出口交给 WARP |
+
+`--takeover` 的具体效果：
+
+- `v4`：目标有 IPv6 地址就走本机 v6，只有 IPv4 地址的目标才走 WARP。用于纯 v6 机器，或 v4 线路差的机器。
+- `v6`：目标有 IPv4 地址就走本机 v4，只有 IPv6 地址的目标才走 WARP。用于纯 v4 机器访问纯 v6 站。像 Google 这种双栈站仍然走本机 v4。
+- `v4,v6`：全部走 WARP。
+
+第一次开启时会自动注册一个免费 WARP 账户，保存在 `/etc/singr/warp.json`（Docker 是 `/etc/singr-docker/warp.json`）。开启前会先真实连一次 WARP，不通就不改配置。开启和关闭都会重启一次 SingR，所有连接会断开一下。
+
+| 命令 | 作用 |
+| --- | --- |
+| `singr warp` | 查看状态，打开菜单 |
+| `singr warp off` | 关闭，恢复全部本机直连（账户保留，下次直接用） |
+| `singr warp test` | 只测试 WARP 能不能通，不改配置 |
+| `singr warp register --force` | 换一个新的 WARP 账户（要先 `off`） |
+
+说明：
+
+- 走 WARP 的流量照常计入用户流量，限速也照常生效。
+- 免费 WARP 的速度和稳定性因地区而异。需要放行 UDP 2408 出站。
+- 需要带 WARP 功能的版本，旧版本请先 `singr update`。
 
 ---
 
