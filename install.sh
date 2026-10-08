@@ -318,9 +318,8 @@ EOF
   "dns": {
     "servers": [
       {
-        "tag": "google",
-        "type": "udp",
-        "server": "8.8.8.8"
+        "tag": "local",
+        "type": "local"
       }
     ],
     "strategy": "prefer_ipv6"
@@ -365,7 +364,7 @@ EOF
       "type": "direct",
       "tag": "anytls-out",
       "domain_resolver": {
-        "server": "google",
+        "server": "local",
         "strategy": "prefer_ipv6"
       }
     },
@@ -373,7 +372,7 @@ EOF
       "type": "direct",
       "tag": "hysteria2-out",
       "domain_resolver": {
-        "server": "google",
+        "server": "local",
         "strategy": "prefer_ipv6"
       }
     },
@@ -381,7 +380,7 @@ EOF
       "type": "direct",
       "tag": "direct",
       "domain_resolver": {
-        "server": "google",
+        "server": "local",
         "strategy": "prefer_ipv6"
       }
     }
@@ -434,8 +433,8 @@ migrate_config() {
     local tmp
     tmp="$(mktemp)"
     if jq '
-        .dns = (.dns // {servers:[{tag:"google",type:"udp",server:"8.8.8.8"}], strategy:"prefer_ipv6"})
-        | (((.dns.servers // []) | map(.tag // empty) | .[0]) // "google") as $dnsTag
+        .dns = (.dns // {servers:[{tag:"local",type:"local"}], strategy:"prefer_ipv6"})
+        | (((.dns.servers // []) | map(.tag // empty) | .[0]) // "local") as $dnsTag
         | .outbounds = ((.outbounds // []) | map(
             if .type == "direct"
             then (

@@ -8,9 +8,8 @@
     "dns": {
         "servers": [
             {
-                "tag": "google",
-                "type": "udp",
-                "server": "8.8.8.8"
+                "tag": "local",
+                "type": "local"
             }
         ],
         "strategy": "prefer_ipv6"
@@ -35,7 +34,7 @@
             "type": "direct",
             "tag": "anytls-out",
             "domain_resolver": {
-                "server": "google",
+                "server": "local",
                 "strategy": "prefer_ipv6"
             }
         },
@@ -43,7 +42,7 @@
             "type": "direct",
             "tag": "direct",
             "domain_resolver": {
-                "server": "google",
+                "server": "local",
                 "strategy": "prefer_ipv6"
             }
         }

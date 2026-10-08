@@ -285,7 +285,7 @@ realm 用于服务器在 NAT 后、没有公网端口的场景。SingR 节点一
 **节点出口没有 IPv6**
 
 - 先确认服务器本身有 IPv6：`curl -6 ifconfig.co`。
-- `server.json` 的 `direct` 出站需要 `"domain_resolver": { "server": "google", "strategy": "prefer_ipv6" }`，`dns` 需要 `"strategy": "prefer_ipv6"`，`route.auto_detect_interface` 需要是 `false`。默认配置都已经写好，删掉的话出口会只走 IPv4。
+- `server.json` 的 `direct` 出站需要 `"domain_resolver": { "server": "local", "strategy": "prefer_ipv6" }`，`dns` 需要 `"strategy": "prefer_ipv6"`，`route.auto_detect_interface` 需要是 `false`。默认配置都已经写好，删掉的话出口会只走 IPv4。
 
 ---
 
@@ -435,7 +435,7 @@ systemctl daemon-reload && systemctl enable --now singr
 {
   "log": { "disabled": false, "level": "info", "timestamp": true, "output": "/var/log/singr.log" },
   "dns": {
-    "servers": [{ "tag": "google", "type": "udp", "server": "8.8.8.8" }],
+    "servers": [{ "tag": "local", "type": "local" }],
     "strategy": "prefer_ipv6"
   },
   "inbounds": [
@@ -451,9 +451,9 @@ systemctl daemon-reload && systemctl enable --now singr
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "anytls-out",    "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" } },
-    { "type": "direct", "tag": "hysteria2-out", "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" } },
-    { "type": "direct", "tag": "direct",        "domain_resolver": { "server": "google", "strategy": "prefer_ipv6" } }
+    { "type": "direct", "tag": "anytls-out",    "domain_resolver": { "server": "local", "strategy": "prefer_ipv6" } },
+    { "type": "direct", "tag": "hysteria2-out", "domain_resolver": { "server": "local", "strategy": "prefer_ipv6" } },
+    { "type": "direct", "tag": "direct",        "domain_resolver": { "server": "local", "strategy": "prefer_ipv6" } }
   ],
   "route": {
     "rules": [
