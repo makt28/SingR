@@ -61,7 +61,7 @@ singr add \
   --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
 ```
 
-`singr add` 不带参数时会逐项询问。`--protocol` 可选 `anytls` 或 `hysteria2`。
+`singr add` 缺必填参数（`--api-url` / `--api-key` / `--node-id` / `--protocol`）时会逐项询问；四项都给齐则不再追问可选的 SNI 和证书路径，留空按默认处理。`--protocol` 可选 `anytls` 或 `hysteria2`。
 
 **Docker**：
 

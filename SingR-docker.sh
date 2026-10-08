@@ -794,16 +794,20 @@ node_add() {
         esac
     done
 
-    # 没给全且在交互终端上，就逐项问；非交互（脚本调用）则直接报缺参数。
+    # 必填的四项没给全且在交互终端上，就逐项问（顺带问可选的 SNI / 证书路径）；
+    # 必填项都给齐了说明是一次性的命令行调用，可选项留空即按默认处理，不再追问。
+    # 非交互（脚本调用）则直接报缺参数。
     if [[ -t 0 ]]; then
-        [[ -z "${api_url}" ]] && read -r -p "面板地址 (--api-url，如 https://panel.example.com): " api_url
-        [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
-        [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
-        [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 (--protocol): " protocol
-        [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
-        if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
-            echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
-            read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
+        if [[ -z "${api_url}" || -z "${api_key}" || -z "${node_id}" || -z "${protocol}" ]]; then
+            [[ -z "${api_url}" ]] && read -r -p "面板地址 (--api-url，如 https://panel.example.com): " api_url
+            [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
+            [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
+            [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 (--protocol): " protocol
+            [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
+            if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
+                echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
+                read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
+            fi
         fi
         # 只给了一对里的一个就把另一个问出来，别直接报错——命令行敲漏一个参数是常事。
         if [[ -n "${cert_src}" && -z "${key_src}" ]]; then
