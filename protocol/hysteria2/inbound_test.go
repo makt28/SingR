@@ -52,7 +52,7 @@ func TestConfigureFromPanelNodeConcurrentReloadAndUsers(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := inbound.(*Inbound)
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -186,7 +186,7 @@ func TestHysteria2ConfigureFromPanelNodePreStart(t *testing.T) {
 	if h.options.TLS == nil || h.options.TLS.ServerName != "reload-a.example.com" {
 		t.Fatalf("TLS options = %#v, want panel SNI", h.options.TLS)
 	}
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	assertUDPPortBound(t, panelPort, true)
@@ -197,7 +197,7 @@ func TestHysteria2ConfigureFromPanelNodeHotReloadAndRollback(t *testing.T) {
 	initialPort := testFreeUDPPort(t)
 	reloadPort := testFreeUDPPort(t)
 	h := newTestHysteria2Inbound(t, initialPort, "initial.example.com")
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -246,7 +246,7 @@ func TestHysteria2ConfigureFromPanelNodeHotReloadAndRollback(t *testing.T) {
 func TestHysteria2ConfigureFromPanelNodeSNIOnlyRebuildsService(t *testing.T) {
 	port := testFreeUDPPort(t)
 	h := newTestHysteria2Inbound(t, port, "initial.example.com")
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -268,6 +268,27 @@ func TestHysteria2ConfigureFromPanelNodeSNIOnlyRebuildsService(t *testing.T) {
 	assertUDPPortBound(t, port, true)
 }
 
+// See TestAnyTLSScopeCloseReleasesHotReloadedListener: the Scope given to
+// Start must close the rebuilt listener/service, not the original ones.
+func TestHysteria2ScopeCloseReleasesHotReloadedListener(t *testing.T) {
+	initialPort := testFreeUDPPort(t)
+	reloadPort := testFreeUDPPort(t)
+	h := newTestHysteria2Inbound(t, initialPort, "initial.example.com")
+	scope := newTestScope()
+	if err := h.Start(adapter.StartStateStart, scope); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: C.TypeHysteria2, Port: uint32(reloadPort), Host: "initial.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	assertUDPPortBound(t, reloadPort, true)
+	assertUDPPortBound(t, initialPort, false)
+	if err := scope.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertUDPPortBound(t, reloadPort, false)
+}
+
 func TestHysteria2ConfigureFromPanelNodeRejectsInvalidPort(t *testing.T) {
 	h := newTestHysteria2Inbound(t, testFreeUDPPort(t), "initial.example.com")
 	defer h.Close()
@@ -286,7 +307,7 @@ func TestHysteria2ConfigureFromPanelNodeRejectsInvalidPort(t *testing.T) {
 func TestHysteria2ConfigureFromPanelNodeNoOpPreservesComponents(t *testing.T) {
 	port := testFreeUDPPort(t)
 	h := newTestHysteria2Inbound(t, port, "initial.example.com")
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -337,7 +358,7 @@ func TestHysteria2AuthenticationEndToEnd(t *testing.T) {
 	port := testFreeUDPPort(t)
 	h := newTestHysteria2Inbound(t, port, "initial.example.com")
 	h.router = &silentHysteria2Router{}
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -457,6 +478,10 @@ func (r *captureHysteria2Router) RouteConnectionEx(_ context.Context, _ net.Conn
 
 func (r *captureHysteria2Router) RoutePacketConnectionEx(_ context.Context, _ N.PacketConn, metadata adapter.InboundContext, _ N.CloseHandlerFunc) {
 	r.packetMetadata = metadata
+}
+
+func newTestScope() *adapter.Scope {
+	return adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
 }
 
 func newTestHysteria2Inbound(t *testing.T, port int, serverName string) *Inbound {

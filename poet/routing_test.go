@@ -174,10 +174,10 @@ func addRoutingTestUser(t *testing.T, service *controller.Controller) *controlle
 
 type routingTestInbound struct{ tag string }
 
-func (*routingTestInbound) Type() string                   { return "test" }
-func (i *routingTestInbound) Tag() string                  { return i.tag }
-func (*routingTestInbound) Start(adapter.StartStage) error { return nil }
-func (*routingTestInbound) Close() error                   { return nil }
+func (*routingTestInbound) Type() string                                   { return "test" }
+func (i *routingTestInbound) Tag() string                                  { return i.tag }
+func (*routingTestInbound) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (*routingTestInbound) Close() error                                   { return nil }
 
 type routingTestAPI struct{}
 

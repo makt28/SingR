@@ -90,7 +90,6 @@ type Inbound struct {
 // service from a set of options, without starting them or applying any
 // users. It is used both by NewInbound and by the hot-reload rebuild path.
 func buildComponents(ctx context.Context, logger log.ContextLogger, options option.Hysteria2InboundOptions, handler hysteria2.ServerHandler) (tls.ServerConfig, *listener.Listener, *hysteria2.Service[string], error) {
-	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, nil, nil, C.ErrTLSRequired
 	}
@@ -501,12 +500,16 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	// Our own Close, not upstream's per-object scope.Add calls: hot reload
+	// rebuilds tlsConfig/listener/service, so method values bound here would
+	// go stale. Registered first so a partial Start is still cleaned up.
+	scope.Add(h.Close)
 	if err := startComponents(h.tlsConfig, h.listener.Load(), h.service); err != nil {
 		return err
 	}
