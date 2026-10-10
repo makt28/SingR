@@ -488,7 +488,7 @@ func (i *incrementalTestInbound) Tag() string {
 	return "anytls-in"
 }
 
-func (i *incrementalTestInbound) Start(adapter.StartStage) error {
+func (i *incrementalTestInbound) Start(adapter.StartStage, *adapter.Scope) error {
 	return nil
 }
 
@@ -544,10 +544,10 @@ type fullRefreshTestInbound struct {
 	failures int
 }
 
-func (*fullRefreshTestInbound) Type() string                   { return C.TypeAnyTLS }
-func (*fullRefreshTestInbound) Tag() string                    { return "anytls-in" }
-func (*fullRefreshTestInbound) Start(adapter.StartStage) error { return nil }
-func (*fullRefreshTestInbound) Close() error                   { return nil }
+func (*fullRefreshTestInbound) Type() string                                   { return C.TypeAnyTLS }
+func (*fullRefreshTestInbound) Tag() string                                    { return "anytls-in" }
+func (*fullRefreshTestInbound) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (*fullRefreshTestInbound) Close() error                                   { return nil }
 
 func (i *fullRefreshTestInbound) seedRuntime(users []api.UserInfo) {
 	i.runtime = make(map[string]string, len(users))

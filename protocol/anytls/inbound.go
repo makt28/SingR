@@ -239,7 +239,7 @@ func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 	return nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -250,6 +250,13 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 	// same.
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	// Register our own Close rather than upstream's per-object
+	// scope.Add(h.listener.Close) / scope.Add(h.tlsConfig.Close): a method
+	// value binds the listener/TLS that exist *now*, but hot reload swaps
+	// both, so shutdown would close the stale ones and leak the live ones.
+	// Close reads the current fields under reloadMu. Registered before
+	// starting anything so a partial Start is still cleaned up.
+	scope.Add(h.Close)
 	if h.tlsConfig != nil {
 		err := h.tlsConfig.Start()
 		if err != nil {

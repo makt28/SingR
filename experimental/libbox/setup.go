@@ -1,6 +1,7 @@
 package libbox
 
 import (
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -38,6 +39,7 @@ var (
 	sOOMKillerDisabled       bool
 	sOOMMemoryLimit          int64
 	sPowerReportEnabled      bool
+	sPlatformMetadata        []byte
 )
 
 func init() {
@@ -61,6 +63,7 @@ type SetupOptions struct {
 	OomKillerDisabled       bool
 	OomMemoryLimit          int64
 	PowerReportEnabled      bool
+	PlatformMetadata        string
 }
 
 func applySetupOptions(options *SetupOptions) {
@@ -90,6 +93,11 @@ func ReloadSetupOptions(options *SetupOptions) {
 	sOOMKillerDisabled = options.OomKillerDisabled
 	sOOMMemoryLimit = options.OomMemoryLimit
 	sPowerReportEnabled = options.PowerReportEnabled
+	if json.Valid([]byte(options.PlatformMetadata)) {
+		sPlatformMetadata = []byte(options.PlatformMetadata)
+	} else {
+		sPlatformMetadata = nil
+	}
 	if sOOMKillerEnabled {
 		if sOOMMemoryLimit == 0 && C.IsIos {
 			sOOMMemoryLimit = oomkiller.DefaultAppleNetworkExtensionMemoryLimit
@@ -117,7 +125,9 @@ func Setup(options *SetupOptions) error {
 	// This lives in libbox only; cmd/sing-box does not import it, so the Linux
 	// binary and its `-p` behaviour are untouched.
 	poetShortcuts.SetObject("poetConfigPath", filepath.Join(sWorkingPath, "panel.json"))
-	return redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log"))
+	err := redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log"))
+	savePlatformSnapshot()
+	return err
 }
 
 func SetLocale(localeID string) error {

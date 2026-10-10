@@ -272,7 +272,7 @@ type stubInbound struct{ tag string }
 
 func (s *stubInbound) Type() string                  { return "anytls" }
 func (s *stubInbound) Tag() string                   { return s.tag }
-func (s *stubInbound) Start(adapter.StartStage) error { return nil }
+func (s *stubInbound) Start(adapter.StartStage, *adapter.Scope) error { return nil }
 func (s *stubInbound) Close() error                  { return nil }
 
 // stubAPI is a no-op api.API for controller.New. POET.RoutedConnection

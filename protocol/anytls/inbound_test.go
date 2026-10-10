@@ -93,7 +93,7 @@ func TestAnyTLSConfigureFromPanelNodePreStart(t *testing.T) {
 	if h.options.TLS == nil || h.options.TLS.ServerName != "panel.example.com" {
 		t.Fatalf("TLS options = %#v, want panel SNI", h.options.TLS)
 	}
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	assertTCPPortBound(t, panelPort, true)
@@ -104,7 +104,7 @@ func TestAnyTLSConfigureFromPanelNodeHotReloadAndRollback(t *testing.T) {
 	initialPort := testFreeTCPPort(t)
 	reloadPort := testFreeTCPPort(t)
 	h := newTestAnyTLSInbound(t, initialPort, "initial.example.com")
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -154,6 +154,29 @@ func TestAnyTLSConfigureFromPanelNodeHotReloadAndRollback(t *testing.T) {
 	assertTCPPortBound(t, reloadPort, true)
 }
 
+// The 1.14.3 lifecycle closes inbounds through the Scope passed to Start,
+// not a Close call from the manager. The scope must release the listener
+// that is live at shutdown — the hot-reloaded one — not the one that existed
+// when Start ran.
+func TestAnyTLSScopeCloseReleasesHotReloadedListener(t *testing.T) {
+	initialPort := testFreeTCPPort(t)
+	reloadPort := testFreeTCPPort(t)
+	h := newTestAnyTLSInbound(t, initialPort, "initial.example.com")
+	scope := newTestScope()
+	if err := h.Start(adapter.StartStateStart, scope); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: C.TypeAnyTLS, Port: uint32(reloadPort), Host: "initial.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	assertTCPPortBound(t, reloadPort, true)
+	assertTCPPortBound(t, initialPort, false)
+	if err := scope.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertTCPPortBound(t, reloadPort, false)
+}
+
 func TestAnyTLSConfigureFromPanelNodeRejectsInvalidPort(t *testing.T) {
 	h := newTestAnyTLSInbound(t, testFreeTCPPort(t), "initial.example.com")
 	defer h.Close()
@@ -172,7 +195,7 @@ func TestAnyTLSConfigureFromPanelNodeRejectsInvalidPort(t *testing.T) {
 func TestAnyTLSConfigureFromPanelNodeNoOpPreservesComponents(t *testing.T) {
 	port := testFreeTCPPort(t)
 	h := newTestAnyTLSInbound(t, port, "initial.example.com")
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -188,7 +211,7 @@ func TestAnyTLSConfigureFromPanelNodeNoOpPreservesComponents(t *testing.T) {
 func TestAnyTLSConfigureFromPanelNodeConcurrentReloadAndUsers(t *testing.T) {
 	portA, portB := testFreeTCPPort(t), testFreeTCPPort(t)
 	h := newTestAnyTLSInbound(t, portA, "initial.example.com")
-	if err := h.Start(adapter.StartStateStart); err != nil {
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
@@ -301,6 +324,10 @@ func (r *captureAnyTLSRouter) RouteConnectionEx(_ context.Context, _ net.Conn, m
 }
 
 func (r *captureAnyTLSRouter) RoutePacketConnectionEx(context.Context, N.PacketConn, adapter.InboundContext, N.CloseHandlerFunc) {
+}
+
+func newTestScope() *adapter.Scope {
+	return adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
 }
 
 func newTestAnyTLSInbound(t *testing.T, port int, serverName string) *Inbound {
