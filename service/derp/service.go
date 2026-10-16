@@ -71,6 +71,8 @@ type Service struct {
 	meshKey              string
 	meshKeyPath          string
 	meshWith             []*option.DERPMeshOptions
+	singr                option.SingRDERPOptions
+	listenPort           uint16
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.DERPServiceOptions) (adapter.Service, error) {
@@ -87,6 +89,11 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		configPath = filemanager.BasePath(ctx, os.ExpandEnv(options.ConfigPath))
 	} else {
 		return nil, E.New("missing config_path")
+	}
+
+	err = validateSingRDERPOptions(options)
+	if err != nil {
+		return nil, err
 	}
 
 	if options.MeshPSK != "" {
@@ -131,6 +138,8 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		meshKey:              options.MeshPSK,
 		meshKeyPath:          options.MeshPSKFile,
 		meshWith:             options.MeshWith,
+		singr:                options.SingRDERPOptions,
+		listenPort:           options.ListenPort,
 	}, nil
 }
 
@@ -176,6 +185,7 @@ func (d *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			server.SetMeshKey(string(meshKeyContent))
 		}
+		d.applyLoopbackVerifier(server)
 		d.server = server
 
 		derpMux := http.NewServeMux()
@@ -262,6 +272,10 @@ func (d *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 					return err
 				}
 			}
+		}
+		err := d.startMeshURL(scope)
+		if err != nil {
+			return err
 		}
 	}
 	return nil

@@ -82,6 +82,7 @@ type TailscaleCertificateProviderOptions struct {
 type DERPServiceOptions struct {
 	ListenOptions
 	InboundTLSOptionsContainer
+	SingRDERPOptions
 	ConfigPath           string                                          `json:"config_path,omitempty"`
 	VerifyClientEndpoint badoption.Listable[string]                      `json:"verify_client_endpoint,omitempty"`
 	VerifyClientURL      badoption.Listable[*DERPVerifyClientURLOptions] `json:"verify_client_url,omitempty"`
