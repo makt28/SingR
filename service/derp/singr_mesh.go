@@ -7,9 +7,10 @@ package derp
 //   - verify_client_loopback: ordinary clients are admitted only from the
 //     loopback address (mesh peers bypass verification upstream, see
 //     derpserver.Server.verifyClient).
-//   - control_url: the node registers with the Linbei headscale fork and gets
-//     the mesh PSK plus every other relay from it; peers are added and
-//     removed in place while running.
+//   - registry_url: the node reports itself (port, certificate pin, its own
+//     public IPv4 / IPv6) to sspapi's tailnet.php every minute and gets the
+//     mesh PSK plus every other relay back; peers are added and removed in
+//     place while running.
 //   - probe_listen_port: a loopback plain-HTTP 204 that clients probe through
 //     each proxy node to find the ones that have a relay.
 //
@@ -51,17 +52,36 @@ import (
 	"github.com/sagernet/tailscale/tailcfg"
 )
 
+// Variables only so tests can shorten them.
+var (
+	defaultSyncInterval   = 60 * time.Second
+	minSyncInterval       = 10 * time.Second
+	addressCheckInterval  = 5 * time.Second
+	addressChangeDebounce = 2 * time.Second
+	peerFailureResync     = 10 * time.Second
+	publicIPRetryInterval = 30 * time.Second
+)
+
 const (
-	defaultControlInterval   = 5 * time.Minute
-	minControlInterval       = 30 * time.Second
-	controlMaxResponseBytes  = 1 << 20
-	controlRequestTimeout    = 20 * time.Second
-	controlCacheName         = "mesh-control.cache.json"
+	publicIPLookupTimeout    = 5 * time.Second
+	registryRequestTimeout   = 15 * time.Second
+	registryMaxResponseBytes = 1 << 20
+	registryCacheName        = "mesh-registry.cache.json"
 	meshPeerErrorLogInterval = time.Minute
+
+	// advertise_ipv4 / advertise_ipv6 value that stops reporting the family.
+	advertiseNone = "none"
 
 	// Never dialed: loopbackAdmitTransport answers it in-process.
 	loopbackAdmitURL = "http://loopback-admit.singr.invalid/admit"
 )
+
+// The kernel is asked which source address it would use towards these; a
+// connected UDP socket sends nothing, so this costs no traffic.
+var routeProbeTargets = [2]string{"1.1.1.1:53", "[2606:4700:4700::1111]:53"}
+
+// Asked once at startup (until it answers) when the machine sits behind NAT.
+var publicIPLookupURLs = [2]string{"https://api-ipv4.ip.sb/ip", "https://api-ipv6.ip.sb/ip"}
 
 func validateSingRDERPOptions(options option.DERPServiceOptions) error {
 	if options.VerifyClientLoopback && (len(options.VerifyClientURL) > 0 || len(options.VerifyClientEndpoint) > 0) {
@@ -70,33 +90,42 @@ func validateSingRDERPOptions(options option.DERPServiceOptions) error {
 	if options.ProbeListenPort != 0 && options.ProbeListenPort == options.ListenPort {
 		return E.New("probe_listen_port must differ from listen_port")
 	}
-	if options.ControlURL == "" {
+	if options.RegistryURL == "" {
 		return nil
 	}
-	parsed, err := url.Parse(options.ControlURL)
+	parsed, err := url.Parse(options.RegistryURL)
 	if err != nil {
-		return E.Cause(err, "invalid control_url")
+		return E.Cause(err, "invalid registry_url")
 	}
-	// The control server decides whom we hand our mesh key to, so the
-	// channel to it must not be tamperable.
+	// The registry decides whom we hand our mesh key to, so the channel to it
+	// must not be tamperable.
 	if parsed.Scheme != "https" || parsed.Host == "" {
-		return E.New("control_url must be an https URL")
+		return E.New("registry_url must be an https URL")
 	}
-	if options.ControlTokenPath == "" {
-		return E.New("control_url requires control_token_path")
+	if options.RegistryTokenPath == "" {
+		return E.New("registry_url requires registry_token_path")
 	}
 	if options.MeshPSK != "" || options.MeshPSKFile != "" {
-		return E.New("control_url provides the mesh PSK; remove mesh_psk / mesh_psk_file")
+		return E.New("registry_url provides the mesh PSK; remove mesh_psk / mesh_psk_file")
 	}
-	// We register our port, and list entries without a port use it.
 	if options.ListenPort == 0 {
-		return E.New("control_url requires listen_port")
+		return E.New("registry_url requires listen_port")
 	}
 	if options.TLS == nil || (len(options.TLS.Certificate) == 0 && options.TLS.CertificatePath == "") {
-		return E.New("control_url requires a fixed TLS certificate (its pin is what other relays verify)")
+		return E.New("registry_url requires a fixed TLS certificate (its pin is what other relays verify)")
 	}
-	if interval := time.Duration(options.ControlInterval); interval != 0 && interval < minControlInterval {
-		return E.New("control_interval must be at least ", minControlInterval)
+	for family, value := range [2]string{options.AdvertiseIPv4, options.AdvertiseIPv6} {
+		if value == "" || value == advertiseNone {
+			continue
+		}
+		address, parseErr := netip.ParseAddr(value)
+		if parseErr != nil || address.Zone() != "" || address.Is4() != (family == 0) {
+			return E.New("advertise_ipv", []string{"4", "6"}[family], ": want an IPv", []string{"4", "6"}[family],
+				" address or \"none\", got ", strconv.Quote(value))
+		}
+	}
+	if options.AdvertiseIPv4 == advertiseNone && options.AdvertiseIPv6 == advertiseNone {
+		return E.New("advertise_ipv4 and advertise_ipv6 are both \"none\": nothing to report")
 	}
 	return nil
 }
@@ -111,7 +140,7 @@ func (d *Service) startSingR(server *derpserver.Server, scope *adapter.Scope) er
 			return err
 		}
 	}
-	if d.singr.ControlURL == "" {
+	if d.singr.RegistryURL == "" {
 		return nil
 	}
 	control, err := d.newMeshControl()
@@ -124,7 +153,7 @@ func (d *Service) startSingR(server *derpserver.Server, scope *adapter.Scope) er
 	// pre-fetches it into the cache; without a cache we ask once here.
 	psk := control.initialPSK()
 	if psk == "" {
-		d.logger.Error("no mesh PSK from control server or cache; relaying works, meshing stays off until restart")
+		d.logger.Error("no mesh PSK from the registry or cache; relaying works, meshing stays off until restart")
 		return nil
 	}
 	return server.SetMeshKey(psk)
@@ -222,7 +251,7 @@ func isLoopbackSource(address netip.Addr) bool {
 	return address.IsValid() && address.Unmap().IsLoopback()
 }
 
-// ---- mesh peer list ----
+// ---- mesh peers ----
 
 type meshTarget struct {
 	Host string
@@ -237,121 +266,13 @@ func (t meshTarget) String() string {
 	return net.JoinHostPort(t.Host, strconv.Itoa(int(t.Port)))
 }
 
-// id identifies a running peer connection: a changed pin must reconnect.
+// id identifies a running peer connection: a changed address or pin must
+// reconnect.
 func (t meshTarget) id() string {
 	if len(t.Pin) == 0 {
 		return t.String()
 	}
 	return t.String() + " pin=" + base64.StdEncoding.EncodeToString(t.Pin)
-}
-
-type meshPeerListFile struct {
-	// Each entry is either a string "host" / "host:port" ("[v6]:port" for
-	// IPv6 with a port), or an object {"host": "...", "pin": "<base64>"}.
-	// Entries without a port use this node's own DERP listen port. Unknown
-	// fields are ignored, at the top level and inside entries: the same file
-	// is read by clients, which may need more than the mesh does.
-	Nodes []json.RawMessage `json:"nodes"`
-}
-
-type meshPeerListEntry struct {
-	Host string `json:"host"`
-	Pin  string `json:"pin"`
-}
-
-// parseMeshPeerList rejects the whole list on any bad entry, so a typo keeps
-// the current peers instead of quietly dropping one. An empty list is
-// rejected too: the registry always lists us, so an empty one means it lost
-// its state, and that must not tear the mesh down.
-func parseMeshPeerList(content []byte, defaultPort uint16) ([]meshTarget, error) {
-	var file meshPeerListFile
-	err := json.Unmarshal(content, &file)
-	if err != nil {
-		return nil, E.Cause(err, "decode mesh peer list")
-	}
-	if len(file.Nodes) == 0 {
-		return nil, E.New("mesh peer list has no nodes")
-	}
-	var targets []meshTarget
-	seen := make(map[string]meshTarget)
-	for index, raw := range file.Nodes {
-		target, parseErr := parseMeshEntry(raw, defaultPort)
-		if parseErr != nil {
-			return nil, E.Cause(parseErr, "nodes[", index, "]")
-		}
-		if previous, duplicate := seen[target.String()]; duplicate {
-			if previous.id() != target.id() {
-				return nil, E.New("nodes[", index, "]: ", target.String(), " listed twice with different pins")
-			}
-			continue
-		}
-		seen[target.String()] = target
-		targets = append(targets, target)
-	}
-	return targets, nil
-}
-
-func parseMeshEntry(raw json.RawMessage, defaultPort uint16) (meshTarget, error) {
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return parseMeshTarget(text, defaultPort)
-	}
-	var entry meshPeerListEntry
-	err := json.Unmarshal(raw, &entry)
-	if err != nil {
-		return meshTarget{}, E.New("want a string or {\"host\", \"pin\"} object")
-	}
-	target, err := parseMeshTarget(entry.Host, defaultPort)
-	if err != nil {
-		return meshTarget{}, err
-	}
-	if pin := strings.TrimSpace(entry.Pin); pin != "" {
-		decoded, decodeErr := base64.StdEncoding.DecodeString(pin)
-		if decodeErr != nil || len(decoded) != sha256.Size {
-			return meshTarget{}, E.New("pin of ", target.String(), " must be a base64 SHA-256 (44 characters)")
-		}
-		target.Pin = decoded
-	}
-	return target, nil
-}
-
-func parseMeshTarget(entry string, defaultPort uint16) (meshTarget, error) {
-	entry = strings.TrimSpace(entry)
-	if entry == "" {
-		return meshTarget{}, E.New("empty host")
-	}
-	if strings.Contains(entry, "://") || strings.ContainsAny(entry, "/?#@ \t") {
-		return meshTarget{}, E.New("want host or host:port, got ", strconv.Quote(entry))
-	}
-	if address, err := netip.ParseAddr(entry); err == nil {
-		if address.Zone() != "" {
-			return meshTarget{}, E.New("zoned address not allowed: ", entry)
-		}
-		return meshTarget{Host: address.String(), Port: defaultPort}, nil
-	}
-	if !strings.Contains(entry, ":") {
-		return meshTarget{Host: strings.ToLower(strings.TrimSuffix(entry, ".")), Port: defaultPort}, nil
-	}
-	host, portText, err := net.SplitHostPort(entry)
-	if err != nil {
-		return meshTarget{}, E.Cause(err, "parse ", strconv.Quote(entry))
-	}
-	port, err := strconv.ParseUint(portText, 10, 16)
-	if err != nil || port == 0 {
-		return meshTarget{}, E.New("invalid port in ", strconv.Quote(entry))
-	}
-	if host == "" {
-		return meshTarget{}, E.New("missing host in ", strconv.Quote(entry))
-	}
-	if address, addrErr := netip.ParseAddr(host); addrErr == nil {
-		if address.Zone() != "" {
-			return meshTarget{}, E.New("zoned address not allowed: ", entry)
-		}
-		host = address.String()
-	} else {
-		host = strings.ToLower(strings.TrimSuffix(host, "."))
-	}
-	return meshTarget{Host: host, Port: uint16(port)}, nil
 }
 
 // meshPeerSet owns the running peer connections; apply diffs against them.
@@ -402,39 +323,250 @@ func (s *meshPeerSet) closeAll() {
 	}
 }
 
-// ---- control_url ----
+// ---- own addresses ----
+
+// isPublicAddress: what the registry accepts and other relays can dial.
+func isPublicAddress(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() {
+		return false
+	}
+	if address.Is4() {
+		return !netip.MustParsePrefix("100.64.0.0/10").Contains(address)
+	}
+	return netip.MustParsePrefix("2000::/3").Contains(address) &&
+		!netip.MustParsePrefix("2001:db8::/32").Contains(address)
+}
+
+// localSourceAddress asks the kernel which address it would send from towards
+// a public host (0 = IPv4, 1 = IPv6). Invalid when the family has no route.
+func localSourceAddress(family int) netip.Addr {
+	conn, err := net.Dial([]string{"udp4", "udp6"}[family], routeProbeTargets[family])
+	if err != nil {
+		return netip.Addr{}
+	}
+	defer conn.Close()
+	addressPort, err := netip.ParseAddrPort(conn.LocalAddr().String())
+	if err != nil {
+		return netip.Addr{}
+	}
+	return addressPort.Addr().Unmap()
+}
+
+// lookupPublicIP asks ip.sb, over the given family only, which address we
+// come from. Used when the machine's own address is not public (NAT).
+func lookupPublicIP(ctx context.Context, family int) (netip.Addr, error) {
+	network := []string{"tcp4", "tcp6"}[family]
+	var netDialer net.Dialer
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+			return netDialer.DialContext(ctx, network, address)
+		},
+		TLSHandshakeTimeout: publicIPLookupTimeout,
+	}
+	defer transport.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(ctx, publicIPLookupTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, publicIPLookupURLs[family], nil)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	request.Header.Set("User-Agent", "SingR")
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer response.Body.Close()
+	content, err := io.ReadAll(io.LimitReader(response.Body, 256))
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return netip.Addr{}, E.New(publicIPLookupURLs[family], ": ", response.Status)
+	}
+	address, err := netip.ParseAddr(strings.TrimSpace(string(content)))
+	if err != nil || address.Is4() != (family == 0) || !isPublicAddress(address) {
+		return netip.Addr{}, E.New(publicIPLookupURLs[family], ": unexpected answer ", strconv.Quote(strings.TrimSpace(string(content))))
+	}
+	return address, nil
+}
+
+// ownAddresses decides what we report, per family:
+//   - advertise_ipv4 / advertise_ipv6 set to an address: that, always;
+//   - set to "none": nothing;
+//   - empty (auto): the address the kernel would send from, when it is
+//     public (most VPS); behind NAT, what ip.sb said once at startup.
+type ownAddresses struct {
+	pinned   [2]string
+	local    func(family int) netip.Addr
+	lookup   func(ctx context.Context, family int) (netip.Addr, error)
+	lookedUp [2]netip.Addr
+	lastTry  [2]time.Time
+	current  [2]netip.Addr
+}
+
+// needsLookup: auto family, a route exists, but the source address is not
+// public and ip.sb has not answered yet.
+func (a *ownAddresses) needsLookup(family int, local netip.Addr) bool {
+	return a.pinned[family] == "" && local.IsValid() && !isPublicAddress(local) && !a.lookedUp[family].IsValid()
+}
+
+// refresh recomputes both families and reports whether anything changed.
+// ip.sb is asked at most every publicIPRetryInterval and only until it answers.
+func (a *ownAddresses) refresh(ctx context.Context, now time.Time, log logger.ContextLogger) bool {
+	changed := false
+	for family := range 2 {
+		var next netip.Addr
+		switch pinned := a.pinned[family]; pinned {
+		case advertiseNone:
+		case "":
+			local := a.local(family)
+			if a.needsLookup(family, local) && now.Sub(a.lastTry[family]) >= publicIPRetryInterval {
+				a.lastTry[family] = now
+				address, err := a.lookup(ctx, family)
+				if err != nil {
+					log.Warn("public IPv", 4+2*family, " lookup (retrying in ", publicIPRetryInterval, "): ", err)
+				} else {
+					a.lookedUp[family] = address
+				}
+			}
+			if isPublicAddress(local) {
+				next = local
+			} else {
+				next = a.lookedUp[family]
+			}
+		default:
+			next = netip.MustParseAddr(pinned)
+		}
+		if next != a.current[family] {
+			if a.current[family].IsValid() || next.IsValid() {
+				log.Info("reported IPv", 4+2*family, ": ", addressText(a.current[family]), " -> ", addressText(next))
+			}
+			a.current[family] = next
+			changed = true
+		}
+	}
+	return changed
+}
+
+func addressText(address netip.Addr) string {
+	if !address.IsValid() {
+		return "none"
+	}
+	return address.String()
+}
+
+// ---- registry ----
+
+type registryNode struct {
+	Pin  string `json:"pin"`
+	Port int    `json:"port"`
+	IPv4 string `json:"ipv4"`
+	IPv6 string `json:"ipv6"`
+}
+
+// registryResponse is tailnet.php's derp_sync answer (also what the cache
+// holds, byte for byte).
+type registryResponse struct {
+	Status   string         `json:"status"`
+	Code     string         `json:"code"`
+	Message  string         `json:"message"`
+	PSK      string         `json:"psk"`
+	Nodes    []registryNode `json:"nodes"`
+	Interval int            `json:"interval"`
+}
+
+func parseRegistryResponse(content []byte) (registryResponse, error) {
+	var response registryResponse
+	err := json.Unmarshal(content, &response)
+	if err != nil {
+		return response, E.Cause(err, "decode registry response")
+	}
+	if response.Status != "success" {
+		return response, E.New("registry: ", response.Code, " ", response.Message)
+	}
+	if checkMeshKey(response.PSK) != nil {
+		return response, E.New("registry response has no valid PSK")
+	}
+	// The registry always lists us, so an empty list means it lost its
+	// state; that must not tear the mesh down.
+	if len(response.Nodes) == 0 {
+		return response, E.New("registry lists no nodes")
+	}
+	return response, nil
+}
+
+// meshTargets picks, for every other node, the address to mesh over: IPv4
+// when both sides have one, else IPv6 when both do. A node sharing no family
+// with us is returned in unreachable. The whole list is rejected on any bad
+// entry, so a broken registry keeps the current peers.
+func meshTargets(nodes []registryNode, selfPin string, self [2]netip.Addr) (targets []meshTarget, unreachable []string, err error) {
+	for index, node := range nodes {
+		pin, decodeErr := base64.StdEncoding.DecodeString(node.Pin)
+		if decodeErr != nil || len(pin) != sha256.Size {
+			return nil, nil, E.New("nodes[", index, "]: bad pin")
+		}
+		if node.Port < 1 || node.Port > 65535 {
+			return nil, nil, E.New("nodes[", index, "]: bad port")
+		}
+		var peer [2]netip.Addr
+		for family, text := range [2]string{node.IPv4, node.IPv6} {
+			if text == "" {
+				continue
+			}
+			address, parseErr := netip.ParseAddr(text)
+			if parseErr != nil || address.Zone() != "" || address.Is4() != (family == 0) {
+				return nil, nil, E.New("nodes[", index, "]: bad IPv", 4+2*family, " ", strconv.Quote(text))
+			}
+			peer[family] = address
+		}
+		if node.Pin == selfPin {
+			continue
+		}
+		chosen := -1
+		for family := range 2 {
+			if self[family].IsValid() && peer[family].IsValid() {
+				chosen = family
+				break
+			}
+		}
+		if chosen < 0 {
+			unreachable = append(unreachable, node.Pin)
+			continue
+		}
+		targets = append(targets, meshTarget{Host: peer[chosen].String(), Port: uint16(node.Port), Pin: pin})
+	}
+	return targets, unreachable, nil
+}
 
 type meshControl struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	logger      logger.ContextLogger
-	baseURL     string
+	registryURL string
 	token       string
-	advertise   string
 	pin         string
 	listenPort  uint16
-	interval    time.Duration
 	cachePath   string
 	httpClient  *http.Client
 	access      sync.Mutex
 	peers       *meshPeerSet
+	addresses   ownAddresses
+	interval    time.Duration
 	currentPSK  string
 	warnedPSK   string
+	warned      map[string]bool
+	peerFailed  chan struct{}
 	started     bool
 	done        chan struct{}
-	startPeerFn func(context.Context, meshTarget) (func(), error)
-}
-
-// meshControlResponse is GET /linbei/derp/mesh. The nodes part is parsed by
-// parseMeshPeerList.
-type meshControlResponse struct {
-	PSK string `json:"psk"`
+	startPeerFn func(context.Context, meshTarget, func()) (func(), error)
 }
 
 func (d *Service) newMeshControl() (*meshControl, error) {
-	token, err := os.ReadFile(d.singr.ControlTokenPath)
+	token, err := os.ReadFile(d.singr.RegistryTokenPath)
 	if err != nil {
-		return nil, E.Cause(err, "read control_token_path")
+		return nil, E.Cause(err, "read registry_token_path")
 	}
 	certificate := []byte(strings.Join(d.tlsOptions.Certificate, "\n"))
 	if d.tlsOptions.CertificatePath != "" {
@@ -447,63 +579,70 @@ func (d *Service) newMeshControl() (*meshControl, error) {
 	if err != nil {
 		return nil, E.Cause(err, "DERP certificate pin")
 	}
-	interval := time.Duration(d.singr.ControlInterval)
-	if interval == 0 {
-		interval = defaultControlInterval
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Never follow proxy environment variables for the control server.
-	transport.Proxy = nil
-	control := &meshControl{
-		ctx:        ctx,
-		cancel:     cancel,
-		logger:     d.logger,
-		baseURL:    strings.TrimSuffix(d.singr.ControlURL, "/"),
-		token:      strings.TrimSpace(string(token)),
-		advertise:  d.singr.ControlAdvertiseHost,
-		pin:        pin,
-		listenPort: d.listenPort,
-		interval:   interval,
-		cachePath:  filepath.Join(filepath.Dir(d.configPath), controlCacheName),
-		httpClient: &http.Client{Transport: transport, Timeout: controlRequestTimeout},
-		done:       make(chan struct{}),
-	}
+	control := newMeshControl(d.logger, d.singr.RegistryURL, strings.TrimSpace(string(token)), pin, d.listenPort,
+		filepath.Join(filepath.Dir(d.configPath), registryCacheName),
+		[2]string{d.singr.AdvertiseIPv4, d.singr.AdvertiseIPv6})
 	control.startPeerFn = d.startMeshPeer
-	control.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
-		return control.startPeerFn(ctx, target)
-	})
 	return control, nil
 }
 
-// initialPSK reads the cached response, or fetches once when there is none.
+func newMeshControl(log logger.ContextLogger, registryURL, token, pin string, listenPort uint16, cachePath string, pinned [2]string) *meshControl {
+	ctx, cancel := context.WithCancel(context.Background())
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Never follow proxy environment variables for the registry.
+	transport.Proxy = nil
+	control := &meshControl{
+		ctx:         ctx,
+		cancel:      cancel,
+		logger:      log,
+		registryURL: registryURL,
+		token:       token,
+		pin:         pin,
+		listenPort:  listenPort,
+		cachePath:   cachePath,
+		httpClient:  &http.Client{Transport: transport, Timeout: registryRequestTimeout},
+		addresses:   ownAddresses{pinned: pinned, local: localSourceAddress, lookup: lookupPublicIP},
+		interval:    defaultSyncInterval,
+		warned:      make(map[string]bool),
+		peerFailed:  make(chan struct{}, 1),
+		done:        make(chan struct{}),
+	}
+	control.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
+		return control.startPeerFn(ctx, target, control.notePeerFailure)
+	})
+	return control
+}
+
+// initialPSK reads the cached response, or registers once when there is none.
 func (m *meshControl) initialPSK() string {
 	content, err := os.ReadFile(m.cachePath)
 	if err != nil {
-		content, err = m.fetch()
+		m.addresses.refresh(m.ctx, time.Now(), m.logger)
+		content, err = m.syncRequest()
 		if err != nil {
-			m.logger.Warn("fetch mesh from control server: ", err)
+			m.logger.Warn("register with the registry: ", err)
 			return ""
 		}
 		m.writeCache(content)
 	}
-	var response meshControlResponse
-	if json.Unmarshal(content, &response) != nil || checkMeshKey(response.PSK) != nil {
-		m.logger.Warn("cached mesh response has no valid PSK")
+	response, err := parseRegistryResponse(content)
+	if err != nil {
+		m.logger.Warn("cached registry response unusable: ", err)
 		return ""
 	}
 	m.currentPSK = response.PSK
 	return response.PSK
 }
 
-// start brings the cached peers up first, so a restart while the control
-// server is unreachable still rebuilds the mesh, then keeps registering and
-// refreshing. Without a mesh key we still register (other relays should know
-// us) but start no peers.
+// start brings the cached peers up first, so a restart while the registry is
+// unreachable still rebuilds the mesh, then keeps reporting and refreshing.
+// Without a mesh key we still report (other relays should know us) but start
+// no peers.
 func (m *meshControl) start(meshEnabled bool) {
 	if !meshEnabled {
 		m.peers = nil
 	}
+	m.addresses.refresh(m.ctx, time.Now(), m.logger)
 	content, err := os.ReadFile(m.cachePath)
 	if err == nil {
 		m.apply(content, "cache")
@@ -512,94 +651,118 @@ func (m *meshControl) start(meshEnabled bool) {
 	go m.loop()
 }
 
+func (m *meshControl) notePeerFailure() {
+	select {
+	case m.peerFailed <- struct{}{}:
+	default:
+	}
+}
+
 func (m *meshControl) loop() {
 	defer close(m.done)
-	m.refresh()
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
+	m.sync()
+	addressTicker := time.NewTicker(addressCheckInterval)
+	defer addressTicker.Stop()
+	syncTimer := time.NewTimer(m.interval)
+	defer syncTimer.Stop()
+	var debounce <-chan time.Time
+	var lastFailureSync time.Time
+	resync := func() {
+		m.sync()
+		syncTimer.Reset(m.interval)
+	}
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-ticker.C:
-			m.refresh()
+		case now := <-addressTicker.C:
+			if m.addresses.refresh(m.ctx, now, m.logger) && debounce == nil {
+				debounce = time.After(addressChangeDebounce)
+			}
+		case <-debounce:
+			debounce = nil
+			resync()
+		case <-m.peerFailed:
+			// A peer that changed address fails until we learn the new one.
+			if time.Since(lastFailureSync) >= peerFailureResync {
+				lastFailureSync = time.Now()
+				resync()
+			}
+		case <-syncTimer.C:
+			resync()
 		}
 	}
 }
 
-func (m *meshControl) refresh() {
-	err := m.register()
-	if err != nil && m.ctx.Err() == nil {
-		m.logger.Warn("register with control server: ", err)
-	}
-	content, err := m.fetch()
+func (m *meshControl) sync() {
+	content, err := m.syncRequest()
 	if err != nil {
 		if m.ctx.Err() == nil {
-			m.logger.Warn("fetch mesh from control server (keeping current peers): ", err)
+			m.logger.Warn("sync with the registry (keeping current peers): ", err)
 		}
 		return
 	}
-	if m.apply(content, "control") {
+	if m.apply(content, "registry") {
 		m.writeCache(content)
 	}
 }
 
-func (m *meshControl) register() error {
-	body, err := json.Marshal(map[string]any{
-		"host": m.advertise,
-		"port": m.listenPort,
-		"pin":  m.pin,
-	})
-	if err != nil {
-		return err
+func (m *meshControl) syncRequest() ([]byte, error) {
+	self := m.addresses.current
+	if !self[0].IsValid() && !self[1].IsValid() {
+		return nil, E.New("no public IPv4 or IPv6 to report (set advertise_ipv4 / advertise_ipv6)")
 	}
-	_, err = m.do(http.MethodPost, "/linbei/derp/register", body)
-	return err
-}
-
-func (m *meshControl) fetch() ([]byte, error) {
-	return m.do(http.MethodGet, "/linbei/derp/mesh", nil)
-}
-
-func (m *meshControl) do(method, path string, body []byte) ([]byte, error) {
-	request, err := http.NewRequestWithContext(m.ctx, method, m.baseURL+path, bytes.NewReader(body))
+	form := url.Values{
+		"action":     {"derp_sync"},
+		"node_token": {m.token},
+		"port":       {strconv.Itoa(int(m.listenPort))},
+		"pin":        {m.pin},
+	}
+	if self[0].IsValid() {
+		form.Set("ipv4", self[0].String())
+	}
+	if self[1].IsValid() {
+		form.Set("ipv6", self[1].String())
+	}
+	request, err := http.NewRequestWithContext(m.ctx, http.MethodPost, m.registryURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Authorization", "Bearer "+m.token)
-	if body != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, err := m.httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
-	content, err := io.ReadAll(io.LimitReader(response.Body, controlMaxResponseBytes+1))
+	content, err := io.ReadAll(io.LimitReader(response.Body, registryMaxResponseBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if response.StatusCode != http.StatusOK {
-		return nil, E.New(method, " ", path, ": ", response.Status, ": ", strings.TrimSpace(string(content)))
+	if len(content) > registryMaxResponseBytes {
+		return nil, E.New("response larger than ", registryMaxResponseBytes, " bytes")
 	}
-	if len(content) > controlMaxResponseBytes {
-		return nil, E.New("response larger than ", controlMaxResponseBytes, " bytes")
+	if response.StatusCode != http.StatusOK {
+		var failure registryResponse
+		_ = json.Unmarshal(content, &failure)
+		if failure.Code != "" {
+			return nil, E.New(response.Status, ": ", failure.Code, " ", failure.Message)
+		}
+		return nil, E.New(response.Status)
 	}
 	return content, nil
 }
 
-// apply updates peers from a mesh response and reports whether it was usable.
-// A bad or empty response keeps the current peers.
+// apply updates peers from a registry response and reports whether it was
+// usable. A bad or empty response keeps the current peers.
 func (m *meshControl) apply(content []byte, source string) bool {
-	var response meshControlResponse
-	err := json.Unmarshal(content, &response)
-	if err != nil || checkMeshKey(response.PSK) != nil {
-		m.logger.Warn("bad mesh response from ", source, " (keeping current peers)")
+	response, err := parseRegistryResponse(content)
+	if err != nil {
+		m.logger.Warn("bad registry response from ", source, " (keeping current peers): ", err)
 		return false
 	}
-	targets, err := parseMeshPeerList(content, m.listenPort)
+	targets, unreachable, err := meshTargets(response.Nodes, m.pin, m.addresses.current)
 	if err != nil {
-		m.logger.Warn("bad mesh peer list from ", source, " (keeping current peers): ", err)
+		m.logger.Warn("bad node list from ", source, " (keeping current peers): ", err)
 		return false
 	}
 	m.access.Lock()
@@ -607,11 +770,20 @@ func (m *meshControl) apply(content []byte, source string) bool {
 	if m.ctx.Err() != nil {
 		return false
 	}
+	if source == "registry" && response.Interval > 0 {
+		m.interval = max(time.Duration(response.Interval)*time.Second, minSyncInterval)
+	}
 	if response.PSK != m.currentPSK && response.PSK != m.warnedPSK {
 		// The key is fixed once the server serves; the new one is cached and
 		// takes effect on the next start.
 		m.warnedPSK = response.PSK
-		m.logger.Warn("mesh PSK changed on the control server; restart SingR to apply it")
+		m.logger.Warn("mesh PSK changed in the registry; restart SingR to apply it")
+	}
+	for _, pin := range unreachable {
+		if !m.warned[pin] {
+			m.warned[pin] = true
+			m.logger.Warn("relay ", pin, " shares no address family with us (one side IPv4-only, the other IPv6-only); not meshing with it")
+		}
 	}
 	if m.peers == nil {
 		return true
@@ -642,7 +814,7 @@ func (m *meshControl) writeCache(content []byte) {
 	}
 	if err != nil {
 		os.Remove(temporary)
-		m.logger.Warn("write mesh cache: ", err)
+		m.logger.Warn("write registry cache: ", err)
 	}
 }
 
@@ -677,7 +849,7 @@ func meshTLSOptions(target meshTarget) option.OutboundTLSOptions {
 // startMeshPeer mirrors upstream startMeshWithHost, kept separate so the
 // connection can be stopped and its failures do not flood the log: a peer
 // that is down retries every few seconds forever.
-func (d *Service) startMeshPeer(parent context.Context, target meshTarget) (func(), error) {
+func (d *Service) startMeshPeer(parent context.Context, target meshTarget, onFailure func()) (func(), error) {
 	meshDialer, err := dialer.NewWithOptions(dialer.Options{
 		Context:        d.ctx,
 		Options:        option.DialerOptions{},
@@ -725,6 +897,7 @@ func (d *Service) startMeshPeer(parent context.Context, target meshTarget) (func
 			// Stopped on purpose (removed from the list or shutting down).
 			return
 		}
+		onFailure()
 		logAccess.Lock()
 		defer logAccess.Unlock()
 		if now := time.Now(); now.Sub(lastErrorAt) >= meshPeerErrorLogInterval {
@@ -735,8 +908,9 @@ func (d *Service) startMeshPeer(parent context.Context, target meshTarget) (func
 	add := func(m derp.PeerPresentMessage) { d.server.AddPacketForwarder(m.Key, meshClient) }
 	remove := func(m derp.PeerGoneMessage) { d.server.RemovePacketForwarder(m.Peer, meshClient) }
 
-	// Self-connect (our own address in the list) is detected by server key
-	// inside RunWatchConnectionLoop, which then returns and stays idle.
+	// Our own entry is skipped by pin; should our address still show up (a
+	// stale entry), RunWatchConnectionLoop detects the self-connect by server
+	// key and goes idle.
 	go meshClient.RunWatchConnectionLoop(ctx, d.server.PublicKey(), debugf, add, remove, notifyError)
 	return func() {
 		cancel()

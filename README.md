@@ -214,35 +214,37 @@ singr cert-source --cert-url https://example.com/a.pem --key-url https://example
 
 - **只服务自家用户。** 客户端经代理隧道访问虚拟域名 `derp.linbei.internal`，节点把它转到本机的 DERP。DERP 只接受来自本机回环的普通连接，公网直接连过来的一律拒绝。所以只有有效订阅能用，中继流量照常计进用户的已用流量。
 - **所有节点组成一个中继网。** 节点之间互相连接（mesh），用户的两台设备连在不同节点上也能互通。这部分走公网，需要放行 DERP 端口（默认 TCP 8443）。
-- **节点自己向林北的 headscale 报到。** headscale 记着所有开了 DERP 的节点，发给每台节点 mesh 口令（PSK）和其它节点的名单。没有名单要手工维护，加节点、下线节点都不用碰别的机器。
-- **节点之间要确认对方身份。** 每台节点有一张固定的自签证书，报到时把证书指纹交给 headscale；名单经 headscale 的正规 https 下发，节点只和指纹对得上的对端互联。
+- **节点自己向 sspapi 报到。** 每 60 秒把自己的端口、证书指纹和公网 IPv4 / IPv6 报给 sspapi 的 `tailnet.php`，拿回 mesh 口令（PSK）和其它节点的名单。没有名单要手工维护，加节点、下线节点都不用碰别的机器。headscale 不参与，它整台没了中继网照常运转。
+- **地址由节点自己报。** sspapi 前面是反向代理，看不到节点的真实 IP。节点每 5 秒看一次本机出网用的地址（不发网络请求），是公网地址就报它；机器在 NAT 后面（网卡上是内网地址）就在启动时问一次 ip.sb，问不到每 30 秒重试。地址一变立刻重新报到，其它节点连它失败时也会立刻重拉名单，所以换 IP 后几秒内中继网就跟上了。也可以手写地址。
+- **节点之间要确认对方身份。** 每台节点有一张固定的自签证书，报到时把证书指纹交给 sspapi；名单经正规 https 下发，节点只和指纹对得上的对端互联。
+- **互联用哪个地址**：双方都有 IPv4 就走 IPv4；有一方只有 IPv6 就走 IPv6；一边只有 IPv4、另一边只有 IPv6 就无法互联，日志里会警告。
 - **客户端怎么知道哪些节点有中继。** 节点在本机回环上开一个探测口（DERP 端口 +1），客户端经每个节点访问 `http://derp.linbei.internal/`，有应答的就是有中继的节点。探测口只听本机，不用放行防火墙。
 
-需要林北 fork 的 headscale（`linbei/README.md` 里有配置），和它配置里的**节点 token**（`linbei.derp_mesh.node_token`，不是 headscale 的 API key：它只能报到和拉名单）。
+需要 sspapi 的 `tailnet.php`，和它 `data/tailnet.json` 里的**节点 token**（`derp.node_token`）。
 
 ### 开启
 
 在每台节点上执行（不写端口用 8443）：
 
 ```sh
-singr derp enable --control https://hs.example.com --token <节点 token>
+singr derp enable --registry https://api.example.com/tailnet.php --token <节点 token>
 ```
 
-它会生成本机证书、向 headscale 报到一次、拉一次名单，确认地址和 token 都对了才改配置并重启 SingR。然后**防火墙放行 TCP 8443**（或你设置的端口），节点之间要能互相连到这个端口。
+它会生成本机证书、探测本机公网地址、向 sspapi 报到一次，确认地址和 token 都对了才改配置并重启 SingR。然后**防火墙放行 TCP 8443**（或你设置的端口），节点之间要能互相连到这个端口。
 
-- headscale 默认按报到请求的来源 IP 记录节点地址。机器有多个公网 IP、或者想让别的节点用域名连它，加 `--advertise jp1.example.com`。
+- 手写地址：`--ipv4 203.0.113.5`、`--ipv6 2001:db8::5`；某一类不报写 `none`（比如 `--ipv6 none`），恢复自动写 `auto`。地址固定、又在 NAT 后面的机器适合手写。
 - 随时用 `singr derp` 查看状态（终端里会出操作菜单）。
 
 ### 修改与生效
 
-- **增删节点**：新节点照「开启」做一遍；下线用 `singr derp disable`，它会先从名单撤下本机。节点每 5 分钟报到并刷新一次名单，变化 5 分钟内生效，不重启。直接关机的节点在 headscale 的过期时间（默认 24 小时）后自动移出名单。
-- **headscale 出问题时保持原样**：连不上、应答格式不对、名单为空，节点都继续用上一份名单，并在日志里警告。SingR 重启时用缓存的名单和 PSK（`/etc/singr/derp/mesh-control.cache.json`），headscale 暂时不在也能把 mesh 建起来。
-- **改端口**：`singr derp port 9443`。新端口报到、旧端口撤下，防火墙也要放行新端口。
-- **改对外地址**：`singr derp advertise jp1.example.com`，`singr derp advertise --clear` 恢复按来源 IP。
-- **换 headscale 地址或 token**：`singr derp enable --control <新地址> --token <新 token>`（只给要改的那项也行）。
-- **PSK 变了**（headscale 的状态文件丢了重建）：节点会记下新 PSK 并在日志里提示，**重启 SingR 后生效**。
-- **换证书**：删掉 `/etc/singr/derp/derp-tls.crt` 和 `derp-tls.key`（Docker 在 `/etc/singr-docker/derp/`），再执行 `singr derp enable`，新指纹随报到更新到 headscale。证书默认用一百年，正常不需要换。
-- **关闭**：`singr derp disable`。证书和 token 会保留，再次开启时指纹不变。
+- **增删节点**：新节点照「开启」做一遍；下线用 `singr derp disable`，它会先从名单撤下本机。直接关机的节点在 sspapi 的过期时间（默认 30 分钟）后移出名单；别的节点连它失败时会提前重拉名单。
+- **sspapi 出问题时保持原样**：连不上、应答格式不对、名单为空，节点都继续用上一份名单，并在日志里警告。SingR 重启时用缓存的名单和 PSK（`/etc/singr/derp/mesh-registry.cache.json`），sspapi 暂时不在也能把 mesh 建起来。
+- **改端口**：`singr derp port 9443`，防火墙也要放行新端口。
+- **换 sspapi 地址或 token**：`singr derp enable --registry <新地址> --token <新 token>`（只给要改的那项也行）。
+- **关掉再开**：`singr derp disable` 之后直接 `singr derp enable`，沿用上次的地址、端口、IPv4 / IPv6 设置和 token。
+- **PSK 变了**（sspapi 里改了 `derp.psk`）：节点会记下新 PSK 并在日志里提示，**重启 SingR 后生效**。
+- **换证书**：删掉 `/etc/singr/derp/derp-tls.crt` 和 `derp-tls.key`（Docker 在 `/etc/singr-docker/derp/`），再执行 `singr derp enable`。证书默认用一百年，正常不需要换。
+- **克隆机**：用同一个镜像克隆出来的机器证书相同，sspapi 会认出来，保留原来那台、拒绝克隆机（`DERP_PIN_CONFLICT`）。在克隆机上按上一条换证书即可。
 - 每次改动都会重启 SingR 并检查是否正常启动；起不来会自动回滚到改动前的配置。
 
 ### 排查
@@ -251,12 +253,16 @@ singr derp enable --control https://hs.example.com --token <节点 token>
 
 | 日志 | 含义 |
 | --- | --- |
-| `mesh peers added (control): ...` / `mesh peers removed (control): ...` | 名单变化已生效（`(cache)` 是重启时从缓存恢复的） |
-| `register with control server: ...` / `fetch mesh from control server (keeping current peers): ...` | 连不上 headscale，或 token 不对（`401`），继续用上一份名单 |
-| `mesh(...): ... unrecognized remote public key: <指纹>` | 对端出示的指纹和它报到的不一致：对端换过证书但还没重新报到，5 分钟内自愈 |
-| `mesh(...): ... connection refused` / `timeout` | 对端端口没放行，或者 headscale 记下的地址连不到（多 IP 机器用 `--advertise`） |
-| `mesh PSK changed on the control server; restart SingR to apply it` | headscale 换了 PSK，重启 SingR |
-| `no mesh PSK from control server or cache` | 第一次启动时 headscale 不可达且没有缓存：中继能用，但不和其它节点互联，重启后重试 |
+| `reported IPv4: ... -> ...` / `reported IPv6: ...` | 报的地址变了（启动时也会打一次） |
+| `mesh peers added (registry): ...` / `mesh peers removed (registry): ...` | 名单变化已生效（`(cache)` 是重启时从缓存恢复的） |
+| `sync with the registry (keeping current peers): ...` | 连不上 sspapi，或被拒（`DERP_UNAUTHORIZED` token 不对、`DERP_PIN_CONFLICT` 克隆机），继续用上一份名单 |
+| `public IPv4 lookup (retrying in 30s): ...` | 机器在 NAT 后面，ip.sb 暂时问不到；问到之前这一类地址不报 |
+| `no public IPv4 or IPv6 to report` | 两类地址都没有：用 `--ipv4` / `--ipv6` 手写 |
+| `relay ... shares no address family with us` | 对方只有 IPv4、我们只有 IPv6（或反过来），不互联 |
+| `mesh(...): ... unrecognized remote public key: <指纹>` | 对端出示的指纹和它报到的不一致：对端换过证书但还没重新报到，一分钟内自愈 |
+| `mesh(...): ... connection refused` / `timeout` | 对端端口没放行，或者它报的地址连不到 |
+| `mesh PSK changed in the registry; restart SingR to apply it` | sspapi 换了 PSK，重启 SingR |
+| `no mesh PSK from the registry or cache` | 第一次启动时 sspapi 不可达且没有缓存：中继能用，但不和其它节点互联，重启后重试 |
 
 连不上的对端每分钟最多警告一次。
 

@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -31,7 +32,7 @@ import (
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/json/badoption"
+	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/tailscale/derp"
 	"github.com/sagernet/tailscale/derp/derphttp"
 	"github.com/sagernet/tailscale/derp/derpserver"
@@ -39,87 +40,146 @@ import (
 	"github.com/sagernet/tailscale/types/key"
 )
 
-func TestParseMeshPeerList(t *testing.T) {
-	targets, err := parseMeshPeerList([]byte(`{
-		"nodes": [
-			"HK1.Example.com",
-			"jp1.example.com:9443",
-			"203.0.113.7",
-			"2001:db8::1",
-			"[2001:db8::2]:9000",
-			"hk1.example.com",
-			"hk1.example.com."
-		],
-		"client_only_field": {"anything": true}
-	}`), 8443)
-	if err != nil {
-		t.Fatal(err)
+func TestMeshTargets(t *testing.T) {
+	pin := func(seed byte) string { return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{seed}, 32)) }
+	nodes := []registryNode{
+		{Pin: pin(1), Port: 8443, IPv4: "203.0.113.1", IPv6: "2a01:4f8::1"}, // self
+		{Pin: pin(2), Port: 8443, IPv4: "203.0.113.2", IPv6: "2a01:4f8::2"}, // dual stack
+		{Pin: pin(3), Port: 9443, IPv6: "2a01:4f8::3"},                      // IPv6 only
+		{Pin: pin(4), Port: 8443, IPv4: "203.0.113.4"},                      // IPv4 only
 	}
-	var got []string
-	for _, target := range targets {
-		got = append(got, target.String())
-	}
-	want := []string{
-		"hk1.example.com:8443",
-		"jp1.example.com:9443",
-		"203.0.113.7:8443",
-		"[2001:db8::1]:8443",
-		"[2001:db8::2]:9000",
-	}
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-}
-
-func TestParseMeshPeerListPins(t *testing.T) {
-	pin := sha256.Sum256([]byte("peer key"))
-	pinText := base64.StdEncoding.EncodeToString(pin[:])
-	targets, err := parseMeshPeerList([]byte(`{"nodes": [
-		{"host": "hk1.example.com", "pin": "`+pinText+`", "label": "ignored"},
-		{"host": "jp1.example.com:9443"},
-		"sg1.example.com",
-		{"host": "hk1.example.com", "pin": "`+pinText+`"}
-	]}`), 8443)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(targets) != 3 {
-		t.Fatalf("want 3 targets (exact duplicate dropped), got %v", targets)
-	}
-	if targets[0].String() != "hk1.example.com:8443" || !bytes.Equal(targets[0].Pin, pin[:]) {
-		t.Fatalf("pinned entry parsed wrong: %+v", targets[0])
-	}
-	if targets[1].String() != "jp1.example.com:9443" || targets[1].Pin != nil || targets[2].Pin != nil {
-		t.Fatalf("unpinned entries parsed wrong: %+v", targets[1:])
-	}
-	if targets[0].id() == (meshTarget{Host: "hk1.example.com", Port: 8443}).id() {
-		t.Fatal("a pin change must change the peer identity (forces a reconnect)")
-	}
-}
-
-func TestParseMeshPeerListRejectsWholeListOnBadEntry(t *testing.T) {
-	for _, content := range []string{
-		`{"nodes": []}`,
-		`{}`,
-		`not json`,
-		`{"nodes": ["ok.example.com", ""]}`,
-		`{"nodes": ["ok.example.com", "https://bad.example.com"]}`,
-		`{"nodes": ["ok.example.com", "bad.example.com/derp"]}`,
-		`{"nodes": ["ok.example.com", "bad.example.com:0"]}`,
-		`{"nodes": ["ok.example.com", "bad.example.com:70000"]}`,
-		`{"nodes": ["ok.example.com", "bad.example.com:x"]}`,
-		`{"nodes": ["ok.example.com", ":8443"]}`,
-		`{"nodes": ["ok.example.com", "user@bad.example.com"]}`,
-		`{"nodes": ["ok.example.com", "fe80::1%eth0"]}`,
-		`{"nodes": ["ok.example.com", {"pin": "AAAA"}]}`,
-		`{"nodes": ["ok.example.com", {"host": "a.example.com", "pin": "not base64!"}]}`,
-		`{"nodes": ["ok.example.com", {"host": "a.example.com", "pin": "AAAA"}]}`,
-		`{"nodes": ["ok.example.com", 42]}`,
-		`{"nodes": [{"host": "a.example.com", "pin": "` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `"}, "a.example.com"]}`,
-	} {
-		if _, err := parseMeshPeerList([]byte(content), 8443); err == nil {
-			t.Errorf("expected error for %s", content)
+	hosts := func(targets []meshTarget) []string {
+		var out []string
+		for _, target := range targets {
+			out = append(out, target.String())
 		}
+		return out
+	}
+	v4 := netip.MustParseAddr("203.0.113.1")
+	v6 := netip.MustParseAddr("2a01:4f8::1")
+
+	// Dual stack: IPv4 when both have it, IPv6 for the IPv6-only peer.
+	targets, unreachable, err := meshTargets(nodes, pin(1), [2]netip.Addr{v4, v6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hosts(targets); !slices.Equal(got, []string{"203.0.113.2:8443", "[2a01:4f8::3]:9443", "203.0.113.4:8443"}) || len(unreachable) != 0 {
+		t.Fatalf("dual stack: %v unreachable=%v", got, unreachable)
+	}
+	if !bytes.Equal(targets[0].Pin, bytes.Repeat([]byte{2}, 32)) {
+		t.Fatal("pin not carried")
+	}
+
+	// IPv6-only self: the IPv4-only peer is unreachable, the others over IPv6.
+	targets, unreachable, _ = meshTargets(nodes, pin(1), [2]netip.Addr{{}, v6})
+	if got := hosts(targets); !slices.Equal(got, []string{"[2a01:4f8::2]:8443", "[2a01:4f8::3]:9443"}) || !slices.Equal(unreachable, []string{pin(4)}) {
+		t.Fatalf("v6-only self: %v unreachable=%v", got, unreachable)
+	}
+
+	// IPv4-only self.
+	targets, unreachable, _ = meshTargets(nodes, pin(1), [2]netip.Addr{v4, {}})
+	if got := hosts(targets); !slices.Equal(got, []string{"203.0.113.2:8443", "203.0.113.4:8443"}) || !slices.Equal(unreachable, []string{pin(3)}) {
+		t.Fatalf("v4-only self: %v unreachable=%v", got, unreachable)
+	}
+
+	// Any bad entry rejects the whole list (keeps the current peers).
+	for name, bad := range map[string]registryNode{
+		"bad pin":       {Pin: "AAAA", Port: 8443, IPv4: "203.0.113.9"},
+		"bad port":      {Pin: pin(9), Port: 0, IPv4: "203.0.113.9"},
+		"v6 in v4 slot": {Pin: pin(9), Port: 8443, IPv4: "2a01:4f8::9"},
+		"garbage":       {Pin: pin(9), Port: 8443, IPv6: "not-an-ip"},
+	} {
+		if _, _, err := meshTargets(append(slices.Clone(nodes), bad), pin(1), [2]netip.Addr{v4, v6}); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestParseRegistryResponse(t *testing.T) {
+	psk := strings.Repeat("ab", 32)
+	good := `{"status":"success","code":"OK","psk":"` + psk + `","nodes":[{"pin":"x","port":1}],"interval":60}`
+	if _, err := parseRegistryResponse([]byte(good)); err != nil {
+		t.Fatal(err)
+	}
+	for name, bad := range map[string]string{
+		"error status": `{"status":"error","code":"DERP_UNAUTHORIZED","message":"节点 token 不对"}`,
+		"no psk":       `{"status":"success","nodes":[{"pin":"x"}]}`,
+		"empty list":   `{"status":"success","psk":"` + psk + `","nodes":[]}`,
+		"not json":     `<html>`,
+	} {
+		if _, err := parseRegistryResponse([]byte(bad)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestIsPublicAddress(t *testing.T) {
+	for text, want := range map[string]bool{
+		"203.0.113.10": true, "8.8.8.8": true, "2a01:4f8::1": true, "2606:4700::1111": true,
+		"10.0.0.1": false, "192.168.1.1": false, "172.16.0.1": false, "100.64.1.1": false, "127.0.0.1": false,
+		"169.254.1.1": false, "fd00::1": false, "fe80::1": false, "::1": false, "2001:db8::1": false,
+	} {
+		if got := isPublicAddress(netip.MustParseAddr(text)); got != want {
+			t.Errorf("%s: got %v", text, got)
+		}
+	}
+}
+
+// What we report, per family: pinned wins; "none" reports nothing; auto uses
+// the kernel's source address when public, and behind NAT asks ip.sb once,
+// retrying every publicIPRetryInterval until it answers.
+func TestOwnAddresses(t *testing.T) {
+	log := logger.NOP()
+	ctx := context.Background()
+	local := [2]netip.Addr{netip.MustParseAddr("10.0.0.5"), netip.MustParseAddr("2a01:4f8::5")}
+	lookups := 0
+	lookupErr := errors.New("ip.sb down")
+	addresses := ownAddresses{
+		local: func(family int) netip.Addr { return local[family] },
+		lookup: func(_ context.Context, family int) (netip.Addr, error) {
+			lookups++
+			if lookupErr != nil {
+				return netip.Addr{}, lookupErr
+			}
+			return netip.MustParseAddr("203.0.113.5"), nil
+		},
+	}
+	now := time.Unix(1_800_000_000, 0)
+
+	// IPv4 behind NAT, ip.sb down: no IPv4 yet; IPv6 public on the NIC.
+	if !addresses.refresh(ctx, now, log) || addresses.current[0].IsValid() || addresses.current[1] != local[1] || lookups != 1 {
+		t.Fatalf("first: %v lookups=%d", addresses.current, lookups)
+	}
+	// No retry before the interval.
+	addresses.refresh(ctx, now.Add(5*time.Second), log)
+	if lookups != 1 {
+		t.Fatalf("retried too early: %d", lookups)
+	}
+	// Retry after the interval succeeds.
+	lookupErr = nil
+	if !addresses.refresh(ctx, now.Add(publicIPRetryInterval), log) || addresses.current[0] != netip.MustParseAddr("203.0.113.5") || lookups != 2 {
+		t.Fatalf("retry: %v lookups=%d", addresses.current, lookups)
+	}
+	// Answered once: never asked again; nothing changed.
+	if addresses.refresh(ctx, now.Add(10*publicIPRetryInterval), log) || lookups != 2 {
+		t.Fatalf("asked again: %d", lookups)
+	}
+	// The NIC's IPv6 changes: noticed on the next check.
+	local[1] = netip.MustParseAddr("2a01:4f8::6")
+	if !addresses.refresh(ctx, now.Add(11*publicIPRetryInterval), log) || addresses.current[1] != local[1] {
+		t.Fatalf("v6 change missed: %v", addresses.current)
+	}
+	// The NIC gains a public IPv4: it wins over the ip.sb answer.
+	local[0] = netip.MustParseAddr("198.51.100.7")
+	addresses.refresh(ctx, now.Add(12*publicIPRetryInterval), log)
+	if addresses.current[0] != local[0] {
+		t.Fatalf("public NIC address not preferred: %v", addresses.current)
+	}
+	// Pinned and "none".
+	addresses.pinned = [2]string{"192.0.2.44", advertiseNone}
+	addresses.refresh(ctx, now.Add(13*publicIPRetryInterval), log)
+	if addresses.current[0] != netip.MustParseAddr("192.0.2.44") || addresses.current[1].IsValid() {
+		t.Fatalf("pinned/none: %v", addresses.current)
 	}
 }
 
@@ -148,8 +208,8 @@ func TestValidateSingRDERPOptions(t *testing.T) {
 		ListenOptions: option.ListenOptions{ListenPort: 8443},
 		SingRDERPOptions: option.SingRDERPOptions{
 			VerifyClientLoopback: true,
-			ControlURL:           "https://hs.example.com",
-			ControlTokenPath:     "/etc/singr/derp-control.token",
+			RegistryURL:          "https://api.example.com/tailnet.php",
+			RegistryTokenPath:    "/etc/singr/derp/registry.token",
 			ProbeListenPort:      8444,
 		},
 		InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
@@ -159,25 +219,31 @@ func TestValidateSingRDERPOptions(t *testing.T) {
 	if err := validateSingRDERPOptions(valid); err != nil {
 		t.Fatal(err)
 	}
+	pinned := valid
+	pinned.AdvertiseIPv4, pinned.AdvertiseIPv6 = "203.0.113.5", advertiseNone
+	if err := validateSingRDERPOptions(pinned); err != nil {
+		t.Fatal(err)
+	}
 	cases := map[string]func(*option.DERPServiceOptions){
 		"loopback with verify url": func(o *option.DERPServiceOptions) {
 			o.VerifyClientURL = []*option.DERPVerifyClientURLOptions{{}}
 		},
 		"loopback with verify endpoint": func(o *option.DERPServiceOptions) { o.VerifyClientEndpoint = []string{"ts"} },
-		"http control url":              func(o *option.DERPServiceOptions) { o.ControlURL = "http://hs.example.com" },
-		"control url without host":      func(o *option.DERPServiceOptions) { o.ControlURL = "https:///x" },
-		"no token":                      func(o *option.DERPServiceOptions) { o.ControlTokenPath = "" },
-		"psk next to control":           func(o *option.DERPServiceOptions) { o.MeshPSK = strings.Repeat("ab", 32) },
-		"psk file next to control":      func(o *option.DERPServiceOptions) { o.MeshPSKFile = "/x" },
+		"http registry":                 func(o *option.DERPServiceOptions) { o.RegistryURL = "http://api.example.com/tailnet.php" },
+		"registry without host":         func(o *option.DERPServiceOptions) { o.RegistryURL = "https:///x" },
+		"no token":                      func(o *option.DERPServiceOptions) { o.RegistryTokenPath = "" },
+		"psk next to registry":          func(o *option.DERPServiceOptions) { o.MeshPSK = strings.Repeat("ab", 32) },
+		"psk file next to registry":     func(o *option.DERPServiceOptions) { o.MeshPSKFile = "/x" },
 		"no listen port":                func(o *option.DERPServiceOptions) { o.ListenPort = 0 },
 		"no tls":                        func(o *option.DERPServiceOptions) { o.TLS = nil },
 		"acme instead of fixed cert": func(o *option.DERPServiceOptions) {
 			o.TLS = &option.InboundTLSOptions{}
 		},
 		"probe on derp port": func(o *option.DERPServiceOptions) { o.ProbeListenPort = 8443 },
-		"interval too short": func(o *option.DERPServiceOptions) {
-			o.ControlInterval = badoption.Duration(time.Second)
-		},
+		"v6 in ipv4":         func(o *option.DERPServiceOptions) { o.AdvertiseIPv4 = "2a01:4f8::1" },
+		"v4 in ipv6":         func(o *option.DERPServiceOptions) { o.AdvertiseIPv6 = "203.0.113.5" },
+		"garbage ipv4":       func(o *option.DERPServiceOptions) { o.AdvertiseIPv4 = "example.com" },
+		"both none":          func(o *option.DERPServiceOptions) { o.AdvertiseIPv4, o.AdvertiseIPv6 = advertiseNone, advertiseNone },
 	}
 	for name, mutate := range cases {
 		options := valid
@@ -188,7 +254,7 @@ func TestValidateSingRDERPOptions(t *testing.T) {
 			t.Errorf("%s: expected error", name)
 		}
 	}
-	// Without a control server only the loopback/probe checks apply.
+	// Without a registry only the loopback/probe checks apply.
 	if err := validateSingRDERPOptions(option.DERPServiceOptions{ListenOptions: option.ListenOptions{ListenPort: 8443}}); err != nil {
 		t.Fatal(err)
 	}
@@ -401,47 +467,68 @@ func selfSignedPEM(t *testing.T) ([]byte, *ecdsa.PrivateKey) {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), key
 }
 
-// fakeControl is the Linbei headscale fork's registry, just enough of it.
-type fakeControl struct {
-	access     sync.Mutex
-	failing    bool
-	registered []map[string]any
-	response   string
+// fakeRegistry is sspapi's tailnet.php, just enough of it.
+type fakeRegistry struct {
+	access   sync.Mutex
+	failing  bool
+	syncs    []url.Values
+	psk      string
+	nodes    []registryNode
+	interval int
 }
 
-func (f *fakeControl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (f *fakeRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.access.Lock()
 	defer f.access.Unlock()
-	if r.Header.Get("Authorization") != "Bearer node-token" {
+	r.ParseForm()
+	if r.PostForm.Get("node_token") != "node-token" {
 		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"status":"error","code":"DERP_UNAUTHORIZED","message":"bad token"}`))
 		return
 	}
 	if f.failing {
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/linbei/derp/register":
-		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
-		f.registered = append(f.registered, body)
-		w.Write([]byte(`{}`))
-	case r.Method == http.MethodGet && r.URL.Path == "/linbei/derp/mesh":
-		w.Write([]byte(f.response))
-	default:
-		w.WriteHeader(http.StatusNotFound)
+	if r.PostForm.Get("action") != "derp_sync" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
+	f.syncs = append(f.syncs, r.PostForm)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "success", "code": "OK", "psk": f.psk, "nodes": f.nodes, "interval": f.interval,
+	})
+}
+
+func (f *fakeRegistry) syncCount() int {
+	f.access.Lock()
+	defer f.access.Unlock()
+	return len(f.syncs)
+}
+
+func (f *fakeRegistry) lastSync() url.Values {
+	f.access.Lock()
+	defer f.access.Unlock()
+	return f.syncs[len(f.syncs)-1]
+}
+
+func (f *fakeRegistry) set(fn func(*fakeRegistry)) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	fn(f)
 }
 
 type runningPeers struct {
-	access sync.Mutex
-	set    map[string]bool
+	access    sync.Mutex
+	set       map[string]bool
+	onFailure func()
 }
 
-func (r *runningPeers) start(_ context.Context, target meshTarget) (func(), error) {
+func (r *runningPeers) start(_ context.Context, target meshTarget, onFailure func()) (func(), error) {
 	r.access.Lock()
 	defer r.access.Unlock()
 	r.set[target.String()] = true
+	r.onFailure = onFailure
 	return func() {
 		r.access.Lock()
 		defer r.access.Unlock()
@@ -460,28 +547,48 @@ func (r *runningPeers) snapshot() []string {
 	return out
 }
 
-func newTestControl(t *testing.T, baseURL string, client *http.Client, cachePath string, running *runningPeers) *meshControl {
+func testPin(seed byte) string {
+	return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{seed}, 32))
+}
+
+// shortTimings speeds the control loop up for a test.
+func shortTimings(t *testing.T) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	control := &meshControl{
-		ctx:         ctx,
-		cancel:      cancel,
-		logger:      log.NewNOPFactory().Logger(),
-		baseURL:     baseURL,
-		token:       "node-token",
-		advertise:   "hk1.example.com",
-		pin:         "PIN",
-		listenPort:  8443,
-		interval:    time.Hour,
-		cachePath:   cachePath,
-		httpClient:  client,
-		done:        make(chan struct{}),
-		startPeerFn: running.start,
-	}
-	control.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
-		return control.startPeerFn(ctx, target)
+	saved := [5]time.Duration{addressCheckInterval, addressChangeDebounce, peerFailureResync, defaultSyncInterval, minSyncInterval}
+	addressCheckInterval, addressChangeDebounce, peerFailureResync = 20*time.Millisecond, 20*time.Millisecond, 50*time.Millisecond
+	defaultSyncInterval, minSyncInterval = time.Hour, time.Hour
+	t.Cleanup(func() {
+		addressCheckInterval, addressChangeDebounce, peerFailureResync, defaultSyncInterval, minSyncInterval =
+			saved[0], saved[1], saved[2], saved[3], saved[4]
 	})
-	return control
+}
+
+// testAddresses are what the kernel reports in a test; tests change them.
+type testAddresses struct {
+	access sync.Mutex
+	local  [2]netip.Addr
+}
+
+func (a *testAddresses) get(family int) netip.Addr {
+	a.access.Lock()
+	defer a.access.Unlock()
+	return a.local[family]
+}
+
+func (a *testAddresses) setV4(text string) {
+	a.access.Lock()
+	defer a.access.Unlock()
+	a.local[0] = netip.MustParseAddr(text)
+}
+
+func newTestControl(t *testing.T, registryURL string, client *http.Client, cachePath string, running *runningPeers, local *testAddresses) *meshControl {
+	t.Helper()
+	m := newMeshControl(logger.NOP(), registryURL, "node-token", testPin(1), 8443, cachePath, [2]string{})
+	m.httpClient = client
+	m.startPeerFn = running.start
+	m.addresses.local = local.get
+	m.addresses.lookup = func(context.Context, int) (netip.Addr, error) { return netip.Addr{}, errors.New("no lookup in tests") }
+	return m
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -495,17 +602,23 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// Register, fetch the PSK and peers, cache them; a failing control server
-// keeps the current peers; peers that leave the registry are dropped.
-func TestMeshControlRegistersAndFollowsRegistry(t *testing.T) {
+// Report port, pin and own addresses; follow the registry; a failing registry
+// keeps the current peers; peers that leave are dropped; the cache (0600,
+// holds the PSK) follows the registry.
+func TestMeshControlReportsAndFollowsRegistry(t *testing.T) {
+	shortTimings(t)
 	psk := strings.Repeat("ab", 32)
-	control := &fakeControl{response: `{"psk":"` + psk + `","nodes":[{"host":"a.example.com:8443","pin":"` +
-		base64.StdEncoding.EncodeToString(make([]byte, 32)) + `"},{"host":"b.example.com:9443"}]}`}
-	server := httptest.NewTLSServer(control)
+	registry := &fakeRegistry{psk: psk, interval: 3600, nodes: []registryNode{
+		{Pin: testPin(1), Port: 8443, IPv4: "203.0.113.1"},
+		{Pin: testPin(2), Port: 8443, IPv4: "203.0.113.2", IPv6: "2a01:4f8::2"},
+		{Pin: testPin(3), Port: 9443, IPv6: "2a01:4f8::3"},
+	}}
+	server := httptest.NewTLSServer(registry)
 	defer server.Close()
-	cachePath := t.TempDir() + "/" + controlCacheName
+	cachePath := t.TempDir() + "/" + registryCacheName
 	running := &runningPeers{set: map[string]bool{}}
-	m := newTestControl(t, server.URL, server.Client(), cachePath, running)
+	local := &testAddresses{local: [2]netip.Addr{netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("2a01:4f8::1")}}
+	m := newTestControl(t, server.URL, server.Client(), cachePath, running, local)
 
 	if got := m.initialPSK(); got != psk {
 		t.Fatalf("initial PSK %q", got)
@@ -514,61 +627,103 @@ func TestMeshControlRegistersAndFollowsRegistry(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("cache must exist with 0600 (holds the PSK): %v %v", info, err)
 	}
+	first := registry.lastSync()
+	if first.Get("port") != "8443" || first.Get("pin") != testPin(1) || first.Get("ipv4") != "203.0.113.1" || first.Get("ipv6") != "2a01:4f8::1" {
+		t.Fatalf("sync form: %v", first)
+	}
+
 	m.start(true)
 	defer m.Close()
-	waitFor(t, "peers", func() bool { return len(running.snapshot()) == 2 })
-	waitFor(t, "registration", func() bool {
-		control.access.Lock()
-		defer control.access.Unlock()
-		return len(control.registered) == 1
+	waitFor(t, "peers", func() bool {
+		return slices.Equal(running.snapshot(), []string{"203.0.113.2:8443", "[2a01:4f8::3]:9443"})
 	})
 
-	control.access.Lock()
-	registered := control.registered
-	control.access.Unlock()
-	if len(registered) != 1 || registered[0]["host"] != "hk1.example.com" ||
-		registered[0]["port"] != float64(8443) || registered[0]["pin"] != "PIN" {
-		t.Fatalf("register body: %v", registered)
+	// Syncs only ever run on the control loop; a peer failure asks it for one.
+	resync := func() {
+		time.Sleep(peerFailureResync)
+		m.notePeerFailure()
 	}
 
-	control.access.Lock()
-	control.failing = true
-	control.access.Unlock()
-	m.refresh()
+	registry.set(func(f *fakeRegistry) { f.failing = true })
+	resync()
+	time.Sleep(100 * time.Millisecond)
 	if got := running.snapshot(); len(got) != 2 {
-		t.Fatalf("failing control server dropped peers: %v", got)
+		t.Fatalf("failing registry dropped peers: %v", got)
 	}
 
-	control.access.Lock()
-	control.failing = false
-	control.response = `{"psk":"` + psk + `","nodes":["b.example.com:9443"]}`
-	control.access.Unlock()
-	m.refresh()
-	if got := running.snapshot(); !slices.Equal(got, []string{"b.example.com:9443"}) {
-		t.Fatalf("after a node left: %v", got)
-	}
+	registry.set(func(f *fakeRegistry) { f.failing = false; f.nodes = f.nodes[:2] })
+	resync()
+	waitFor(t, "node removal", func() bool { return slices.Equal(running.snapshot(), []string{"203.0.113.2:8443"}) })
 	cached, _ := os.ReadFile(cachePath)
-	if !strings.Contains(string(cached), `"nodes":["b.example.com:9443"]`) {
+	if strings.Contains(string(cached), "2a01:4f8::3") {
 		t.Fatalf("cache not updated: %s", cached)
 	}
 }
 
-// A restart while the control server is down rebuilds the mesh from the
-// cache, PSK included.
-func TestMeshControlStartsFromCacheWhenControlUnreachable(t *testing.T) {
+// Our address changes: reported right away (after the debounce), not on the
+// next minute; a peer that fails triggers an early refetch, throttled.
+func TestMeshControlReactsToAddressChangeAndPeerFailure(t *testing.T) {
+	shortTimings(t)
+	registry := &fakeRegistry{psk: strings.Repeat("ab", 32), interval: 3600, nodes: []registryNode{
+		{Pin: testPin(1), Port: 8443, IPv4: "203.0.113.1"},
+		{Pin: testPin(2), Port: 8443, IPv4: "203.0.113.2"},
+	}}
+	server := httptest.NewTLSServer(registry)
+	defer server.Close()
+	running := &runningPeers{set: map[string]bool{}}
+	local := &testAddresses{local: [2]netip.Addr{netip.MustParseAddr("203.0.113.1")}}
+	m := newTestControl(t, server.URL, server.Client(), t.TempDir()+"/"+registryCacheName, running, local)
+	m.initialPSK()
+	m.start(true)
+	defer m.Close()
+	waitFor(t, "first sync", func() bool { return registry.syncCount() >= 2 })
+
+	local.setV4("203.0.113.99")
+	waitFor(t, "address change reported", func() bool {
+		return registry.syncCount() >= 3 && registry.lastSync().Get("ipv4") == "203.0.113.99"
+	})
+
+	// The peer moved: its connection fails, we refetch and follow it.
+	registry.set(func(f *fakeRegistry) { f.nodes[1].IPv4 = "203.0.113.22" })
+	before := registry.syncCount()
+	running.access.Lock()
+	onFailure := running.onFailure
+	running.access.Unlock()
+	onFailure()
+	waitFor(t, "refetch after peer failure", func() bool {
+		return slices.Equal(running.snapshot(), []string{"203.0.113.22:8443"})
+	})
+	// Throttled: a burst of failures right after does not hammer the registry.
+	for range 20 {
+		onFailure()
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := registry.syncCount() - before; n > 2 {
+		t.Fatalf("peer failures not throttled: %d syncs", n)
+	}
+}
+
+// A restart while the registry is down rebuilds the mesh from the cache, PSK
+// included.
+func TestMeshControlStartsFromCacheWhenRegistryUnreachable(t *testing.T) {
+	shortTimings(t)
 	psk := strings.Repeat("cd", 32)
-	cachePath := t.TempDir() + "/" + controlCacheName
-	if err := os.WriteFile(cachePath, []byte(`{"psk":"`+psk+`","nodes":["a.example.com","b.example.com:9443"]}`), 0o600); err != nil {
+	cachePath := t.TempDir() + "/" + registryCacheName
+	cache := `{"status":"success","code":"OK","psk":"` + psk + `","nodes":[` +
+		`{"pin":"` + testPin(1) + `","port":8443,"ipv4":"203.0.113.1","ipv6":""},` +
+		`{"pin":"` + testPin(2) + `","port":9443,"ipv4":"203.0.113.2","ipv6":""}],"interval":60}`
+	if err := os.WriteFile(cachePath, []byte(cache), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	running := &runningPeers{set: map[string]bool{}}
-	m := newTestControl(t, "https://127.0.0.1:1", &http.Client{Timeout: time.Second}, cachePath, running)
+	local := &testAddresses{local: [2]netip.Addr{netip.MustParseAddr("203.0.113.1")}}
+	m := newTestControl(t, "https://127.0.0.1:1/tailnet.php", &http.Client{Timeout: time.Second}, cachePath, running, local)
 	if got := m.initialPSK(); got != psk {
 		t.Fatalf("PSK from cache %q", got)
 	}
 	m.start(true)
-	time.Sleep(200 * time.Millisecond) // let the first (failing) refresh run
-	if got := running.snapshot(); !slices.Equal(got, []string{"a.example.com:8443", "b.example.com:9443"}) {
+	time.Sleep(100 * time.Millisecond) // let the first (failing) sync run
+	if got := running.snapshot(); !slices.Equal(got, []string{"203.0.113.2:9443"}) {
 		t.Fatalf("peers from cache: %v", got)
 	}
 	m.Close()
@@ -577,22 +732,40 @@ func TestMeshControlStartsFromCacheWhenControlUnreachable(t *testing.T) {
 	}
 }
 
-// Without a mesh key the node still registers but starts no peers.
+// Without a mesh key the node still reports but starts no peers.
 func TestMeshControlWithoutMeshKeyStartsNoPeers(t *testing.T) {
-	control := &fakeControl{response: `{"psk":"` + strings.Repeat("ab", 32) + `","nodes":["a.example.com"]}`}
-	server := httptest.NewTLSServer(control)
+	shortTimings(t)
+	registry := &fakeRegistry{psk: strings.Repeat("ab", 32), interval: 3600, nodes: []registryNode{
+		{Pin: testPin(2), Port: 8443, IPv4: "203.0.113.2"},
+	}}
+	server := httptest.NewTLSServer(registry)
 	defer server.Close()
 	running := &runningPeers{set: map[string]bool{}}
-	m := newTestControl(t, server.URL, server.Client(), t.TempDir()+"/"+controlCacheName, running)
+	local := &testAddresses{local: [2]netip.Addr{netip.MustParseAddr("203.0.113.1")}}
+	m := newTestControl(t, server.URL, server.Client(), t.TempDir()+"/"+registryCacheName, running, local)
 	m.start(false)
-	waitFor(t, "registration", func() bool {
-		control.access.Lock()
-		defer control.access.Unlock()
-		return len(control.registered) == 1
-	})
+	waitFor(t, "report", func() bool { return registry.syncCount() == 1 })
 	m.Close()
 	if got := running.snapshot(); len(got) != 0 {
 		t.Fatalf("peers started without a mesh key: %v", got)
+	}
+}
+
+// Nothing public to report (NAT and ip.sb unreachable): no request with an
+// empty address set is sent.
+func TestMeshControlWithoutAddressDoesNotReport(t *testing.T) {
+	shortTimings(t)
+	registry := &fakeRegistry{psk: strings.Repeat("ab", 32)}
+	server := httptest.NewTLSServer(registry)
+	defer server.Close()
+	running := &runningPeers{set: map[string]bool{}}
+	local := &testAddresses{local: [2]netip.Addr{netip.MustParseAddr("10.0.0.5")}}
+	m := newTestControl(t, server.URL, server.Client(), t.TempDir()+"/"+registryCacheName, running, local)
+	if got := m.initialPSK(); got != "" {
+		t.Fatalf("got a PSK without reporting: %q", got)
+	}
+	if registry.syncCount() != 0 {
+		t.Fatal("sent a sync without an address")
 	}
 }
 

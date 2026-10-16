@@ -57,35 +57,49 @@ mkdir -p "${CFG}" "${STATE}"
     # ---- 桩 ----
     echo "node_backend_restart() { echo x >> '${STATE}/restarts'; }"
     echo "node_backend_verify() { [[ ! -f '${STATE}/broken' ]]; }"
-    # 假 headscale：curl 换成函数，按 STATE 里的文件决定应答，并把每次请求记进 calls。
+    # 假 sspapi（tailnet.php）与假 ip.sb：curl 换成函数，按 STATE 里的文件决定应答，
+    # 每次调 sspapi 都把表单记进 calls（node_token@文件 展开成文件内容）。
     cat <<EOF
 STATE='${STATE}'
 EOF
     cat <<'EOF'
 curl() {
-    local out="" method="GET" header="" body="" url=""
+    local out="" url="" family="" fields=() f name file
     while (($# > 0)); do
         case "$1" in
             -o) out="$2"; shift 2 ;;
-            -X) method="$2"; shift 2 ;;
-            -H) [[ "$2" == @* ]] && header="${2#@}"; shift 2 ;;
-            --data) body="$2"; shift 2 ;;
+            --data-urlencode)
+                f="$2"
+                if [[ "${f}" == *@* && "${f%%@*}" != *=* ]]; then
+                    name="${f%%@*}"; file="${f#*@}"
+                    fields+=("${name}=$(cat "${file}")")
+                else
+                    fields+=("${f}")
+                fi
+                shift 2 ;;
+            -4) family=4; shift ;;
+            -6) family=6; shift ;;
             -w | --proto | --noproxy | --connect-timeout | --max-time) shift 2 ;;
             -*) shift ;;
             *) url="$1"; shift ;;
         esac
     done
-    printf '%s %s %s %s\n' "${method}" "${url}" "$(cat "${header}")" "${body}" >>"${STATE}/calls"
-    [[ -f "${STATE}/unreachable" ]] && return 7
-    if [[ -f "${STATE}/code" ]]; then
-        echo denied >"${out}"
-        cat "${STATE}/code"
+    if [[ "${url}" == *ip.sb* ]]; then
+        [[ -f "${STATE}/ipsb_down" ]] && return 6
+        [[ "${family}" == 6 && -f "${STATE}/no_v6" ]] && return 7
+        [[ "${family}" == 4 ]] && echo "203.0.113.50" || echo "2a01:4f8::50"
         return 0
     fi
-    case "${method} ${url}" in
-        "GET "*/linbei/derp/mesh) cat "${STATE}/mesh" >"${out}"; echo 200 ;;
-        "DELETE "*) : >"${out}"; echo 204 ;;
-        *) echo '{}' >"${out}"; echo 200 ;;
+    printf '%s\n' "${fields[*]}" >>"${STATE}/calls"
+    [[ -f "${STATE}/unreachable" ]] && return 7
+    if [[ -f "${STATE}/code" ]]; then
+        printf '{"status":"error","code":"%s"}' "$(cat "${STATE}/code")" >"${out}"
+        echo 400
+        return 0
+    fi
+    case " ${fields[*]} " in
+        *" action=derp_sync "*) cat "${STATE}/mesh" >"${out}"; echo 200 ;;
+        *) echo '{"status":"success","code":"OK"}' >"${out}"; echo 200 ;;
     esac
 }
 EOF
@@ -108,52 +122,61 @@ cat >"${CFG}/server.json" <<'EOF'
 }
 EOF
 ORIGINAL="$(q .)"
-CONTROL="https://hs.example.com"
+REGISTRY="https://api.example.com/tailnet.php"
 TOKEN="$(printf 't%.0s' {1..40})"
 PSK="$(printf 'a%.0s' {1..64})"
-printf '{"psk":"%s","nodes":[{"host":"203.0.113.5:8443","pin":"x"},{"host":"203.0.113.6:8443","pin":"y"}]}' \
+printf '{"status":"success","code":"OK","psk":"%s","nodes":[{"pin":"x","port":8443,"ipv4":"203.0.113.5","ipv6":""},{"pin":"y","port":8443,"ipv4":"","ipv6":"2a01:4f8::6"}],"interval":60}' \
     "${PSK}" >"${STATE}/mesh"
-calls() { [[ -f "${STATE}/calls" ]] && cat "${STATE}/calls"; }
 ncalls() { [[ -f "${STATE}/calls" ]] && wc -l <"${STATE}/calls" | tr -d ' ' || echo 0; }
+lastcall() { tail -1 "${STATE}/calls"; }
+has() { grep -qF -- "$1" <<<"$2" && echo yes || echo no; }
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+rej() { run "$1" >/dev/null && echo accepted || echo rejected; }
 
 echo "== 开启前的参数检查 =="
-check "没有 headscale 地址被拒" 'rejected' "$(run "derp_cmd enable --token ${TOKEN}" >/dev/null && echo accepted || echo rejected)"
-check "http 地址被拒" 'rejected' "$(run "derp_cmd enable --control http://hs.example.com --token ${TOKEN}" >/dev/null && echo accepted || echo rejected)"
-check "没有 token 被拒" 'rejected' "$(run "derp_cmd enable --control ${CONTROL}" >/dev/null && echo accepted || echo rejected)"
-check "token 太短被拒" 'rejected' "$(run "derp_cmd enable --control ${CONTROL} --token short" >/dev/null && echo accepted || echo rejected)"
-check "对外地址带协议被拒" 'rejected' "$(run "derp_cmd enable --control ${CONTROL} --token ${TOKEN} --advertise https://x" >/dev/null && echo accepted || echo rejected)"
-check "参数错误时没碰 headscale 也没改配置" "0 ${ORIGINAL}" "$(ncalls) $(q .)"
+check "没有 sspapi 地址被拒" 'rejected' "$(rej "derp_cmd enable --token ${TOKEN}")"
+check "http 地址被拒" 'rejected' "$(rej "derp_cmd enable --registry http://api.example.com/tailnet.php --token ${TOKEN}")"
+check "没有 token 被拒" 'rejected' "$(rej "derp_cmd enable --registry ${REGISTRY}")"
+check "token 太短被拒" 'rejected' "$(rej "derp_cmd enable --registry ${REGISTRY} --token short")"
+check "--ipv4 填 IPv6 被拒" 'rejected' "$(rej "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN} --ipv4 2a01:4f8::1")"
+check "--ipv6 填 IPv4 被拒" 'rejected' "$(rej "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN} --ipv6 1.2.3.4")"
+check "两个都 none 被拒" 'rejected' "$(rej "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN} --ipv4 none --ipv6 none")"
+check "参数错误时没碰 sspapi 也没改配置" "0 ${ORIGINAL}" "$(ncalls) $(q .)"
 
-echo "== headscale 拒绝或连不上时不开启 =="
-echo 401 >"${STATE}/code"
-OUT="$(run "derp_cmd enable --control ${CONTROL} --token ${TOKEN}")"
-check "401 时不开启" "${ORIGINAL}" "$(q .)"
-check "401 给出 token 不对的提示" 'yes' "$(grep -q '节点 token' <<<"${OUT}" && echo yes || echo no)"
-echo 404 >"${STATE}/code"
-OUT="$(run "derp_cmd enable --control ${CONTROL} --token ${TOKEN}")"
-check "404 提示不是林北的 fork" 'yes' "$(grep -q 'fork' <<<"${OUT}" && echo yes || echo no)"
+echo "== sspapi 拒绝、连不上、探测不到地址时不开启 =="
+echo DERP_UNAUTHORIZED >"${STATE}/code"
+OUT="$(run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}")"
+check "token 不对时不开启" "${ORIGINAL}" "$(q .)"
+check "给出 token 不对的提示" 'yes' "$(has '节点 token' "${OUT}")"
+echo DERP_PIN_CONFLICT >"${STATE}/code"
+OUT="$(run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}")"
+check "克隆机给出删证书的提示" 'yes' "$(has '克隆机' "${OUT}")"
 rm -f "${STATE}/code"
 touch "${STATE}/unreachable"
-run "derp_cmd enable --control ${CONTROL} --token ${TOKEN}" >/dev/null
+run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}" >/dev/null
 check "连不上时不开启" "${ORIGINAL}" "$(q .)"
 rm -f "${STATE}/unreachable"
-check "没开启就没有 token 文件" 'no' "$([[ -e "${CFG}/derp/control.token" ]] && echo yes || echo no)"
+touch "${STATE}/ipsb_down"
+N="$(ncalls)"
+OUT="$(run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}")"
+check "ip.sb 也连不上：提示手写地址、不报到" "yes ${N}" "$(has '手写' "${OUT}") $(ncalls)"
+rm -f "${STATE}/ipsb_down"
+check "没开启就没有 token 文件" 'no' "$([[ -e "${CFG}/derp/registry.token" ]] && echo yes || echo no)"
 : >"${STATE}/calls"
 
-echo "== 开启 =="
-run "derp_cmd enable --control ${CONTROL}/ --token ${TOKEN}" >/dev/null
+echo "== 开启（自动探测地址） =="
+run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}" >/dev/null
 check "生成一个 derp 服务" '1' "$(q '[.services[] | select(.tag=="derp")] | length')"
 check "默认端口 8443" '8443' "$(q '.services[0].listen_port')"
 check "只放行回环" 'true' "$(q '.services[0].verify_client_loopback')"
 check "探测口是 DERP 端口 +1" '8444' "$(q '.services[0].probe_listen_port')"
-check "headscale 地址去掉末尾斜杠" "\"${CONTROL}\"" "$(q '.services[0].control_url')"
-check "token 存成文件、不进 server.json" "\"${CFG}/derp/control.token\" 0" \
-    "$(q '.services[0].control_token_path') $(grep -c "${TOKEN}" "${CFG}/server.json")"
-check "token 文件内容" "${TOKEN}" "$(tr -d '\n' <"${CFG}/derp/control.token")"
-check "token 文件 0600" '600' "$(mode "${CFG}/derp/control.token")"
-check "没指定对外地址时不写这个字段" 'null' "$(q '.services[0].control_advertise_host')"
-check "不再有 PSK 字段" 'null null' "$(q '.services[0].mesh_psk_file') $(q '.services[0].mesh_psk')"
+check "sspapi 地址" "\"${REGISTRY}\"" "$(q '.services[0].registry_url')"
+check "token 存成文件、不进 server.json" "\"${CFG}/derp/registry.token\" 0" \
+    "$(q '.services[0].registry_token_path') $(grep -c "${TOKEN}" "${CFG}/server.json")"
+check "token 文件内容不带换行" "${TOKEN}" "$(cat "${CFG}/derp/registry.token")"
+check "token 文件 0600" '600' "$(mode "${CFG}/derp/registry.token")"
+check "自动探测时不写 advertise 字段" 'null null' "$(q '.services[0].advertise_ipv4') $(q '.services[0].advertise_ipv6')"
+check "不再有 PSK / headscale 字段" 'null null null' "$(q '.services[0].mesh_psk_file') $(q '.services[0].control_url') $(q '.services[0].mesh_with_url')"
 check "用本机固定自签证书" "{\"enabled\":true,\"certificate_path\":\"${CFG}/derp/derp-tls.crt\",\"key_path\":\"${CFG}/derp/derp-tls.key\"}" "$(q '.services[0].tls')"
 check "私钥 0600" '600' "$(mode "${CFG}/derp/derp-tls.key")"
 PIN="$(run 'derp_pin')"
@@ -161,12 +184,10 @@ check "指纹是 base64 SHA-256" 'yes' "$([[ "${PIN}" =~ ^[A-Za-z0-9+/]{43}=$ ]]
 # 与 Go 侧同一算法：SHA-256(公钥 DER)。这里换一条独立的命令链算一遍对照。
 check "指纹与公钥 DER 的 SHA-256 一致" \
     "$(openssl pkey -in "${CFG}/derp/derp-tls.key" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64)" "${PIN}"
-check "报到带端口和指纹、token 走请求头" \
-    "POST ${CONTROL}/linbei/derp/register Authorization: Bearer ${TOKEN} {\"port\":8443,\"pin\":\"${PIN}\"}" \
-    "$(sed -n 1p "${STATE}/calls")"
-check "随后拉名单" "GET ${CONTROL}/linbei/derp/mesh" "$(sed -n 2p "${STATE}/calls" | cut -d' ' -f1-2)"
-check "名单写进进程的缓存" "$(cat "${STATE}/mesh")" "$(cat "${CFG}/derp/mesh-control.cache.json")"
-check "缓存 0600（里面有 PSK）" '600' "$(mode "${CFG}/derp/mesh-control.cache.json")"
+check "报到：token、动作、端口、指纹、ip.sb 探到的两个地址" \
+    "node_token=${TOKEN} action=derp_sync port=8443 pin=${PIN} ipv4=203.0.113.50 ipv6=2a01:4f8::50" "$(lastcall)"
+check "名单写进进程的缓存" "$(cat "${STATE}/mesh")" "$(cat "${CFG}/derp/mesh-registry.cache.json")"
+check "缓存 0600（里面有 PSK）" '600' "$(mode "${CFG}/derp/mesh-registry.cache.json")"
 check "443 改写到 DERP 端口" \
     '{"domain":["derp.linbei.internal"],"port":[443],"action":"route-options","override_address":"127.0.0.1","override_port":8443}' \
     "$(q '.route.rules[0]')"
@@ -175,80 +196,86 @@ check "80 改写到探测口" \
     "$(q '.route.rules[1]')"
 check "原有规则保留在后面" '{"inbound":"anytls-in","outbound":"anytls-out"}' "$(q '.route.rules[2]')"
 check "重启过一次" '1' "$(restarts)"
-check "没有留下备份" 'no no' "$([[ -e "${CFG}/server.json.bak" ]] && echo yes || echo no) $([[ -e "${CFG}/derp/control.token.bak" ]] && echo yes || echo no)"
+check "没有留下备份" 'no no' "$([[ -e "${CFG}/server.json.bak" ]] && echo yes || echo no) $([[ -e "${CFG}/derp/registry.token.bak" ]] && echo yes || echo no)"
 SHOW="$(run 'derp_show')"
-check "状态页显示名单数量" 'yes' "$(grep -q '2 个节点' <<<"${SHOW}" && echo yes || echo no)"
-check "状态页不显示 token" 'no' "$(grep -q "${TOKEN}" <<<"${SHOW}" && echo yes || echo no)"
+check "状态页显示名单数量" 'yes' "$(has '2 个节点' "${SHOW}")"
+check "状态页不显示 token" 'no' "$(has "${TOKEN}" "${SHOW}")"
 
 run 'derp_cmd enable' >/dev/null
-check "不带参数重复开启沿用原配置" "\"${CONTROL}\" 8443" "$(q '.services[0].control_url') $(q '.services[0].listen_port')"
+check "不带参数重复开启沿用原配置" "\"${REGISTRY}\" 8443" "$(q '.services[0].registry_url') $(q '.services[0].listen_port')"
 check "重复开启不换证书（指纹不变）" "${PIN}" "$(run 'derp_pin')"
 check "重复开启不会叠加服务" '1' "$(q '[.services[] | select(.tag=="derp")] | length')"
 check "重复开启不会叠加规则" '2' "$(q '[.route.rules[] | select(.action=="route-options")] | length')"
 
-echo "== 端口与对外地址 =="
-check "非法端口被拒" 'rejected' "$(run 'derp_cmd port 70000' >/dev/null && echo accepted || echo rejected)"
+echo "== 手写地址 =="
+touch "${STATE}/no_v6"
+run 'derp_cmd enable --ipv4 198.51.100.7 --ipv6 none' >/dev/null
+check "写进配置" '"198.51.100.7" "none"' "$(q '.services[0].advertise_ipv4') $(q '.services[0].advertise_ipv6')"
+check "报到用手写的、不报 IPv6" 'yes yes' "$(has 'ipv4=198.51.100.7 ' "$(lastcall) ") $(has 'ipv6= ' "$(lastcall) ")"
+run 'derp_cmd enable --ipv4 auto' >/dev/null
+check "auto 恢复自动（IPv6 仍是 none）" 'null "none"' "$(q '.services[0].advertise_ipv4') $(q '.services[0].advertise_ipv6')"
+run 'derp_cmd enable --ipv6 auto' >/dev/null
+check "没有 IPv6 的机器自动探测只报 IPv4" 'yes' "$(has 'ipv4=203.0.113.50 ipv6=' "$(lastcall)")"
+rm -f "${STATE}/no_v6"
+
+echo "== 端口 =="
+check "非法端口被拒" 'rejected' "$(rej 'derp_cmd port 70000')"
 check "带前导零的端口不按八进制算" 'accepted' "$(run 'derp_valid_port 08443' >/dev/null && echo accepted || echo rejected)"
 check "65535 的探测口取下一个之前的" '65534' "$(run 'derp_probe_port 65535')"
-: >"${STATE}/calls"
 run 'derp_cmd port 9443' >/dev/null
 check "改端口：服务与两条改写规则一起变" '9443 9443 9444 9444' \
     "$(q '.services[0].listen_port') $(q '.route.rules[0].override_port') $(q '.services[0].probe_listen_port') $(q '.route.rules[1].override_port')"
-check "改端口：新端口报到、旧端口撤下" "POST 9443|DELETE 8443" \
-    "$(grep -oE '^(POST|DELETE) .*"port":[0-9]+' "${STATE}/calls" | sed -E 's/^([A-Z]+) .*"port":([0-9]+)$/\1 \2/' | grep -v '^GET' | paste -sd '|' -)"
-run 'derp_cmd advertise JP1.example.com' >/dev/null
-check "指定对外地址" '"JP1.example.com"' "$(q '.services[0].control_advertise_host')"
-check "报到带上对外地址" 'yes' "$(grep -q '"host":"JP1.example.com"' "${STATE}/calls" && echo yes || echo no)"
-run 'derp_cmd advertise --clear' >/dev/null
-check "清除对外地址" 'null' "$(q '.services[0].control_advertise_host')"
-check "清除后撤下按对外地址报到的那条" 'yes' \
-    "$(grep -q '^DELETE .*"host":"JP1.example.com"' "${STATE}/calls" && echo yes || echo no)"
+check "改端口后按新端口报到" 'yes' "$(has 'port=9443' "$(lastcall)")"
 
 echo "== 换 token =="
 NEW_TOKEN="$(printf 'n%.0s' {1..40})"
 run "derp_cmd enable --token ${NEW_TOKEN}" >/dev/null
-check "换了 token" "${NEW_TOKEN}" "$(tr -d '\n' <"${CFG}/derp/control.token")"
+check "换了 token" "${NEW_TOKEN}" "$(cat "${CFG}/derp/registry.token")"
+check "用新 token 报到" 'yes' "$(has "node_token=${NEW_TOKEN} " "$(lastcall)")"
 
 echo "== 起不来就回滚 =="
 BEFORE="$(q .)"
 touch "${STATE}/broken"
 : >"${STATE}/calls"
 run "derp_cmd enable --token ${TOKEN}" >/dev/null
-check "token 回滚到旧值" "${NEW_TOKEN}" "$(tr -d '\n' <"${CFG}/derp/control.token")"
+check "token 回滚到旧值" "${NEW_TOKEN}" "$(cat "${CFG}/derp/registry.token")"
 check "server.json 回滚" "${BEFORE}" "$(q .)"
 run 'derp_cmd port 7443' >/dev/null
 check "改端口失败也回滚" '9443' "$(q '.services[0].listen_port')"
-check "本来开着时失败不撤下自己" 'no' "$(grep -q '^DELETE .*"port":9443' "${STATE}/calls" && echo yes || echo no)"
+check "本来开着时失败不撤下自己" 'no' "$(has 'action=derp_leave' "$(cat "${STATE}/calls")")"
 rm -f "${STATE}/broken"
 
 echo "== 关闭 =="
 : >"${STATE}/calls"
 run 'derp_cmd disable' >/dev/null
-check "关闭时从名单撤下本机" "DELETE ${CONTROL}/linbei/derp/register Authorization: Bearer ${NEW_TOKEN} {\"port\":9443}" \
-    "$(cat "${STATE}/calls")"
+check "关闭时从名单撤下本机" "node_token=${NEW_TOKEN} action=derp_leave pin=${PIN}" "$(cat "${STATE}/calls")"
 check "关闭后去掉服务" 'null' "$(q '.services')"
 check "关闭后去掉改写规则、保留其它规则" '[{"inbound":"anytls-in","outbound":"anytls-out"}]' "$(q '.route.rules')"
 check "关闭后与开启前完全一致" "${ORIGINAL}" "$(q .)"
-check "关闭删掉缓存（里面有 PSK）" 'no' "$([[ -e "${CFG}/derp/mesh-control.cache.json" ]] && echo yes || echo no)"
+check "关闭删掉缓存（里面有 PSK）" 'no' "$([[ -e "${CFG}/derp/mesh-registry.cache.json" ]] && echo yes || echo no)"
 check "关闭不删证书（再开指纹不变）" 'yes' "$([[ -s "${CFG}/derp/derp-tls.crt" ]] && echo yes || echo no)"
-check "未开启时不能改端口" 'rejected' "$(run 'derp_cmd port 9443' >/dev/null && echo accepted || echo rejected)"
+check "未开启时不能改端口" 'rejected' "$(rej 'derp_cmd port 9443')"
 check "未开启时不改 server.json" "${ORIGINAL}" "$(q .)"
 run 'derp_cmd enable' >/dev/null
-check "关掉再开不用重新输入（地址、端口、token 都沿用）" "\"${CONTROL}\" 9443 ${NEW_TOKEN}" \
-    "$(q '.services[0].control_url') $(q '.services[0].listen_port') $(tr -d '\n' <"${CFG}/derp/control.token")"
+check "关掉再开不用重新输入（地址、端口、token 都沿用）" "\"${REGISTRY}\" 9443 ${NEW_TOKEN}" \
+    "$(q '.services[0].registry_url') $(q '.services[0].listen_port') $(cat "${CFG}/derp/registry.token")"
+run 'derp_cmd enable --ipv6 none' >/dev/null
+run 'derp_cmd disable' >/dev/null
+run 'derp_cmd enable' >/dev/null
+check "关掉再开，手写的地址设置也沿用" '"none"' "$(q '.services[0].advertise_ipv6')"
 run 'derp_cmd disable' >/dev/null
 
 echo "== 首次开启失败撤下刚报到的那条 =="
 touch "${STATE}/broken"
 : >"${STATE}/calls"
-run "derp_cmd enable --control ${CONTROL} --token ${TOKEN}" >/dev/null
-check "首次开启失败：报到后又撤下" 'POST|GET|DELETE' "$(cut -d' ' -f1 "${STATE}/calls" | paste -sd '|' -)"
+run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}" >/dev/null
+check "首次开启失败：报到后又撤下" 'derp_sync derp_leave' "$(grep -oE 'action=derp_[a-z]+' "${STATE}/calls" | cut -d= -f2 | paste -sd ' ' -)"
 check "首次开启失败不改 server.json" "${ORIGINAL}" "$(q .)"
 rm -f "${STATE}/broken"
 
 if [[ -n "${SINGR_BIN:-}" ]]; then
     echo "== singr check =="
-    run "derp_cmd enable --control ${CONTROL} --token ${TOKEN}" >/dev/null
+    run "derp_cmd enable --registry ${REGISTRY} --token ${TOKEN}" >/dev/null
     # 夹具里的 anytls 没有证书（实机靠 -p 补默认证书路径），check 时让它自签，只看 DERP 部分。
     jq '.inbounds[].tls.insecure = true' "${CFG}/server.json" >"${TMP}/check.json"
     if out="$("${SINGR_BIN}" check -c "${TMP}/check.json" 2>&1)"; then
