@@ -1674,19 +1674,20 @@ cert_update_cmd() {
 # 本块在 SingR.sh 与 SingR-docker.sh 中逐字相同，改一处必须同步另一处。
 #
 # 节点内置 DERP，给林北客户端组网当中继。设计（详见 AGENTS.md 的「DERP relay」）：
-#   - 客户端经代理隧道访问虚拟域名 DERP_DOMAIN，route.rules 第一条把它改写到本机
-#     127.0.0.1:<端口>；DERP 开 verify_client_loopback，公网直连的普通客户端一律拒绝。
-#     于是只有有效订阅能用，流量照常记到用户账上。
-#   - 所有节点组成同一个 DERP 区域，节点之间经公网 TCP <端口> 互联（mesh），靠 PSK
-#     鉴权，所有节点必须是同一个 PSK。对端列表是一个 https 地址（mesh_with_url），
-#     进程运行中每 5 分钟拉一次，增删对端不重启；拉取失败或列表为空都保留现有对端。
-#     列表里不写端口的项用本机 DERP 端口。
-#   - mesh 连接必须认证对端（握手后紧接着发出的就是 PSK）：每台节点用一张固定的自签
-#     证书（DERP_TLS_CERT，首次开启时生成，之后不变），把它的公钥指纹写进对端列表
-#     {"host": ..., "pin": ...}；列表本身经真证书 https 下发，所以指纹可信。没写指纹的
-#     项按正常证书校验，两者都不满足就拒绝连接。重新生成证书 = 指纹变了，列表要跟着改。
-#   - 配置在 server.json 的 services[tag=derp] 与 route.rules 第一条；PSK 单独存在
-#     DERP_PSK_FILE（0600），不写进 server.json。DERP 自己的密钥由进程首次启动时生成。
+#   - 客户端经代理隧道访问虚拟域名 DERP_DOMAIN，route.rules 前两条把它改写到本机：
+#     443 端口 → 127.0.0.1:<DERP 端口>（中继本身），80 端口 → 127.0.0.1:<探测端口>
+#     （明文 204，客户端经每个节点探一下，就知道哪些节点有中继）。DERP 开
+#     verify_client_loopback，公网直连的普通客户端一律拒绝；于是只有有效订阅能用，
+#     流量照常记到用户账上。
+#   - 所有节点组成同一个 DERP 区域、两两 mesh（经公网 TCP <DERP 端口>）。节点向林北的
+#     headscale 报到（control_url + 节点 token），从那里拿 mesh PSK 和其它节点的名单，
+#     进程运行中每 5 分钟报到并刷新一次，增删对端不重启。没有人需要手工维护名单。
+#   - mesh 连接按公钥指纹认证对端（握手后紧接着发出的就是 PSK）：每台节点用一张固定的
+#     自签证书（DERP_TLS_CERT，首次开启时生成，之后不变），指纹随报到交给 headscale，
+#     名单经真证书 https 下发，所以可信。
+#   - 配置在 server.json 的 services[tag=derp] 与 route.rules 前两条；节点 token 单独存在
+#     DERP_TOKEN_FILE（0600），不写进 server.json。进程把 headscale 的应答（含 PSK）缓存在
+#     DERP_CONTROL_CACHE（0600）：headscale 暂时连不上时照样能重启、重建 mesh。
 #
 # 依赖节点管理块的 node_require_jq / node_configs_ready / node_backup / node_restore /
 # node_apply，以及默认证书更新源块的 cert_url_mask。
@@ -1696,8 +1697,11 @@ DERP_DOMAIN="derp.linbei.internal"
 DERP_DEFAULT_PORT=8443
 DERP_DIR="${CONFIG_DIR}/derp"
 DERP_KEY_FILE="${DERP_DIR}/derp.key"
-DERP_PSK_FILE="${DERP_DIR}/mesh.psk"
-DERP_PEER_CACHE="${DERP_DIR}/mesh-peers.cache.json"
+DERP_TOKEN_FILE="${DERP_DIR}/control.token"
+# 上次成功开启时的 headscale 地址、端口、对外地址：关掉再开不用重新输入（token 文件同理保留）。
+DERP_SAVED_FILE="${DERP_DIR}/enable.json"
+# 进程把缓存放在 config_path（DERP_KEY_FILE）同目录下，文件名见 service/derp/singr_mesh.go。
+DERP_CONTROL_CACHE="${DERP_DIR}/mesh-control.cache.json"
 DERP_TLS_CERT="${DERP_DIR}/derp-tls.crt"
 DERP_TLS_KEY="${DERP_DIR}/derp-tls.key"
 
@@ -1716,15 +1720,16 @@ derp_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
-derp_valid_psk() {
-    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+# 探测口只听 127.0.0.1，不用放行防火墙；取 DERP 端口的下一个。
+derp_probe_port() {
+    if (($1 < 65535)); then echo $(($1 + 1)); else echo $(($1 - 1)); fi
 }
 
-derp_gen_psk() {
-    od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
+derp_token() {
+    [[ -s "${DERP_TOKEN_FILE}" ]] && tr -d ' \r\n' <"${DERP_TOKEN_FILE}"
 }
 
-# 固定的自签证书：只生成一次，之后一直用它（指纹写在对端列表里，换了就对不上）。
+# 固定的自签证书：只生成一次，之后一直用它（指纹在 headscale 的名单里，换了要重新报到）。
 # 有效期写满一百年；对端按公钥指纹校验，不看有效期，写长只是避免别的工具误报过期。
 derp_ensure_cert() {
     [[ -s "${DERP_TLS_CERT}" && -s "${DERP_TLS_KEY}" ]] && return 0
@@ -1753,27 +1758,87 @@ derp_pin() {
         openssl dgst -sha256 -binary 2>/dev/null | base64 | tr -d '\n'
 }
 
-# 按给定端口和对端列表地址写入 DERP 服务与改写规则（替换已有的那一份）。
-# 进程按 ^[0-9a-f]{64}$ 校验 PSK 文件的完整内容，所以写文件时不能带换行。
+# 调 headscale 的注册表接口。参数：方法 路径 请求体(可空) 控制面地址 token。
+# 成功时把应答写到 stdout；token 经 0600 临时文件交给 curl，不进命令行（ps 看得见）。
+derp_control_call() {
+    local method="$1" path="$2" body="$3" url="$4" token="$5" header out code rc=0
+    local -a args
+    command -v curl >/dev/null 2>&1 || { echo -e "${red}需要 curl${plain}" >&2; return 1; }
+    header="$(umask 077 && mktemp)" || return 1
+    out="$(mktemp)" || { rm -f "${header}"; return 1; }
+    printf 'Authorization: Bearer %s\n' "${token}" >"${header}"
+    args=(--proto '=https' -sS --noproxy '*' --connect-timeout 15 --max-time 30
+        -o "${out}" -w '%{http_code}' -X "${method}" -H "@${header}")
+    [[ -n "${body}" ]] && args+=(-H 'Content-Type: application/json' --data "${body}")
+    code="$(curl "${args[@]}" "${url%/}${path}")" || rc=$?
+    if ((rc != 0)); then
+        echo -e "${red}连不上 headscale（curl 退出码 ${rc}）${plain}" >&2
+    elif [[ "${code}" == 401 ]]; then
+        echo -e "${red}headscale 拒绝了节点 token（401），检查 token 是否与 headscale 配置的一致${plain}" >&2
+        rc=1
+    elif [[ "${code}" == 404 ]]; then
+        echo -e "${red}headscale 没有 DERP 注册表接口（404）：不是林北的 fork，或没配 linbei.derp_mesh.node_token${plain}" >&2
+        rc=1
+    elif [[ "${code}" != 200 && "${code}" != 204 ]]; then
+        echo -e "${red}headscale 返回 HTTP ${code}：$(head -c 300 "${out}")${plain}" >&2
+        rc=1
+    else
+        cat "${out}"
+    fi
+    rm -f "${header}" "${out}"
+    return "${rc}"
+}
+
+# 报到一次并拉名单，写进进程的缓存：既验证了地址和 token，进程第一次启动也直接有 PSK。
+derp_register() {
+    local url="$1" token="$2" port="$3" adv="$4" body mesh tmp
+    body="$(jq -nc --argjson port "${port}" --arg pin "$(derp_pin)" --arg host "${adv}" \
+        '{port: $port, pin: $pin} + (if $host != "" then {host: $host} else {} end)')" || return 1
+    derp_control_call POST /linbei/derp/register "${body}" "${url}" "${token}" >/dev/null || return 1
+    mesh="$(derp_control_call GET /linbei/derp/mesh "" "${url}" "${token}")" || return 1
+    if ! jq -e '(.psk | test("^[0-9a-f]{64}$")) and (.nodes | type == "array")' <<<"${mesh}" >/dev/null 2>&1; then
+        echo -e "${red}headscale 返回的名单格式不对${plain}" >&2
+        return 1
+    fi
+    mkdir -p "${DERP_DIR}" && chmod 700 "${DERP_DIR}" 2>/dev/null
+    tmp="$(umask 077 && mktemp "${DERP_CONTROL_CACHE}.XXXXXX")" || return 1
+    printf '%s' "${mesh}" >"${tmp}" && mv -f "${tmp}" "${DERP_CONTROL_CACHE}" || { rm -f "${tmp}"; return 1; }
+    echo -e "${green}已向 headscale 报到，当前名单 $(jq '.nodes | length' <<<"${mesh}") 个节点（含本机）${plain}"
+}
+
+# 主动离开名单（不离开的话别的节点要等 headscale 的过期时间才不再连它）。失败不阻断。
+derp_leave() {
+    local url="$1" token="$2" port="$3" adv="$4" body
+    [[ -n "${url}" && -n "${token}" && -n "${port}" ]] || return 0
+    body="$(jq -nc --argjson port "${port}" --arg host "${adv}" \
+        '{port: $port} + (if $host != "" then {host: $host} else {} end)')" || return 0
+    derp_control_call DELETE /linbei/derp/register "${body}" "${url}" "${token}" >/dev/null ||
+        echo -e "${yellow}没能从 headscale 名单里撤下本机，它会在过期后自动移除${plain}"
+}
+
+# 按给定端口、控制面地址、对外地址写入 DERP 服务与两条改写规则（替换已有的那一份）。
 derp_write_server() {
-    local port="$1" url="$2" psk_file="" tmp
-    [[ -s "${DERP_PSK_FILE}" ]] && psk_file="${DERP_PSK_FILE}"
+    local port="$1" url="$2" adv="$3" tmp
     tmp="$(mktemp "${SERVER_CONFIG}.XXXXXX")" || return 1
     if ! jq --arg t "${DERP_TAG}" --arg d "${DERP_DOMAIN}" --argjson port "${port}" \
-        --arg key "${DERP_KEY_FILE}" --arg psk "${psk_file}" --arg url "${url}" \
+        --argjson probe "$(derp_probe_port "${port}")" --arg key "${DERP_KEY_FILE}" \
+        --arg url "${url}" --arg token "${DERP_TOKEN_FILE}" --arg adv "${adv}" \
         --arg crt "${DERP_TLS_CERT}" --arg tkey "${DERP_TLS_KEY}" '
         def is_derp_rule: (.action == "route-options") and (.domain == [$d]);
         .services = ([(.services // [])[] | select(.tag != $t)] + [
             {type: "derp", tag: $t, listen: "::", listen_port: $port,
              config_path: $key, home: "blank",
              tls: {enabled: true, certificate_path: $crt, key_path: $tkey},
-             verify_client_loopback: true}
-            + (if $psk != "" then {mesh_psk_file: $psk} else {} end)
-            + (if $url != "" then {mesh_with_url: $url} else {} end)
+             verify_client_loopback: true, probe_listen_port: $probe,
+             control_url: $url, control_token_path: $token}
+            + (if $adv != "" then {control_advertise_host: $adv} else {} end)
         ])
         | .route = (.route // {})
-        | .route.rules = ([{domain: [$d], action: "route-options",
-                            override_address: "127.0.0.1", override_port: $port}]
+        # route-options 不是终止动作，两条都得带端口，否则后一条会盖掉前一条的改写。
+        | .route.rules = ([{domain: [$d], port: [443], action: "route-options",
+                            override_address: "127.0.0.1", override_port: $port},
+                           {domain: [$d], port: [80], action: "route-options",
+                            override_address: "127.0.0.1", override_port: $probe}]
                           + [(.route.rules // [])[] | select(is_derp_rule | not)])
     ' "${SERVER_CONFIG}" >"${tmp}" || ! mv -f "${tmp}" "${SERVER_CONFIG}"; then
         rm -f "${tmp}"
@@ -1797,159 +1862,168 @@ derp_remove_server() {
     fi
 }
 
-# 备份 → 写入 → 重启校验，起不来就连同 PSK 文件一起回滚。
-# 参数：新 PSK（不改传空） write|remove [端口 对端列表地址]
+# 备份 → 写入 → 重启校验，起不来就连同 token 文件一起回滚。
+# 参数：write|remove [端口 控制面地址 对外地址 新token(不改传空)]
 derp_change() {
-    local new_psk="$1" mode="$2" port="${3:-}" url="${4:-}" psk_backup=""
+    local mode="$1" port="${2:-}" url="${3:-}" adv="${4:-}" token="${5:-}" token_backup=""
     node_configs_ready || return 1
     mkdir -p "${DERP_DIR}" || return 1
     chmod 700 "${DERP_DIR}" 2>/dev/null
-    if [[ -n "${new_psk}" ]]; then
-        if [[ -e "${DERP_PSK_FILE}" ]]; then
-            psk_backup="${DERP_PSK_FILE}.bak"
-            cp -fp "${DERP_PSK_FILE}" "${psk_backup}" || return 1
-        fi
+    if [[ -n "${token}" && -e "${DERP_TOKEN_FILE}" ]]; then
+        token_backup="${DERP_TOKEN_FILE}.bak"
+        cp -fp "${DERP_TOKEN_FILE}" "${token_backup}" || return 1
     fi
     node_backup || { echo -e "${red}备份配置失败，未做任何修改${plain}"; return 1; }
-    if [[ -n "${new_psk}" ]]; then
-        (umask 077 && printf '%s' "${new_psk}" >"${DERP_PSK_FILE}") || { node_restore; return 1; }
+    if [[ -n "${token}" ]]; then
+        (umask 077 && printf '%s\n' "${token}" >"${DERP_TOKEN_FILE}") || { node_restore; return 1; }
     fi
     if [[ "${mode}" == "remove" ]]; then
         derp_remove_server || { node_restore; return 1; }
     else
-        derp_ensure_cert || { node_restore; return 1; }
-        derp_write_server "${port}" "${url}" || { node_restore; return 1; }
+        derp_write_server "${port}" "${url}" "${adv}" || { node_restore; return 1; }
     fi
     if node_apply; then
-        rm -f "${psk_backup}"
+        rm -f "${token_backup}"
         return 0
     fi
-    if [[ -n "${new_psk}" ]]; then
-        if [[ -n "${psk_backup}" ]]; then
-            mv -f "${psk_backup}" "${DERP_PSK_FILE}"
+    if [[ -n "${token}" ]]; then
+        if [[ -n "${token_backup}" ]]; then
+            mv -f "${token_backup}" "${DERP_TOKEN_FILE}"
         else
-            rm -f "${DERP_PSK_FILE}"
+            rm -f "${DERP_TOKEN_FILE}"
         fi
     fi
     return 1
 }
 
 derp_show() {
-    local port url peers
+    local port url adv peers
     if ! derp_enabled; then
         echo -e "${yellow}DERP 中继：未开启${plain}"
-    else
-        port="$(derp_get listen_port)"
-        url="$(derp_get mesh_with_url)"
-        echo -e "${green}DERP 中继：已开启${plain}"
-        echo "  端口：TCP ${port}（节点之间 mesh 互联要用，防火墙需放行）"
-        echo "  虚拟域名：${DERP_DOMAIN} → 127.0.0.1:${port}（只接受经代理隧道进来的连接）"
-        echo "  本机指纹：$(derp_pin || echo '读取失败')"
-        echo "  在对端列表里这样写本机（host 换成本机域名或 IP）："
-        echo "    {\"host\": \"<本机域名>:${port}\", \"pin\": \"$(derp_pin)\"}"
-        if [[ -n "${url}" ]]; then
-            echo "  对端列表：$(cert_url_mask "${url}")（运行中每 5 分钟拉取一次）"
-            if [[ -s "${DERP_PEER_CACHE}" ]]; then
-                peers="$(jq -r '(.nodes // []) | length' "${DERP_PEER_CACHE}" 2>/dev/null)"
-                echo "  最近一次拉到：${peers:-?} 个对端（含本机）"
-            else
-                echo -e "  最近一次拉到：${yellow}还没有成功拉取过${plain}"
-            fi
-        else
-            echo -e "  对端列表：${yellow}未配置${plain}（只作为单节点中继，不与其它节点互联）"
-        fi
+        return 0
     fi
-    if [[ -s "${DERP_PSK_FILE}" ]]; then
-        echo "  PSK：已设置（${DERP_PSK_FILE}）"
+    port="$(derp_get listen_port)"
+    url="$(derp_get control_url)"
+    adv="$(derp_get control_advertise_host)"
+    echo -e "${green}DERP 中继：已开启${plain}"
+    echo "  端口：TCP ${port}（节点之间 mesh 互联要用，防火墙需放行）"
+    echo "  虚拟域名：${DERP_DOMAIN} → 127.0.0.1:${port}，探测口 127.0.0.1:$(derp_get probe_listen_port)（只接受经代理隧道进来的连接）"
+    echo "  headscale：$(cert_url_mask "${url}")（运行中每 5 分钟报到并刷新名单）"
+    echo "  对外地址：${adv:-由 headscale 按来源 IP 判断}"
+    echo "  本机指纹：$(derp_pin || echo '读取失败')"
+    if [[ -s "${DERP_CONTROL_CACHE}" ]]; then
+        peers="$(jq -r '(.nodes // []) | length' "${DERP_CONTROL_CACHE}" 2>/dev/null)"
+        echo "  最近一次拉到：${peers:-?} 个节点（含本机）"
     else
-        echo -e "  PSK：${yellow}未设置${plain}（配置对端列表前必须先设置，所有节点相同）"
+        echo -e "  最近一次拉到：${yellow}还没有成功拉取过${plain}"
     fi
 }
 
 derp_usage() {
     echo "用法："
     echo "  singr derp                    查看状态（终端里会出操作菜单）"
-    echo "  singr derp enable [端口]      开启 DERP 中继，默认端口 ${DERP_DEFAULT_PORT}"
-    echo "  singr derp disable            关闭 DERP 中继"
+    echo "  singr derp enable --control <https://headscale地址> --token <节点token> [--port 端口] [--advertise 地址]"
+    echo "                                开启 DERP 中继并加入 mesh，默认端口 ${DERP_DEFAULT_PORT}；已开启时可只改其中几项"
+    echo "  singr derp disable            关闭 DERP 中继（同时从 headscale 名单撤下本机）"
     echo "  singr derp port <端口>        修改端口"
-    echo "  singr derp url <https://...>  设置对端列表地址（--clear 清除）"
-    echo "  singr derp psk <64位十六进制> 设置 mesh PSK（所有节点必须相同）"
-    echo "  singr derp psk gen            生成一个新的 PSK 并设置到本机"
+    echo "  singr derp advertise <地址>   指定别的节点连本机用的域名或 IP（--clear 恢复按来源 IP）"
+    echo "节点 token 是 headscale 配置里 linbei.derp_mesh 的那个，不是 headscale 的 API key。"
 }
 
-derp_set_psk() {
-    local psk="$1"
-    if [[ "${psk}" == "gen" ]]; then
-        psk="$(derp_gen_psk)"
-        echo -e "${green}新生成的 PSK（请在其它所有节点上执行同一条命令设置）：${plain}"
-        echo "  singr derp psk ${psk}"
+# 开启或修改。参数同 singr derp enable；没给的项沿用当前配置。
+derp_enable() {
+    local url token port adv old_port old_url old_adv old_token token_changed=""
+    old_port="$(derp_get listen_port)"
+    old_url="$(derp_get control_url)"
+    old_adv="$(derp_get control_advertise_host)"
+    old_token="$(derp_token)"
+    url="${old_url}" port="${old_port:-${DERP_DEFAULT_PORT}}" adv="${old_adv}" token="${old_token}"
+    if ! derp_enabled && [[ -s "${DERP_SAVED_FILE}" ]]; then
+        url="$(jq -r '.control // empty' "${DERP_SAVED_FILE}" 2>/dev/null)"
+        port="$(jq -r '.port // empty' "${DERP_SAVED_FILE}" 2>/dev/null)"
+        port="${port:-${DERP_DEFAULT_PORT}}"
+        adv="$(jq -r '.advertise // empty' "${DERP_SAVED_FILE}" 2>/dev/null)"
     fi
-    psk="$(echo "${psk}" | tr '[:upper:]' '[:lower:]')"
-    if ! derp_valid_psk "${psk}"; then
-        echo -e "${red}PSK 必须是 64 位十六进制（可用 singr derp psk gen 生成）${plain}"
+    while (($# > 0)); do
+        case "$1" in
+            --control) url="${2:-}"; shift 2 || shift ;;
+            --token) token="${2:-}"; token_changed=1; shift 2 || shift ;;
+            --port) port="${2:-}"; shift 2 || shift ;;
+            --advertise) adv="${2:-}"; shift 2 || shift ;;
+            --clear-advertise) adv=""; shift ;;
+            *) echo -e "${red}未知参数：$1${plain}"; derp_usage; return 1 ;;
+        esac
+    done
+    url="${url%/}"
+    derp_valid_port "${port}" || { echo -e "${red}端口无效：${port}${plain}"; return 1; }
+    if [[ "${url}" != https://?* ]]; then
+        echo -e "${red}需要 headscale 地址 --control https://...（名单决定 PSK 发给谁，必须 https）${plain}"
         return 1
     fi
-    if ! derp_enabled; then
-        mkdir -p "${DERP_DIR}" && chmod 700 "${DERP_DIR}" 2>/dev/null
-        (umask 077 && printf '%s' "${psk}" >"${DERP_PSK_FILE}") || return 1
-        echo -e "${green}PSK 已保存，开启 DERP 时生效${plain}"
-        return 0
+    if ((${#token} < 32)); then
+        echo -e "${red}需要节点 token --token ...（至少 32 个字符，即 headscale 配置的 linbei.derp_mesh 节点 token）${plain}"
+        return 1
     fi
-    derp_change "${psk}" write "$(derp_get listen_port)" "$(derp_get mesh_with_url)"
+    if [[ -n "${adv}" && ! "${adv}" =~ ^[A-Za-z0-9.:-]+$ ]]; then
+        echo -e "${red}对外地址只能是域名或 IP（不带端口和协议）：${adv}${plain}"
+        return 1
+    fi
+    derp_ensure_cert || return 1
+    derp_register "${url}" "${token}" "${port}" "${adv}" || return 1
+    local new_token="${token}"
+    [[ -z "${token_changed}" || "${token}" == "${old_token}" ]] && token=""
+    if ! derp_change write "${port}" "${url}" "${adv}" "${token}"; then
+        # 没开起来：刚报到的那条撤掉；本来就开着的话旧配置已回滚，进程会按旧配置继续报到。
+        derp_valid_port "${old_port}" || derp_leave "${url}" "${new_token}" "${port}" "${adv}"
+        return 1
+    fi
+    jq -n --arg c "${url}" --argjson p "${port}" --arg a "${adv}" '{control: $c, port: $p, advertise: $a}' \
+        >"${DERP_SAVED_FILE}" 2>/dev/null
+    # 换了端口或对外地址：旧的那条从名单里撤掉，别让别的节点连到已经不在的地址上。
+    if derp_valid_port "${old_port}" && [[ "${old_port}" != "${port}" || "${old_adv}" != "${adv}" ]]; then
+        derp_leave "${old_url}" "${old_token:-$(derp_token)}" "${old_port}" "${old_adv}"
+    fi
+    echo -e "${yellow}记得在防火墙放行 TCP ${port}（节点之间 mesh 互联要用）${plain}"
 }
 
-# singr derp [enable [端口] | disable | port <端口> | url <地址>|--clear | psk <PSK>|gen]
+# singr derp [enable ... | disable | port <端口> | advertise <地址>|--clear]
 derp_cmd() {
-    local action="${1:-}" arg="${2:-}" port url sel
+    local action="${1:-}" arg="${2:-}" sel url token port
     node_require_jq || return 1
     node_configs_ready || return 1
     case "${action}" in
         "") ;;
         enable)
-            port="${arg:-$(derp_get listen_port)}"
-            port="${port:-${DERP_DEFAULT_PORT}}"
-            derp_valid_port "${port}" || { echo -e "${red}端口无效：${port}${plain}"; return 1; }
-            derp_change "" write "${port}" "$(derp_get mesh_with_url)" || return 1
-            echo -e "${yellow}记得在防火墙放行 TCP ${port}（节点之间 mesh 互联要用）${plain}"
-            return 0
+            shift
+            derp_enable "$@"
+            return
             ;;
         disable)
             derp_enabled || { echo -e "${yellow}DERP 中继本来就没开${plain}"; return 0; }
-            derp_change "" remove
-            return
-            ;;
-        port)
-            derp_enabled || { echo -e "${red}DERP 中继未开启，请用 singr derp enable ${arg}${plain}"; return 1; }
-            derp_valid_port "${arg}" || { echo -e "${red}端口无效：${arg}${plain}"; return 1; }
-            derp_change "" write "${arg}" "$(derp_get mesh_with_url)" || return 1
-            echo -e "${yellow}记得在防火墙放行 TCP ${arg}；对端列表里给本机写了端口的话也要一起改${plain}"
+            derp_leave "$(derp_get control_url)" "$(derp_token)" "$(derp_get listen_port)" \
+                "$(derp_get control_advertise_host)"
+            derp_change remove || return 1
+            rm -f "${DERP_CONTROL_CACHE}"
             return 0
             ;;
-        url)
-            derp_enabled || { echo -e "${red}DERP 中继未开启，请先 singr derp enable${plain}"; return 1; }
+        port)
+            derp_enabled || { echo -e "${red}DERP 中继未开启，请用 singr derp enable${plain}"; return 1; }
+            derp_enable --port "${arg}"
+            return
+            ;;
+        advertise)
+            derp_enabled || { echo -e "${red}DERP 中继未开启，请用 singr derp enable${plain}"; return 1; }
             if [[ "${arg}" == "--clear" ]]; then
-                derp_change "" write "$(derp_get listen_port)" ""
-                return
+                derp_enable --clear-advertise
+            else
+                [[ -n "${arg}" ]] || { derp_usage; return 1; }
+                derp_enable --advertise "${arg}"
             fi
-            if [[ "${arg}" != https://* ]]; then
-                echo -e "${red}对端列表地址必须是 https://（列表决定 PSK 发给谁，不能被中途篡改）${plain}"
-                return 1
-            fi
-            if [[ ! -s "${DERP_PSK_FILE}" ]]; then
-                echo -e "${red}请先设置 PSK：singr derp psk <PSK>（第一台节点可用 singr derp psk gen 生成）${plain}"
-                return 1
-            fi
-            derp_change "" write "$(derp_get listen_port)" "${arg}"
             return
             ;;
         help | -h | --help)
             derp_usage
             return 0
-            ;;
-        psk)
-            [[ -n "${arg}" ]] || { derp_usage; return 1; }
-            derp_set_psk "${arg}"
-            return
             ;;
         *)
             derp_usage
@@ -1962,8 +2036,8 @@ derp_cmd() {
     echo -e "
   1. 开启 / 关闭
   2. 修改端口
-  3. 设置对端列表地址
-  4. 设置 PSK
+  3. 修改 headscale 地址与节点 token
+  4. 指定对外地址
   0. 返回
 "
     read -r -p "请输入选择 [0-4]: " sel
@@ -1972,8 +2046,11 @@ derp_cmd() {
             if derp_enabled; then
                 confirm "确定关闭 DERP 中继吗" "n" && derp_cmd disable
             else
+                read -r -p "headscale 地址 (https://...): " url
+                read -r -s -p "节点 token: " token
+                echo
                 read -r -p "端口 [${DERP_DEFAULT_PORT}]: " port
-                derp_cmd enable "${port:-${DERP_DEFAULT_PORT}}"
+                derp_enable --control "${url}" --token "${token}" --port "${port:-${DERP_DEFAULT_PORT}}"
             fi
             ;;
         2)
@@ -1981,12 +2058,18 @@ derp_cmd() {
             derp_cmd port "${port}"
             ;;
         3)
-            read -r -p "对端列表地址 (https://...，输入 --clear 清除): " url
-            [[ -n "${url}" ]] && derp_cmd url "${url}"
+            read -r -p "headscale 地址 [$(derp_get control_url)]: " url
+            read -r -s -p "节点 token（留空不改）: " token
+            echo
+            if [[ -n "${token}" ]]; then
+                derp_enable --control "${url:-$(derp_get control_url)}" --token "${token}"
+            else
+                derp_enable --control "${url:-$(derp_get control_url)}"
+            fi
             ;;
         4)
-            read -r -p "PSK（64 位十六进制，输入 gen 生成新的）: " url
-            [[ -n "${url}" ]] && derp_cmd psk "${url}"
+            read -r -p "对外地址（域名或 IP，输入 --clear 恢复按来源 IP）: " url
+            [[ -n "${url}" ]] && derp_cmd advertise "${url}"
             ;;
         *) return 0 ;;
     esac
@@ -2174,7 +2257,7 @@ show_usage() {
     echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
     echo "singr cert-source           查看/配置默认证书的远程更新源"
     echo "singr cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
-    echo "singr derp [子命令]         DERP 中继（组网）：enable/disable/port/url/psk，详见 singr derp help"
+    echo "singr derp [子命令]         DERP 中继（组网）：enable/disable/port/advertise，详见 singr derp help"
     echo "------------------------------------------"
     echo "添加节点参数："
     echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2"

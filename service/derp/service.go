@@ -73,6 +73,8 @@ type Service struct {
 	meshWith             []*option.DERPMeshOptions
 	singr                option.SingRDERPOptions
 	listenPort           uint16
+	tlsOptions           option.InboundTLSOptions
+	singrControl         *meshControl
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.DERPServiceOptions) (adapter.Service, error) {
@@ -140,6 +142,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		meshWith:             options.MeshWith,
 		singr:                options.SingRDERPOptions,
 		listenPort:           options.ListenPort,
+		tlsOptions:           common.PtrValueOrDefault(options.TLS),
 	}, nil
 }
 
@@ -185,7 +188,10 @@ func (d *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			server.SetMeshKey(string(meshKeyContent))
 		}
-		d.applyLoopbackVerifier(server)
+		err = d.startSingR(server, scope)
+		if err != nil {
+			return err
+		}
 		d.server = server
 
 		derpMux := http.NewServeMux()
@@ -273,7 +279,7 @@ func (d *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				}
 			}
 		}
-		err := d.startMeshURL(scope)
+		err := d.startSingRMesh(scope)
 		if err != nil {
 			return err
 		}

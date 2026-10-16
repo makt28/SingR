@@ -13,6 +13,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"math/big"
 	"net"
@@ -20,6 +22,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -141,11 +144,17 @@ func TestLoopbackSource(t *testing.T) {
 }
 
 func TestValidateSingRDERPOptions(t *testing.T) {
-	psk := strings.Repeat("ab", 32)
 	valid := option.DERPServiceOptions{
-		ListenOptions:    option.ListenOptions{ListenPort: 8443},
-		SingRDERPOptions: option.SingRDERPOptions{VerifyClientLoopback: true, MeshWithURL: "https://example.com/derp.json"},
-		MeshPSK:          psk,
+		ListenOptions: option.ListenOptions{ListenPort: 8443},
+		SingRDERPOptions: option.SingRDERPOptions{
+			VerifyClientLoopback: true,
+			ControlURL:           "https://hs.example.com",
+			ControlTokenPath:     "/etc/singr/derp-control.token",
+			ProbeListenPort:      8444,
+		},
+		InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+			TLS: &option.InboundTLSOptions{CertificatePath: "/etc/singr/derp.crt"},
+		},
 	}
 	if err := validateSingRDERPOptions(valid); err != nil {
 		t.Fatal(err)
@@ -155,20 +164,33 @@ func TestValidateSingRDERPOptions(t *testing.T) {
 			o.VerifyClientURL = []*option.DERPVerifyClientURLOptions{{}}
 		},
 		"loopback with verify endpoint": func(o *option.DERPServiceOptions) { o.VerifyClientEndpoint = []string{"ts"} },
-		"http list url":                 func(o *option.DERPServiceOptions) { o.MeshWithURL = "http://example.com/derp.json" },
-		"list url without host":         func(o *option.DERPServiceOptions) { o.MeshWithURL = "https:///derp.json" },
-		"no psk":                        func(o *option.DERPServiceOptions) { o.MeshPSK = "" },
+		"http control url":              func(o *option.DERPServiceOptions) { o.ControlURL = "http://hs.example.com" },
+		"control url without host":      func(o *option.DERPServiceOptions) { o.ControlURL = "https:///x" },
+		"no token":                      func(o *option.DERPServiceOptions) { o.ControlTokenPath = "" },
+		"psk next to control":           func(o *option.DERPServiceOptions) { o.MeshPSK = strings.Repeat("ab", 32) },
+		"psk file next to control":      func(o *option.DERPServiceOptions) { o.MeshPSKFile = "/x" },
 		"no listen port":                func(o *option.DERPServiceOptions) { o.ListenPort = 0 },
+		"no tls":                        func(o *option.DERPServiceOptions) { o.TLS = nil },
+		"acme instead of fixed cert": func(o *option.DERPServiceOptions) {
+			o.TLS = &option.InboundTLSOptions{}
+		},
+		"probe on derp port": func(o *option.DERPServiceOptions) { o.ProbeListenPort = 8443 },
 		"interval too short": func(o *option.DERPServiceOptions) {
-			o.MeshWithURLInterval = badoption.Duration(time.Second)
+			o.ControlInterval = badoption.Duration(time.Second)
 		},
 	}
 	for name, mutate := range cases {
 		options := valid
+		tlsCopy := *valid.TLS
+		options.TLS = &tlsCopy
 		mutate(&options)
 		if err := validateSingRDERPOptions(options); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
+	}
+	// Without a control server only the loopback/probe checks apply.
+	if err := validateSingRDERPOptions(option.DERPServiceOptions{ListenOptions: option.ListenOptions{ListenPort: 8443}}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -345,48 +367,232 @@ func (c *fakeRemoteConn) RemoteAddr() net.Addr {
 	return c.remote
 }
 
-// A restart while the list host is down must rebuild the mesh from the
-// cached list, and a failing fetch must not drop those peers.
-func TestMeshURLManagerStartsFromCacheWhenListUnreachable(t *testing.T) {
-	cachePath := t.TempDir() + "/" + meshPeerCacheName
-	if err := os.WriteFile(cachePath, []byte(`{"nodes": ["a.example.com", "b.example.com:9443"]}`), 0o644); err != nil {
+// The pin we register must be what peers' certificate_public_key_sha256
+// check compares against.
+func TestCertificatePin(t *testing.T) {
+	certificate, key := selfSignedPEM(t)
+	pin, err := certificatePin(certificate)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var access sync.Mutex
-	running := map[string]bool{}
+	spki, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	sum := sha256.Sum256(spki)
+	if pin != base64.StdEncoding.EncodeToString(sum[:]) {
+		t.Fatalf("pin %s does not match the public key", pin)
+	}
+	if _, err := certificatePin([]byte("not pem")); err == nil {
+		t.Fatal("garbage accepted")
+	}
+}
+
+func selfSignedPEM(t *testing.T) ([]byte, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "derp"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), key
+}
+
+// fakeControl is the Linbei headscale fork's registry, just enough of it.
+type fakeControl struct {
+	access     sync.Mutex
+	failing    bool
+	registered []map[string]any
+	response   string
+}
+
+func (f *fakeControl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	if r.Header.Get("Authorization") != "Bearer node-token" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if f.failing {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/linbei/derp/register":
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		f.registered = append(f.registered, body)
+		w.Write([]byte(`{}`))
+	case r.Method == http.MethodGet && r.URL.Path == "/linbei/derp/mesh":
+		w.Write([]byte(f.response))
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+type runningPeers struct {
+	access sync.Mutex
+	set    map[string]bool
+}
+
+func (r *runningPeers) start(_ context.Context, target meshTarget) (func(), error) {
+	r.access.Lock()
+	defer r.access.Unlock()
+	r.set[target.String()] = true
+	return func() {
+		r.access.Lock()
+		defer r.access.Unlock()
+		delete(r.set, target.String())
+	}, nil
+}
+
+func (r *runningPeers) snapshot() []string {
+	r.access.Lock()
+	defer r.access.Unlock()
+	var out []string
+	for k := range r.set {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func newTestControl(t *testing.T, baseURL string, client *http.Client, cachePath string, running *runningPeers) *meshControl {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	manager := &meshURLManager{
+	control := &meshControl{
 		ctx:         ctx,
 		cancel:      cancel,
 		logger:      log.NewNOPFactory().Logger(),
-		url:         "https://127.0.0.1:1/unreachable.json",
+		baseURL:     baseURL,
+		token:       "node-token",
+		advertise:   "hk1.example.com",
+		pin:         "PIN",
+		listenPort:  8443,
 		interval:    time.Hour,
-		defaultPort: 8443,
 		cachePath:   cachePath,
-		httpClient:  &http.Client{Timeout: time.Second},
+		httpClient:  client,
 		done:        make(chan struct{}),
+		startPeerFn: running.start,
 	}
-	manager.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
-		access.Lock()
-		defer access.Unlock()
-		running[target.String()] = true
-		return func() {
-			access.Lock()
-			defer access.Unlock()
-			delete(running, target.String())
-		}, nil
+	control.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
+		return control.startPeerFn(ctx, target)
 	})
-	manager.start()
-	time.Sleep(200 * time.Millisecond) // let the first (failing) fetch run
-	access.Lock()
-	got := len(running) == 2 && running["a.example.com:8443"] && running["b.example.com:9443"]
-	access.Unlock()
-	if !got {
-		t.Fatalf("peers from cache not running: %v", running)
+	return control
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for ", what)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	manager.Close()
-	if len(running) != 0 {
-		t.Fatalf("peers left after Close: %v", running)
+}
+
+// Register, fetch the PSK and peers, cache them; a failing control server
+// keeps the current peers; peers that leave the registry are dropped.
+func TestMeshControlRegistersAndFollowsRegistry(t *testing.T) {
+	psk := strings.Repeat("ab", 32)
+	control := &fakeControl{response: `{"psk":"` + psk + `","nodes":[{"host":"a.example.com:8443","pin":"` +
+		base64.StdEncoding.EncodeToString(make([]byte, 32)) + `"},{"host":"b.example.com:9443"}]}`}
+	server := httptest.NewTLSServer(control)
+	defer server.Close()
+	cachePath := t.TempDir() + "/" + controlCacheName
+	running := &runningPeers{set: map[string]bool{}}
+	m := newTestControl(t, server.URL, server.Client(), cachePath, running)
+
+	if got := m.initialPSK(); got != psk {
+		t.Fatalf("initial PSK %q", got)
+	}
+	info, err := os.Stat(cachePath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("cache must exist with 0600 (holds the PSK): %v %v", info, err)
+	}
+	m.start(true)
+	defer m.Close()
+	waitFor(t, "peers", func() bool { return len(running.snapshot()) == 2 })
+	waitFor(t, "registration", func() bool {
+		control.access.Lock()
+		defer control.access.Unlock()
+		return len(control.registered) == 1
+	})
+
+	control.access.Lock()
+	registered := control.registered
+	control.access.Unlock()
+	if len(registered) != 1 || registered[0]["host"] != "hk1.example.com" ||
+		registered[0]["port"] != float64(8443) || registered[0]["pin"] != "PIN" {
+		t.Fatalf("register body: %v", registered)
+	}
+
+	control.access.Lock()
+	control.failing = true
+	control.access.Unlock()
+	m.refresh()
+	if got := running.snapshot(); len(got) != 2 {
+		t.Fatalf("failing control server dropped peers: %v", got)
+	}
+
+	control.access.Lock()
+	control.failing = false
+	control.response = `{"psk":"` + psk + `","nodes":["b.example.com:9443"]}`
+	control.access.Unlock()
+	m.refresh()
+	if got := running.snapshot(); !slices.Equal(got, []string{"b.example.com:9443"}) {
+		t.Fatalf("after a node left: %v", got)
+	}
+	cached, _ := os.ReadFile(cachePath)
+	if !strings.Contains(string(cached), `"nodes":["b.example.com:9443"]`) {
+		t.Fatalf("cache not updated: %s", cached)
+	}
+}
+
+// A restart while the control server is down rebuilds the mesh from the
+// cache, PSK included.
+func TestMeshControlStartsFromCacheWhenControlUnreachable(t *testing.T) {
+	psk := strings.Repeat("cd", 32)
+	cachePath := t.TempDir() + "/" + controlCacheName
+	if err := os.WriteFile(cachePath, []byte(`{"psk":"`+psk+`","nodes":["a.example.com","b.example.com:9443"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	running := &runningPeers{set: map[string]bool{}}
+	m := newTestControl(t, "https://127.0.0.1:1", &http.Client{Timeout: time.Second}, cachePath, running)
+	if got := m.initialPSK(); got != psk {
+		t.Fatalf("PSK from cache %q", got)
+	}
+	m.start(true)
+	time.Sleep(200 * time.Millisecond) // let the first (failing) refresh run
+	if got := running.snapshot(); !slices.Equal(got, []string{"a.example.com:8443", "b.example.com:9443"}) {
+		t.Fatalf("peers from cache: %v", got)
+	}
+	m.Close()
+	if got := running.snapshot(); len(got) != 0 {
+		t.Fatalf("peers left after Close: %v", got)
+	}
+}
+
+// Without a mesh key the node still registers but starts no peers.
+func TestMeshControlWithoutMeshKeyStartsNoPeers(t *testing.T) {
+	control := &fakeControl{response: `{"psk":"` + strings.Repeat("ab", 32) + `","nodes":["a.example.com"]}`}
+	server := httptest.NewTLSServer(control)
+	defer server.Close()
+	running := &runningPeers{set: map[string]bool{}}
+	m := newTestControl(t, server.URL, server.Client(), t.TempDir()+"/"+controlCacheName, running)
+	m.start(false)
+	waitFor(t, "registration", func() bool {
+		control.access.Lock()
+		defer control.access.Unlock()
+		return len(control.registered) == 1
+	})
+	m.Close()
+	if got := running.snapshot(); len(got) != 0 {
+		t.Fatalf("peers started without a mesh key: %v", got)
 	}
 }
 

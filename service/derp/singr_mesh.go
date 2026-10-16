@@ -7,8 +7,11 @@ package derp
 //   - verify_client_loopback: ordinary clients are admitted only from the
 //     loopback address (mesh peers bypass verification upstream, see
 //     derpserver.Server.verifyClient).
-//   - mesh_with_url: a remote mesh peer list polled while running, with peers
-//     added and removed in place.
+//   - control_url: the node registers with the Linbei headscale fork and gets
+//     the mesh PSK plus every other relay from it; peers are added and
+//     removed in place while running.
+//   - probe_listen_port: a loopback plain-HTTP 204 that clients probe through
+//     each proxy node to find the ones that have a relay.
 //
 // Hooks in service.go are kept to a few lines so a core resync stays easy.
 
@@ -16,8 +19,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -47,12 +52,12 @@ import (
 )
 
 const (
-	defaultMeshWithURLInterval = 5 * time.Minute
-	minMeshWithURLInterval     = 30 * time.Second
-	meshPeerListMaxBytes       = 1 << 20
-	meshPeerListFetchTimeout   = 20 * time.Second
-	meshPeerCacheName          = "mesh-peers.cache.json"
-	meshPeerErrorLogInterval   = time.Minute
+	defaultControlInterval   = 5 * time.Minute
+	minControlInterval       = 30 * time.Second
+	controlMaxResponseBytes  = 1 << 20
+	controlRequestTimeout    = 20 * time.Second
+	controlCacheName         = "mesh-control.cache.json"
+	meshPeerErrorLogInterval = time.Minute
 
 	// Never dialed: loopbackAdmitTransport answers it in-process.
 	loopbackAdmitURL = "http://loopback-admit.singr.invalid/admit"
@@ -62,32 +67,78 @@ func validateSingRDERPOptions(options option.DERPServiceOptions) error {
 	if options.VerifyClientLoopback && (len(options.VerifyClientURL) > 0 || len(options.VerifyClientEndpoint) > 0) {
 		return E.New("verify_client_loopback conflicts with verify_client_url and verify_client_endpoint")
 	}
-	if options.MeshWithURL == "" {
+	if options.ProbeListenPort != 0 && options.ProbeListenPort == options.ListenPort {
+		return E.New("probe_listen_port must differ from listen_port")
+	}
+	if options.ControlURL == "" {
 		return nil
 	}
-	parsed, err := url.Parse(options.MeshWithURL)
+	parsed, err := url.Parse(options.ControlURL)
 	if err != nil {
-		return E.Cause(err, "invalid mesh_with_url")
+		return E.Cause(err, "invalid control_url")
 	}
-	// The list decides whom we hand our mesh key to, so it must not be
-	// tamperable in transit.
+	// The control server decides whom we hand our mesh key to, so the
+	// channel to it must not be tamperable.
 	if parsed.Scheme != "https" || parsed.Host == "" {
-		return E.New("mesh_with_url must be an https URL")
+		return E.New("control_url must be an https URL")
 	}
-	if options.MeshPSK == "" && options.MeshPSKFile == "" {
-		return E.New("mesh_with_url requires mesh_psk or mesh_psk_file")
+	if options.ControlTokenPath == "" {
+		return E.New("control_url requires control_token_path")
 	}
-	// Entries without a port use our own listen port.
+	if options.MeshPSK != "" || options.MeshPSKFile != "" {
+		return E.New("control_url provides the mesh PSK; remove mesh_psk / mesh_psk_file")
+	}
+	// We register our port, and list entries without a port use it.
 	if options.ListenPort == 0 {
-		return E.New("mesh_with_url requires listen_port")
+		return E.New("control_url requires listen_port")
 	}
-	if interval := time.Duration(options.MeshWithURLInterval); interval != 0 && interval < minMeshWithURLInterval {
-		return E.New("mesh_with_url_interval must be at least ", minMeshWithURLInterval)
+	if options.TLS == nil || (len(options.TLS.Certificate) == 0 && options.TLS.CertificatePath == "") {
+		return E.New("control_url requires a fixed TLS certificate (its pin is what other relays verify)")
+	}
+	if interval := time.Duration(options.ControlInterval); interval != 0 && interval < minControlInterval {
+		return E.New("control_interval must be at least ", minControlInterval)
 	}
 	return nil
 }
 
-// ---- verify_client_loopback ----
+// startSingR runs during the DERP service's Start stage, before the server
+// begins serving.
+func (d *Service) startSingR(server *derpserver.Server, scope *adapter.Scope) error {
+	d.applyLoopbackVerifier(server)
+	if d.singr.ProbeListenPort != 0 {
+		err := d.startProbe(scope)
+		if err != nil {
+			return err
+		}
+	}
+	if d.singr.ControlURL == "" {
+		return nil
+	}
+	control, err := d.newMeshControl()
+	if err != nil {
+		return err
+	}
+	d.singrControl = control
+	// The mesh key has to be in place before the server serves: changing it
+	// later would race with connection handshakes. `singr derp enable`
+	// pre-fetches it into the cache; without a cache we ask once here.
+	psk := control.initialPSK()
+	if psk == "" {
+		d.logger.Error("no mesh PSK from control server or cache; relaying works, meshing stays off until restart")
+		return nil
+	}
+	return server.SetMeshKey(psk)
+}
+
+// startSingRMesh runs in PostStart, when the server is up.
+func (d *Service) startSingRMesh(scope *adapter.Scope) error {
+	if d.singrControl == nil {
+		return nil
+	}
+	d.singrControl.start(d.server.HasMeshKey())
+	scope.Add(d.singrControl.Close)
+	return nil
+}
 
 func (d *Service) applyLoopbackVerifier(server *derpserver.Server) {
 	if !d.singr.VerifyClientLoopback {
@@ -96,6 +147,47 @@ func (d *Service) applyLoopbackVerifier(server *derpserver.Server) {
 	server.SetVerifyClientHTTPClient([]*http.Client{{Transport: loopbackAdmitTransport{}}})
 	server.SetVerifyClientURL([]string{loopbackAdmitURL})
 }
+
+// ---- probe ----
+
+func (d *Service) startProbe(scope *adapter.Scope) error {
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(d.singr.ProbeListenPort))))
+	if err != nil {
+		return E.Cause(err, "listen probe port")
+	}
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go server.Serve(listener)
+	scope.Add(server.Close)
+	return nil
+}
+
+// ---- pin ----
+
+// certificatePin returns base64(SHA-256(PKIX public key)) of the first
+// certificate, the form sing-box's certificate_public_key_sha256 checks.
+func certificatePin(pemContent []byte) (string, error) {
+	block, _ := pem.Decode(pemContent)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", E.New("no PEM certificate")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	publicKey, err := x509.MarshalPKIXPublicKey(certificate.PublicKey)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(publicKey)
+	return base64.StdEncoding.EncodeToString(sum[:]), nil
+}
+
+// ---- verify_client_loopback ----
 
 // loopbackAdmitTransport plays the admission controller in-process, so the
 // existing upstream verify_client_url machinery enforces the rule without a
@@ -169,8 +261,8 @@ type meshPeerListEntry struct {
 
 // parseMeshPeerList rejects the whole list on any bad entry, so a typo keeps
 // the current peers instead of quietly dropping one. An empty list is
-// rejected too: an accidentally emptied file must not tear the mesh down
-// (clear mesh_with_url to really remove every peer).
+// rejected too: the registry always lists us, so an empty one means it lost
+// its state, and that must not tear the mesh down.
 func parseMeshPeerList(content []byte, defaultPort uint16) ([]meshTarget, error) {
 	var file meshPeerListFile
 	err := json.Unmarshal(content, &file)
@@ -310,74 +402,117 @@ func (s *meshPeerSet) closeAll() {
 	}
 }
 
-// ---- mesh_with_url ----
+// ---- control_url ----
 
-type meshURLManager struct {
+type meshControl struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	logger      logger.ContextLogger
-	url         string
+	baseURL     string
+	token       string
+	advertise   string
+	pin         string
+	listenPort  uint16
 	interval    time.Duration
-	defaultPort uint16
 	cachePath   string
 	httpClient  *http.Client
 	access      sync.Mutex
 	peers       *meshPeerSet
+	currentPSK  string
+	warnedPSK   string
 	started     bool
 	done        chan struct{}
+	startPeerFn func(context.Context, meshTarget) (func(), error)
 }
 
-func (d *Service) startMeshURL(scope *adapter.Scope) error {
-	if d.singr.MeshWithURL == "" {
-		return nil
+// meshControlResponse is GET /linbei/derp/mesh. The nodes part is parsed by
+// parseMeshPeerList.
+type meshControlResponse struct {
+	PSK string `json:"psk"`
+}
+
+func (d *Service) newMeshControl() (*meshControl, error) {
+	token, err := os.ReadFile(d.singr.ControlTokenPath)
+	if err != nil {
+		return nil, E.Cause(err, "read control_token_path")
 	}
-	if !d.server.HasMeshKey() {
-		return E.New("missing mesh psk")
+	certificate := []byte(strings.Join(d.tlsOptions.Certificate, "\n"))
+	if d.tlsOptions.CertificatePath != "" {
+		certificate, err = os.ReadFile(d.tlsOptions.CertificatePath)
+		if err != nil {
+			return nil, E.Cause(err, "read DERP certificate")
+		}
 	}
-	interval := time.Duration(d.singr.MeshWithURLInterval)
+	pin, err := certificatePin(certificate)
+	if err != nil {
+		return nil, E.Cause(err, "DERP certificate pin")
+	}
+	interval := time.Duration(d.singr.ControlInterval)
 	if interval == 0 {
-		interval = defaultMeshWithURLInterval
+		interval = defaultControlInterval
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Never follow proxy environment variables for the list.
+	// Never follow proxy environment variables for the control server.
 	transport.Proxy = nil
-	manager := &meshURLManager{
-		ctx:         ctx,
-		cancel:      cancel,
-		logger:      d.logger,
-		url:         d.singr.MeshWithURL,
-		interval:    interval,
-		defaultPort: d.listenPort,
-		cachePath:   filepath.Join(filepath.Dir(d.configPath), meshPeerCacheName),
-		httpClient:  &http.Client{Transport: transport, Timeout: meshPeerListFetchTimeout},
-		done:        make(chan struct{}),
+	control := &meshControl{
+		ctx:        ctx,
+		cancel:     cancel,
+		logger:     d.logger,
+		baseURL:    strings.TrimSuffix(d.singr.ControlURL, "/"),
+		token:      strings.TrimSpace(string(token)),
+		advertise:  d.singr.ControlAdvertiseHost,
+		pin:        pin,
+		listenPort: d.listenPort,
+		interval:   interval,
+		cachePath:  filepath.Join(filepath.Dir(d.configPath), controlCacheName),
+		httpClient: &http.Client{Transport: transport, Timeout: controlRequestTimeout},
+		done:       make(chan struct{}),
 	}
-	manager.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
-		return d.startURLMeshPeer(ctx, target)
+	control.startPeerFn = d.startMeshPeer
+	control.peers = newMeshPeerSet(func(target meshTarget) (func(), error) {
+		return control.startPeerFn(ctx, target)
 	})
-	manager.start()
-	scope.Add(manager.Close)
-	return nil
+	return control, nil
 }
 
-func (m *meshURLManager) start() {
-	// Bring the last good list up first, so a restart while the list host is
-	// unreachable still rebuilds the mesh.
+// initialPSK reads the cached response, or fetches once when there is none.
+func (m *meshControl) initialPSK() string {
+	content, err := os.ReadFile(m.cachePath)
+	if err != nil {
+		content, err = m.fetch()
+		if err != nil {
+			m.logger.Warn("fetch mesh from control server: ", err)
+			return ""
+		}
+		m.writeCache(content)
+	}
+	var response meshControlResponse
+	if json.Unmarshal(content, &response) != nil || checkMeshKey(response.PSK) != nil {
+		m.logger.Warn("cached mesh response has no valid PSK")
+		return ""
+	}
+	m.currentPSK = response.PSK
+	return response.PSK
+}
+
+// start brings the cached peers up first, so a restart while the control
+// server is unreachable still rebuilds the mesh, then keeps registering and
+// refreshing. Without a mesh key we still register (other relays should know
+// us) but start no peers.
+func (m *meshControl) start(meshEnabled bool) {
+	if !meshEnabled {
+		m.peers = nil
+	}
 	content, err := os.ReadFile(m.cachePath)
 	if err == nil {
-		targets, parseErr := parseMeshPeerList(content, m.defaultPort)
-		if parseErr != nil {
-			m.logger.Warn("ignore cached mesh peer list: ", parseErr)
-		} else {
-			m.update(targets, "cache")
-		}
+		m.apply(content, "cache")
 	}
 	m.started = true
 	go m.loop()
 }
 
-func (m *meshURLManager) loop() {
+func (m *meshControl) loop() {
 	defer close(m.done)
 	m.refresh()
 	ticker := time.NewTicker(m.interval)
@@ -392,51 +527,94 @@ func (m *meshURLManager) loop() {
 	}
 }
 
-func (m *meshURLManager) refresh() {
+func (m *meshControl) refresh() {
+	err := m.register()
+	if err != nil && m.ctx.Err() == nil {
+		m.logger.Warn("register with control server: ", err)
+	}
 	content, err := m.fetch()
 	if err != nil {
 		if m.ctx.Err() == nil {
-			m.logger.Warn("fetch mesh peer list (keeping current peers): ", err)
+			m.logger.Warn("fetch mesh from control server (keeping current peers): ", err)
 		}
 		return
 	}
-	targets, err := parseMeshPeerList(content, m.defaultPort)
-	if err != nil {
-		m.logger.Warn("bad mesh peer list (keeping current peers): ", err)
-		return
+	if m.apply(content, "control") {
+		m.writeCache(content)
 	}
-	m.update(targets, "remote")
-	m.writeCache(content)
 }
 
-func (m *meshURLManager) fetch() ([]byte, error) {
-	request, err := http.NewRequestWithContext(m.ctx, http.MethodGet, m.url, nil)
+func (m *meshControl) register() error {
+	body, err := json.Marshal(map[string]any{
+		"host": m.advertise,
+		"port": m.listenPort,
+		"pin":  m.pin,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = m.do(http.MethodPost, "/linbei/derp/register", body)
+	return err
+}
+
+func (m *meshControl) fetch() ([]byte, error) {
+	return m.do(http.MethodGet, "/linbei/derp/mesh", nil)
+}
+
+func (m *meshControl) do(method, path string, body []byte) ([]byte, error) {
+	request, err := http.NewRequestWithContext(m.ctx, method, m.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+m.token)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := m.httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, E.New("unexpected status ", response.Status)
-	}
-	content, err := io.ReadAll(io.LimitReader(response.Body, meshPeerListMaxBytes+1))
+	content, err := io.ReadAll(io.LimitReader(response.Body, controlMaxResponseBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(content) > meshPeerListMaxBytes {
-		return nil, E.New("mesh peer list larger than ", meshPeerListMaxBytes, " bytes")
+	if response.StatusCode != http.StatusOK {
+		return nil, E.New(method, " ", path, ": ", response.Status, ": ", strings.TrimSpace(string(content)))
+	}
+	if len(content) > controlMaxResponseBytes {
+		return nil, E.New("response larger than ", controlMaxResponseBytes, " bytes")
 	}
 	return content, nil
 }
 
-func (m *meshURLManager) update(targets []meshTarget, source string) {
+// apply updates peers from a mesh response and reports whether it was usable.
+// A bad or empty response keeps the current peers.
+func (m *meshControl) apply(content []byte, source string) bool {
+	var response meshControlResponse
+	err := json.Unmarshal(content, &response)
+	if err != nil || checkMeshKey(response.PSK) != nil {
+		m.logger.Warn("bad mesh response from ", source, " (keeping current peers)")
+		return false
+	}
+	targets, err := parseMeshPeerList(content, m.listenPort)
+	if err != nil {
+		m.logger.Warn("bad mesh peer list from ", source, " (keeping current peers): ", err)
+		return false
+	}
 	m.access.Lock()
 	defer m.access.Unlock()
 	if m.ctx.Err() != nil {
-		return
+		return false
+	}
+	if response.PSK != m.currentPSK && response.PSK != m.warnedPSK {
+		// The key is fixed once the server serves; the new one is cached and
+		// takes effect on the next start.
+		m.warnedPSK = response.PSK
+		m.logger.Warn("mesh PSK changed on the control server; restart SingR to apply it")
+	}
+	if m.peers == nil {
+		return true
 	}
 	added, removed, errs := m.peers.apply(targets)
 	for _, err := range errs {
@@ -448,31 +626,35 @@ func (m *meshURLManager) update(targets []meshTarget, source string) {
 	if len(removed) > 0 {
 		m.logger.Info("mesh peers removed (", source, "): ", strings.Join(removed, ", "))
 	}
+	return true
 }
 
-func (m *meshURLManager) writeCache(content []byte) {
+func (m *meshControl) writeCache(content []byte) {
 	current, err := os.ReadFile(m.cachePath)
 	if err == nil && bytes.Equal(current, content) {
 		return
 	}
 	temporary := m.cachePath + ".tmp"
-	err = os.WriteFile(temporary, content, 0o644)
+	// The cache holds the mesh PSK.
+	err = os.WriteFile(temporary, content, 0o600)
 	if err == nil {
 		err = os.Rename(temporary, m.cachePath)
 	}
 	if err != nil {
 		os.Remove(temporary)
-		m.logger.Warn("write mesh peer cache: ", err)
+		m.logger.Warn("write mesh cache: ", err)
 	}
 }
 
-func (m *meshURLManager) Close() error {
+func (m *meshControl) Close() error {
 	m.cancel()
 	if m.started {
 		<-m.done
 	}
 	m.access.Lock()
-	m.peers.closeAll()
+	if m.peers != nil {
+		m.peers.closeAll()
+	}
 	m.access.Unlock()
 	return nil
 }
@@ -492,10 +674,10 @@ func meshTLSOptions(target meshTarget) option.OutboundTLSOptions {
 	return options
 }
 
-// startURLMeshPeer mirrors upstream startMeshWithHost, kept separate so the
+// startMeshPeer mirrors upstream startMeshWithHost, kept separate so the
 // connection can be stopped and its failures do not flood the log: a peer
 // that is down retries every few seconds forever.
-func (d *Service) startURLMeshPeer(parent context.Context, target meshTarget) (func(), error) {
+func (d *Service) startMeshPeer(parent context.Context, target meshTarget) (func(), error) {
 	meshDialer, err := dialer.NewWithOptions(dialer.Options{
 		Context:        d.ctx,
 		Options:        option.DialerOptions{},

@@ -214,69 +214,35 @@ singr cert-source --cert-url https://example.com/a.pem --key-url https://example
 
 - **只服务自家用户。** 客户端经代理隧道访问虚拟域名 `derp.linbei.internal`，节点把它转到本机的 DERP。DERP 只接受来自本机回环的普通连接，公网直接连过来的一律拒绝。所以只有有效订阅能用，中继流量照常计进用户的已用流量。
 - **所有节点组成一个中继网。** 节点之间互相连接（mesh），用户的两台设备连在不同节点上也能互通。这部分走公网，需要放行 DERP 端口（默认 TCP 8443）。
-- **节点之间要确认对方身份。** 每台节点有一张固定的自签证书，你把各节点证书的指纹写进对端列表，节点只和指纹对得上的对端互联。对端列表放在你自己的 https 地址上，所以指纹可信。
-- **对端列表由你手动维护**，放在一个 https 地址上。节点每 5 分钟拉一次，增删节点不用重启 SingR，也不用登录每台机器。
+- **节点自己向林北的 headscale 报到。** headscale 记着所有开了 DERP 的节点，发给每台节点 mesh 口令（PSK）和其它节点的名单。没有名单要手工维护，加节点、下线节点都不用碰别的机器。
+- **节点之间要确认对方身份。** 每台节点有一张固定的自签证书，报到时把证书指纹交给 headscale；名单经 headscale 的正规 https 下发，节点只和指纹对得上的对端互联。
+- **客户端怎么知道哪些节点有中继。** 节点在本机回环上开一个探测口（DERP 端口 +1），客户端经每个节点访问 `http://derp.linbei.internal/`，有应答的就是有中继的节点。探测口只听本机，不用放行防火墙。
+
+需要林北 fork 的 headscale（`linbei/README.md` 里有配置），和它配置里的**节点 token**（`linbei.derp_mesh.node_token`，不是 headscale 的 API key：它只能报到和拉名单）。
 
 ### 开启
 
-在**每台**节点上做以下几步：
-
-1. **设置 PSK**（节点之间互联的口令，所有节点必须相同）。第一台节点生成：
-
-   ```sh
-   singr derp psk gen
-   ```
-
-   它会打印一条 `singr derp psk <64 位十六进制>`，到其他每台节点上原样执行这条命令。
-
-2. **开启 DERP**（不写端口用 8443）：
-
-   ```sh
-   singr derp enable
-   ```
-
-   第一次开启时会生成本机证书并打印指纹。之后随时用 `singr derp` 查看，里面有一行可以直接复制到对端列表里的内容：
-
-   ```text
-   {"host": "<本机域名>:8443", "pin": "vozXbmt0YHVDKYFUcF5MQ7FPjtiIf8zgTTGYCbR8WtU="}
-   ```
-
-   把 `<本机域名>` 换成这台节点的域名或公网 IP。
-
-3. **防火墙放行 TCP 8443**（或你设置的端口）。节点之间要能互相连到这个端口。
-
-然后在**你自己的服务器**上放一个对端列表文件，比如 `https://example.com/derp-peers.json`，列出全部节点：
-
-```json
-{
-  "nodes": [
-    {"host": "hk1.example.com:8443", "pin": "vozXbmt0YHVDKYFUcF5MQ7FPjtiIf8zgTTGYCbR8WtU="},
-    {"host": "jp1.example.com:8443", "pin": "hKjWRm/UD0srYSh821wm28JFLI+Cmb0m5Mvg1DzDj5Q="}
-  ]
-}
-```
-
-最后回到**每台**节点，设置这个地址：
+在每台节点上执行（不写端口用 8443）：
 
 ```sh
-singr derp url https://example.com/derp-peers.json
+singr derp enable --control https://hs.example.com --token <节点 token>
 ```
 
-### 对端列表格式
+它会生成本机证书、向 headscale 报到一次、拉一次名单，确认地址和 token 都对了才改配置并重启 SingR。然后**防火墙放行 TCP 8443**（或你设置的端口），节点之间要能互相连到这个端口。
 
-- 每一项是 `{"host": "地址:端口", "pin": "指纹"}`。不写端口时用本机的 DERP 端口，所以所有节点都用默认端口的话可以只写域名。IPv6 写成 `[2001:db8::1]:8443`。
-- 列表里包含本机自己没关系，会自动识别并跳过，所以每台节点可以用同一份列表。
-- 不写 `pin` 的项（比如 `"hk1.example.com"`）要求对端的 DERP 端口用的是该域名的正规证书。用 `singr derp enable` 生成的自签证书时**必须写 `pin`**，否则连不上。
-- 列表地址必须是 `https://`。**不要把 PSK 写进列表**：客户端也会读这个文件。
-- 可以添加其他字段，SingR 会忽略它们。
+- headscale 默认按报到请求的来源 IP 记录节点地址。机器有多个公网 IP、或者想让别的节点用域名连它，加 `--advertise jp1.example.com`。
+- 随时用 `singr derp` 查看状态（终端里会出操作菜单）。
 
 ### 修改与生效
 
-- **增删节点**：只改列表文件。节点 5 分钟内自动生效，不重启。新节点自己照「开启」的步骤做一遍。
-- **列表出错时保持原样**：拉取失败、任何一项格式不对、列表为空，节点都继续用上一份能用的列表，并在日志里警告。要真正断开所有对端，执行 `singr derp url --clear`。
-- **改端口**：`singr derp port 9443`。列表里给这台节点写了端口的话要一起改，防火墙也要放行新端口。
-- **换证书**：删掉 `/etc/singr/derp/derp-tls.crt` 和 `derp-tls.key`（Docker 在 `/etc/singr-docker/derp/`），再执行 `singr derp enable`。指纹会变，列表要跟着改。证书默认用一百年，正常不需要换。
-- **关闭**：`singr derp disable`。证书和 PSK 会保留，再次开启时指纹不变。
+- **增删节点**：新节点照「开启」做一遍；下线用 `singr derp disable`，它会先从名单撤下本机。节点每 5 分钟报到并刷新一次名单，变化 5 分钟内生效，不重启。直接关机的节点在 headscale 的过期时间（默认 24 小时）后自动移出名单。
+- **headscale 出问题时保持原样**：连不上、应答格式不对、名单为空，节点都继续用上一份名单，并在日志里警告。SingR 重启时用缓存的名单和 PSK（`/etc/singr/derp/mesh-control.cache.json`），headscale 暂时不在也能把 mesh 建起来。
+- **改端口**：`singr derp port 9443`。新端口报到、旧端口撤下，防火墙也要放行新端口。
+- **改对外地址**：`singr derp advertise jp1.example.com`，`singr derp advertise --clear` 恢复按来源 IP。
+- **换 headscale 地址或 token**：`singr derp enable --control <新地址> --token <新 token>`（只给要改的那项也行）。
+- **PSK 变了**（headscale 的状态文件丢了重建）：节点会记下新 PSK 并在日志里提示，**重启 SingR 后生效**。
+- **换证书**：删掉 `/etc/singr/derp/derp-tls.crt` 和 `derp-tls.key`（Docker 在 `/etc/singr-docker/derp/`），再执行 `singr derp enable`，新指纹随报到更新到 headscale。证书默认用一百年，正常不需要换。
+- **关闭**：`singr derp disable`。证书和 token 会保留，再次开启时指纹不变。
 - 每次改动都会重启 SingR 并检查是否正常启动；起不来会自动回滚到改动前的配置。
 
 ### 排查
@@ -285,12 +251,12 @@ singr derp url https://example.com/derp-peers.json
 
 | 日志 | 含义 |
 | --- | --- |
-| `mesh peers added (remote): ...` / `mesh peers removed (remote): ...` | 列表变化已生效 |
-| `mesh(...): ... unrecognized remote public key: <指纹>` | 对端出示的指纹和列表不一致：列表写错了，或者对端换过证书。日志里的就是对端当前的指纹 |
-| `mesh(...): ... x509: ...` | 这一项没写 `pin`，对端又没有该域名的正规证书 |
-| `mesh(...): ... connection refused` / `timeout` | 对端没开 DERP，或者端口没放行 |
-| `fetch mesh peer list (keeping current peers): ...` | 列表地址拉不下来，继续用上一份 |
-| `bad mesh peer list (keeping current peers): ...` | 列表格式有错，错误信息里有是第几项 |
+| `mesh peers added (control): ...` / `mesh peers removed (control): ...` | 名单变化已生效（`(cache)` 是重启时从缓存恢复的） |
+| `register with control server: ...` / `fetch mesh from control server (keeping current peers): ...` | 连不上 headscale，或 token 不对（`401`），继续用上一份名单 |
+| `mesh(...): ... unrecognized remote public key: <指纹>` | 对端出示的指纹和它报到的不一致：对端换过证书但还没重新报到，5 分钟内自愈 |
+| `mesh(...): ... connection refused` / `timeout` | 对端端口没放行，或者 headscale 记下的地址连不到（多 IP 机器用 `--advertise`） |
+| `mesh PSK changed on the control server; restart SingR to apply it` | headscale 换了 PSK，重启 SingR |
+| `no mesh PSK from control server or cache` | 第一次启动时 headscale 不可达且没有缓存：中继能用，但不和其它节点互联，重启后重试 |
 
 连不上的对端每分钟最多警告一次。
 
