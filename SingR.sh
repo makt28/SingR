@@ -1355,6 +1355,10 @@ cert_update_cmd() {
 #     鉴权，所有节点必须是同一个 PSK。对端列表是一个 https 地址（mesh_with_url），
 #     进程运行中每 5 分钟拉一次，增删对端不重启；拉取失败或列表为空都保留现有对端。
 #     列表里不写端口的项用本机 DERP 端口。
+#   - mesh 连接必须认证对端（握手后紧接着发出的就是 PSK）：每台节点用一张固定的自签
+#     证书（DERP_TLS_CERT，首次开启时生成，之后不变），把它的公钥指纹写进对端列表
+#     {"host": ..., "pin": ...}；列表本身经真证书 https 下发，所以指纹可信。没写指纹的
+#     项按正常证书校验，两者都不满足就拒绝连接。重新生成证书 = 指纹变了，列表要跟着改。
 #   - 配置在 server.json 的 services[tag=derp] 与 route.rules 第一条；PSK 单独存在
 #     DERP_PSK_FILE（0600），不写进 server.json。DERP 自己的密钥由进程首次启动时生成。
 #
@@ -1368,6 +1372,8 @@ DERP_DIR="${CONFIG_DIR}/derp"
 DERP_KEY_FILE="${DERP_DIR}/derp.key"
 DERP_PSK_FILE="${DERP_DIR}/mesh.psk"
 DERP_PEER_CACHE="${DERP_DIR}/mesh-peers.cache.json"
+DERP_TLS_CERT="${DERP_DIR}/derp-tls.crt"
+DERP_TLS_KEY="${DERP_DIR}/derp-tls.key"
 
 # 当前 DERP 服务里某个字段的值；没开 DERP 或没有该字段时输出空。
 derp_get() {
@@ -1392,6 +1398,35 @@ derp_gen_psk() {
     od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
 }
 
+# 固定的自签证书：只生成一次，之后一直用它（指纹写在对端列表里，换了就对不上）。
+# 有效期写满一百年；对端按公钥指纹校验，不看有效期，写长只是避免别的工具误报过期。
+derp_ensure_cert() {
+    [[ -s "${DERP_TLS_CERT}" && -s "${DERP_TLS_KEY}" ]] && return 0
+    command -v openssl >/dev/null 2>&1 || {
+        echo -e "${red}生成 DERP 证书需要 openssl，请先安装（Debian/Ubuntu: apt install openssl）${plain}"
+        return 1
+    }
+    mkdir -p "${DERP_DIR}" && chmod 700 "${DERP_DIR}" 2>/dev/null
+    # 先单独生成 EC 私钥再签证书：req 的 -newkey ec + -pkeyopt 写法 LibreSSL 不认。
+    if ! (umask 077 && openssl ecparam -name prime256v1 -genkey -noout -out "${DERP_TLS_KEY}" >/dev/null 2>&1 &&
+        openssl req -new -x509 -key "${DERP_TLS_KEY}" -days 36500 -subj "/CN=derp" \
+            -out "${DERP_TLS_CERT}" >/dev/null 2>&1); then
+        rm -f "${DERP_TLS_CERT}" "${DERP_TLS_KEY}"
+        echo -e "${red}生成 DERP 证书失败${plain}"
+        return 1
+    fi
+    chmod 644 "${DERP_TLS_CERT}" 2>/dev/null
+    echo -e "${green}已生成本机 DERP 证书，指纹：$(derp_pin)${plain}"
+}
+
+# 公钥指纹 = base64(SHA-256(公钥 DER))，与 sing-box 的 certificate_public_key_sha256 同一算法。
+derp_pin() {
+    [[ -s "${DERP_TLS_CERT}" ]] || return 1
+    openssl x509 -in "${DERP_TLS_CERT}" -noout -pubkey 2>/dev/null |
+        openssl pkey -pubin -outform DER 2>/dev/null |
+        openssl dgst -sha256 -binary 2>/dev/null | base64 | tr -d '\n'
+}
+
 # 按给定端口和对端列表地址写入 DERP 服务与改写规则（替换已有的那一份）。
 # 进程按 ^[0-9a-f]{64}$ 校验 PSK 文件的完整内容，所以写文件时不能带换行。
 derp_write_server() {
@@ -1399,11 +1434,13 @@ derp_write_server() {
     [[ -s "${DERP_PSK_FILE}" ]] && psk_file="${DERP_PSK_FILE}"
     tmp="$(mktemp "${SERVER_CONFIG}.XXXXXX")" || return 1
     if ! jq --arg t "${DERP_TAG}" --arg d "${DERP_DOMAIN}" --argjson port "${port}" \
-        --arg key "${DERP_KEY_FILE}" --arg psk "${psk_file}" --arg url "${url}" '
+        --arg key "${DERP_KEY_FILE}" --arg psk "${psk_file}" --arg url "${url}" \
+        --arg crt "${DERP_TLS_CERT}" --arg tkey "${DERP_TLS_KEY}" '
         def is_derp_rule: (.action == "route-options") and (.domain == [$d]);
         .services = ([(.services // [])[] | select(.tag != $t)] + [
             {type: "derp", tag: $t, listen: "::", listen_port: $port,
-             config_path: $key, tls: {enabled: true, insecure: true}, home: "blank",
+             config_path: $key, home: "blank",
+             tls: {enabled: true, certificate_path: $crt, key_path: $tkey},
              verify_client_loopback: true}
             + (if $psk != "" then {mesh_psk_file: $psk} else {} end)
             + (if $url != "" then {mesh_with_url: $url} else {} end)
@@ -1454,6 +1491,7 @@ derp_change() {
     if [[ "${mode}" == "remove" ]]; then
         derp_remove_server || { node_restore; return 1; }
     else
+        derp_ensure_cert || { node_restore; return 1; }
         derp_write_server "${port}" "${url}" || { node_restore; return 1; }
     fi
     if node_apply; then
@@ -1480,6 +1518,9 @@ derp_show() {
         echo -e "${green}DERP 中继：已开启${plain}"
         echo "  端口：TCP ${port}（节点之间 mesh 互联要用，防火墙需放行）"
         echo "  虚拟域名：${DERP_DOMAIN} → 127.0.0.1:${port}（只接受经代理隧道进来的连接）"
+        echo "  本机指纹：$(derp_pin || echo '读取失败')"
+        echo "  在对端列表里这样写本机（host 换成本机域名或 IP）："
+        echo "    {\"host\": \"<本机域名>:${port}\", \"pin\": \"$(derp_pin)\"}"
         if [[ -n "${url}" ]]; then
             echo "  对端列表：$(cert_url_mask "${url}")（运行中每 5 分钟拉取一次）"
             if [[ -s "${DERP_PEER_CACHE}" ]]; then

@@ -104,6 +104,7 @@ Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全�
 | `singr cert-source` | 设置默认证书的下载地址（菜单第 15 项） |
 | `singr cert-update --force` | 立即重新下载默认证书 |
 | `singr porthop` | Hysteria2 端口跳跃规则（菜单第 13 项） |
+| `singr derp` | DERP 中继（组网），见[「DERP 中继」](#derp-中继组网)（菜单第 16 项） |
 | `singr version` | 查看 SingR 和 sing-box 核心版本 |
 | `singr uninstall` | 卸载 |
 
@@ -205,6 +206,96 @@ singr cert-source --cert-url https://example.com/a.pem --key-url https://example
 
 ---
 
+## DERP 中继（组网）
+
+给林北客户端组网用的中继：两台设备打不通 P2P 时，数据经节点上的 DERP 转发。默认关闭。
+
+工作方式：
+
+- **只服务自家用户。** 客户端经代理隧道访问虚拟域名 `derp.linbei.internal`，节点把它转到本机的 DERP。DERP 只接受来自本机回环的普通连接，公网直接连过来的一律拒绝。所以只有有效订阅能用，中继流量照常计进用户的已用流量。
+- **所有节点组成一个中继网。** 节点之间互相连接（mesh），用户的两台设备连在不同节点上也能互通。这部分走公网，需要放行 DERP 端口（默认 TCP 8443）。
+- **节点之间要确认对方身份。** 每台节点有一张固定的自签证书，你把各节点证书的指纹写进对端列表，节点只和指纹对得上的对端互联。对端列表放在你自己的 https 地址上，所以指纹可信。
+- **对端列表由你手动维护**，放在一个 https 地址上。节点每 5 分钟拉一次，增删节点不用重启 SingR，也不用登录每台机器。
+
+### 开启
+
+在**每台**节点上做以下几步：
+
+1. **设置 PSK**（节点之间互联的口令，所有节点必须相同）。第一台节点生成：
+
+   ```sh
+   singr derp psk gen
+   ```
+
+   它会打印一条 `singr derp psk <64 位十六进制>`，到其他每台节点上原样执行这条命令。
+
+2. **开启 DERP**（不写端口用 8443）：
+
+   ```sh
+   singr derp enable
+   ```
+
+   第一次开启时会生成本机证书并打印指纹。之后随时用 `singr derp` 查看，里面有一行可以直接复制到对端列表里的内容：
+
+   ```text
+   {"host": "<本机域名>:8443", "pin": "vozXbmt0YHVDKYFUcF5MQ7FPjtiIf8zgTTGYCbR8WtU="}
+   ```
+
+   把 `<本机域名>` 换成这台节点的域名或公网 IP。
+
+3. **防火墙放行 TCP 8443**（或你设置的端口）。节点之间要能互相连到这个端口。
+
+然后在**你自己的服务器**上放一个对端列表文件，比如 `https://example.com/derp-peers.json`，列出全部节点：
+
+```json
+{
+  "nodes": [
+    {"host": "hk1.example.com:8443", "pin": "vozXbmt0YHVDKYFUcF5MQ7FPjtiIf8zgTTGYCbR8WtU="},
+    {"host": "jp1.example.com:8443", "pin": "hKjWRm/UD0srYSh821wm28JFLI+Cmb0m5Mvg1DzDj5Q="}
+  ]
+}
+```
+
+最后回到**每台**节点，设置这个地址：
+
+```sh
+singr derp url https://example.com/derp-peers.json
+```
+
+### 对端列表格式
+
+- 每一项是 `{"host": "地址:端口", "pin": "指纹"}`。不写端口时用本机的 DERP 端口，所以所有节点都用默认端口的话可以只写域名。IPv6 写成 `[2001:db8::1]:8443`。
+- 列表里包含本机自己没关系，会自动识别并跳过，所以每台节点可以用同一份列表。
+- 不写 `pin` 的项（比如 `"hk1.example.com"`）要求对端的 DERP 端口用的是该域名的正规证书。用 `singr derp enable` 生成的自签证书时**必须写 `pin`**，否则连不上。
+- 列表地址必须是 `https://`。**不要把 PSK 写进列表**：客户端也会读这个文件。
+- 可以添加其他字段，SingR 会忽略它们。
+
+### 修改与生效
+
+- **增删节点**：只改列表文件。节点 5 分钟内自动生效，不重启。新节点自己照「开启」的步骤做一遍。
+- **列表出错时保持原样**：拉取失败、任何一项格式不对、列表为空，节点都继续用上一份能用的列表，并在日志里警告。要真正断开所有对端，执行 `singr derp url --clear`。
+- **改端口**：`singr derp port 9443`。列表里给这台节点写了端口的话要一起改，防火墙也要放行新端口。
+- **换证书**：删掉 `/etc/singr/derp/derp-tls.crt` 和 `derp-tls.key`（Docker 在 `/etc/singr-docker/derp/`），再执行 `singr derp enable`。指纹会变，列表要跟着改。证书默认用一百年，正常不需要换。
+- **关闭**：`singr derp disable`。证书和 PSK 会保留，再次开启时指纹不变。
+- 每次改动都会重启 SingR 并检查是否正常启动；起不来会自动回滚到改动前的配置。
+
+### 排查
+
+用 `singr log` 查看，DERP 相关的日志都带 `service/derp`：
+
+| 日志 | 含义 |
+| --- | --- |
+| `mesh peers added (remote): ...` / `mesh peers removed (remote): ...` | 列表变化已生效 |
+| `mesh(...): ... unrecognized remote public key: <指纹>` | 对端出示的指纹和列表不一致：列表写错了，或者对端换过证书。日志里的就是对端当前的指纹 |
+| `mesh(...): ... x509: ...` | 这一项没写 `pin`，对端又没有该域名的正规证书 |
+| `mesh(...): ... connection refused` / `timeout` | 对端没开 DERP，或者端口没放行 |
+| `fetch mesh peer list (keeping current peers): ...` | 列表地址拉不下来，继续用上一份 |
+| `bad mesh peer list (keeping current peers): ...` | 列表格式有错，错误信息里有是第几项 |
+
+连不上的对端每分钟最多警告一次。
+
+---
+
 ## Hysteria2
 
 下面这些参数面板下发不了，需要写在本地 `server.json` 的 `hysteria2-in` 入站里。
@@ -290,6 +381,8 @@ realm 用于服务器在 NAT 后、没有公网端口的场景。SingR 节点一
 ---
 
 ## 升级注意
+
+- **DERP 中继（2026-10）**：二进制多编了 gvisor 和 tailscale，体积大了约 17 MB（linux/amd64 41 MB → 58 MB）。不开 DERP 的节点行为不变。
 
 - **0.6.0（核心 1.14）起**：`direct` 出站的旧字段 `domain_strategy` 会导致无法启动。`singr update` 会自动把它迁移成 `domain_resolver`，迁移前会备份成 `server.json.bak.<时间戳>`。如果升级时看到 `未安装 jq，跳过 server.json 迁移` 的警告，说明没迁移成功，**先别重启**，手动改好再启动。
 - **旧版 Docker（证书靠复制 + `singr cert-sync`）**：升级管理脚本后，第一次执行任意 `singr` 命令会自动迁移成「直接引用原证书路径」。原证书已经不存在的节点，以及使用默认证书的节点，迁移后不会再自动续期，会记录在 `/etc/singr-docker/cert-migration-notice.txt`，`singr list` 也会提示。处理办法：用 `singr cert-source` 设置下载地址，或用 `singr config` 把证书路径改成 certbot 的原始路径后 `singr restart`。certbot 里残留的 `--deploy-hook "singr cert-sync"` 不会报错，可以删掉。

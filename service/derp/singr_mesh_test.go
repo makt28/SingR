@@ -3,8 +3,18 @@
 package derp
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	stdtls "crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"errors"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -57,6 +68,32 @@ func TestParseMeshPeerList(t *testing.T) {
 	}
 }
 
+func TestParseMeshPeerListPins(t *testing.T) {
+	pin := sha256.Sum256([]byte("peer key"))
+	pinText := base64.StdEncoding.EncodeToString(pin[:])
+	targets, err := parseMeshPeerList([]byte(`{"nodes": [
+		{"host": "hk1.example.com", "pin": "`+pinText+`", "label": "ignored"},
+		{"host": "jp1.example.com:9443"},
+		"sg1.example.com",
+		{"host": "hk1.example.com", "pin": "`+pinText+`"}
+	]}`), 8443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 3 {
+		t.Fatalf("want 3 targets (exact duplicate dropped), got %v", targets)
+	}
+	if targets[0].String() != "hk1.example.com:8443" || !bytes.Equal(targets[0].Pin, pin[:]) {
+		t.Fatalf("pinned entry parsed wrong: %+v", targets[0])
+	}
+	if targets[1].String() != "jp1.example.com:9443" || targets[1].Pin != nil || targets[2].Pin != nil {
+		t.Fatalf("unpinned entries parsed wrong: %+v", targets[1:])
+	}
+	if targets[0].id() == (meshTarget{Host: "hk1.example.com", Port: 8443}).id() {
+		t.Fatal("a pin change must change the peer identity (forces a reconnect)")
+	}
+}
+
 func TestParseMeshPeerListRejectsWholeListOnBadEntry(t *testing.T) {
 	for _, content := range []string{
 		`{"nodes": []}`,
@@ -71,6 +108,11 @@ func TestParseMeshPeerListRejectsWholeListOnBadEntry(t *testing.T) {
 		`{"nodes": ["ok.example.com", ":8443"]}`,
 		`{"nodes": ["ok.example.com", "user@bad.example.com"]}`,
 		`{"nodes": ["ok.example.com", "fe80::1%eth0"]}`,
+		`{"nodes": ["ok.example.com", {"pin": "AAAA"}]}`,
+		`{"nodes": ["ok.example.com", {"host": "a.example.com", "pin": "not base64!"}]}`,
+		`{"nodes": ["ok.example.com", {"host": "a.example.com", "pin": "AAAA"}]}`,
+		`{"nodes": ["ok.example.com", 42]}`,
+		`{"nodes": [{"host": "a.example.com", "pin": "` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `"}, "a.example.com"]}`,
 	} {
 		if _, err := parseMeshPeerList([]byte(content), 8443); err == nil {
 			t.Errorf("expected error for %s", content)
@@ -345,5 +387,74 @@ func TestMeshURLManagerStartsFromCacheWhenListUnreachable(t *testing.T) {
 	manager.Close()
 	if len(running) != 0 {
 		t.Fatalf("peers left after Close: %v", running)
+	}
+}
+
+// The mesh client sends our PSK right after the handshake, so the handshake
+// itself must authenticate the peer: by pin when the list gives one, by the
+// system roots otherwise — and never not at all.
+func TestMeshTLSOptionsVerifyPeer(t *testing.T) {
+	serverKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "derp"},
+		DNSNames:     []string{"derp"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		// Expired on purpose: a pinned peer is identified by its key alone.
+		NotAfter: time.Now().Add(-time.Minute),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &serverKey.PublicKey, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spki, _ := x509.MarshalPKIXPublicKey(&serverKey.PublicKey)
+	goodPin := sha256.Sum256(spki)
+	wrongPin := sha256.Sum256([]byte("someone else"))
+
+	listener, err := stdtls.Listen("tcp", "127.0.0.1:0", &stdtls.Config{
+		Certificates: []stdtls.Certificate{{Certificate: [][]byte{der}, PrivateKey: serverKey}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				conn.(*stdtls.Conn).Handshake()
+				conn.Close()
+			}()
+		}
+	}()
+
+	handshake := func(target meshTarget) error {
+		config, err := tls.NewClient(context.Background(), log.NewNOPFactory().Logger(), target.Host, meshTLSOptions(target))
+		if err != nil {
+			return err
+		}
+		stdConfig, err := config.STDConfig()
+		if err != nil {
+			return err
+		}
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		return stdtls.Client(conn, stdConfig).Handshake()
+	}
+	host := "hk1.example.com"
+	if err := handshake(meshTarget{Host: host, Port: 8443, Pin: goodPin[:]}); err != nil {
+		t.Fatalf("matching pin rejected: %v", err)
+	}
+	if err := handshake(meshTarget{Host: host, Port: 8443, Pin: wrongPin[:]}); err == nil {
+		t.Fatal("wrong pin accepted (a man in the middle would get the PSK)")
+	}
+	if err := handshake(meshTarget{Host: host, Port: 8443}); err == nil {
+		t.Fatal("unpinned self-signed peer accepted (must fall back to CA verification, not to none)")
 	}
 }

@@ -15,6 +15,8 @@ package derp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -133,18 +135,36 @@ func isLoopbackSource(address netip.Addr) bool {
 type meshTarget struct {
 	Host string
 	Port uint16
+	// Pin is the SHA-256 of the peer certificate's public key (PKIX). When
+	// set, mesh TLS is verified against it alone; otherwise the certificate
+	// must be valid for Host under the system roots. Never unverified.
+	Pin []byte
 }
 
 func (t meshTarget) String() string {
 	return net.JoinHostPort(t.Host, strconv.Itoa(int(t.Port)))
 }
 
+// id identifies a running peer connection: a changed pin must reconnect.
+func (t meshTarget) id() string {
+	if len(t.Pin) == 0 {
+		return t.String()
+	}
+	return t.String() + " pin=" + base64.StdEncoding.EncodeToString(t.Pin)
+}
+
 type meshPeerListFile struct {
-	// Each entry is "host" or "host:port" ("[v6]:port" for IPv6 with a port).
+	// Each entry is either a string "host" / "host:port" ("[v6]:port" for
+	// IPv6 with a port), or an object {"host": "...", "pin": "<base64>"}.
 	// Entries without a port use this node's own DERP listen port. Unknown
-	// fields are ignored: the same file is read by clients, which may need
-	// more than the mesh does.
-	Nodes []string `json:"nodes"`
+	// fields are ignored, at the top level and inside entries: the same file
+	// is read by clients, which may need more than the mesh does.
+	Nodes []json.RawMessage `json:"nodes"`
+}
+
+type meshPeerListEntry struct {
+	Host string `json:"host"`
+	Pin  string `json:"pin"`
 }
 
 // parseMeshPeerList rejects the whole list on any bad entry, so a typo keeps
@@ -161,25 +181,52 @@ func parseMeshPeerList(content []byte, defaultPort uint16) ([]meshTarget, error)
 		return nil, E.New("mesh peer list has no nodes")
 	}
 	var targets []meshTarget
-	seen := make(map[string]bool)
-	for index, entry := range file.Nodes {
-		target, parseErr := parseMeshTarget(entry, defaultPort)
+	seen := make(map[string]meshTarget)
+	for index, raw := range file.Nodes {
+		target, parseErr := parseMeshEntry(raw, defaultPort)
 		if parseErr != nil {
 			return nil, E.Cause(parseErr, "nodes[", index, "]")
 		}
-		if seen[target.String()] {
+		if previous, duplicate := seen[target.String()]; duplicate {
+			if previous.id() != target.id() {
+				return nil, E.New("nodes[", index, "]: ", target.String(), " listed twice with different pins")
+			}
 			continue
 		}
-		seen[target.String()] = true
+		seen[target.String()] = target
 		targets = append(targets, target)
 	}
 	return targets, nil
 }
 
+func parseMeshEntry(raw json.RawMessage, defaultPort uint16) (meshTarget, error) {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return parseMeshTarget(text, defaultPort)
+	}
+	var entry meshPeerListEntry
+	err := json.Unmarshal(raw, &entry)
+	if err != nil {
+		return meshTarget{}, E.New("want a string or {\"host\", \"pin\"} object")
+	}
+	target, err := parseMeshTarget(entry.Host, defaultPort)
+	if err != nil {
+		return meshTarget{}, err
+	}
+	if pin := strings.TrimSpace(entry.Pin); pin != "" {
+		decoded, decodeErr := base64.StdEncoding.DecodeString(pin)
+		if decodeErr != nil || len(decoded) != sha256.Size {
+			return meshTarget{}, E.New("pin of ", target.String(), " must be a base64 SHA-256 (44 characters)")
+		}
+		target.Pin = decoded
+	}
+	return target, nil
+}
+
 func parseMeshTarget(entry string, defaultPort uint16) (meshTarget, error) {
 	entry = strings.TrimSpace(entry)
 	if entry == "" {
-		return meshTarget{}, E.New("empty entry")
+		return meshTarget{}, E.New("empty host")
 	}
 	if strings.Contains(entry, "://") || strings.ContainsAny(entry, "/?#@ \t") {
 		return meshTarget{}, E.New("want host or host:port, got ", strconv.Quote(entry))
@@ -230,7 +277,7 @@ func newMeshPeerSet(start func(meshTarget) (func(), error)) *meshPeerSet {
 func (s *meshPeerSet) apply(targets []meshTarget) (added, removed []string, errs []error) {
 	wanted := make(map[string]meshTarget, len(targets))
 	for _, target := range targets {
-		wanted[target.String()] = target
+		wanted[target.id()] = target
 	}
 	for name, stop := range s.peers {
 		if _, keep := wanted[name]; !keep {
@@ -430,6 +477,21 @@ func (m *meshURLManager) Close() error {
 	return nil
 }
 
+// meshTLSOptions never returns an unverified config. The client info sent
+// right after the handshake carries our mesh key, sealed to whatever DERP key
+// the far end presents, so an unauthenticated TLS peer would simply be handed
+// the PSK. The list itself is fetched over verified https, which is what makes
+// a pin from it trustworthy.
+func meshTLSOptions(target meshTarget) option.OutboundTLSOptions {
+	options := option.OutboundTLSOptions{Enabled: true, ServerName: target.Host}
+	if len(target.Pin) > 0 {
+		// Pinned peers use a fixed self-signed certificate; the pin alone
+		// decides (no CA, hostname or expiry check).
+		options.CertificatePublicKeySHA256 = [][]byte{target.Pin}
+	}
+	return options
+}
+
 // startURLMeshPeer mirrors upstream startMeshWithHost, kept separate so the
 // connection can be stopped and its failures do not flood the log: a peer
 // that is down retries every few seconds forever.
@@ -443,12 +505,7 @@ func (d *Service) startURLMeshPeer(parent context.Context, target meshTarget) (f
 	if err != nil {
 		return nil, err
 	}
-	// Peers use the auto-generated self-signed certificate, so the TLS layer is
-	// not verified (see "DERP relay" in CLAUDE.md for what that exposes).
-	tlsConfig, err := tls.NewClient(d.ctx, d.logger, target.Host, option.OutboundTLSOptions{
-		Enabled:  true,
-		Insecure: true,
-	})
+	tlsConfig, err := tls.NewClient(d.ctx, d.logger, target.Host, meshTLSOptions(target))
 	if err != nil {
 		return nil, err
 	}

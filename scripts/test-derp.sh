@@ -17,6 +17,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
 command -v jq >/dev/null 2>&1 || { echo "skip - 没有 jq"; exit 0; }
+command -v openssl >/dev/null 2>&1 || { echo "skip - 没有 openssl"; exit 0; }
 
 FAILED=0
 pass() { echo "  ok   - $1"; }
@@ -83,7 +84,17 @@ run 'derp_cmd enable' >/dev/null
 check "生成一个 derp 服务" '1' "$(q '[.services[] | select(.tag=="derp")] | length')"
 check "默认端口 8443" '8443' "$(q '.services[0].listen_port')"
 check "只放行回环" 'true' "$(q '.services[0].verify_client_loopback')"
-check "自签 TLS" '{"enabled":true,"insecure":true}' "$(q '.services[0].tls')"
+check "用本机固定自签证书" "{\"enabled\":true,\"certificate_path\":\"${CFG}/derp/derp-tls.crt\",\"key_path\":\"${CFG}/derp/derp-tls.key\"}" "$(q '.services[0].tls')"
+check "证书已生成" 'yes yes' "$([[ -s "${CFG}/derp/derp-tls.crt" ]] && echo yes || echo no) $([[ -s "${CFG}/derp/derp-tls.key" ]] && echo yes || echo no)"
+check "私钥 0600" '600' "$(stat -c %a "${CFG}/derp/derp-tls.key" 2>/dev/null || stat -f %Lp "${CFG}/derp/derp-tls.key")"
+PIN="$(run 'derp_pin')"
+check "指纹是 base64 SHA-256" 'yes' "$([[ "${PIN}" =~ ^[A-Za-z0-9+/]{43}=$ ]] && echo yes || echo no)"
+# 与 Go 侧同一算法：SHA-256(公钥 DER)。这里换一条独立的命令链算一遍对照。
+check "指纹与公钥 DER 的 SHA-256 一致" \
+    "$(openssl pkey -in "${CFG}/derp/derp-tls.key" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64)" "${PIN}"
+# 先收下整段输出再 grep：pipefail 下 grep -q 提前退出会让上游吃 SIGPIPE，整条管道判失败。
+SHOW="$(run 'derp_show')"
+check "状态页给出可直接粘贴的列表项" 'yes' "$(grep -qF "\"pin\": \"${PIN}\"" <<<"${SHOW}" && echo yes || echo no)"
 check "密钥路径在配置目录下" "\"${CFG}/derp/derp.key\"" "$(q '.services[0].config_path')"
 check "没设列表时不带 mesh 字段" 'null null' "$(q '.services[0].mesh_with_url') $(q '.services[0].mesh_psk_file')"
 check "改写规则排在第一条" \
@@ -94,6 +105,7 @@ check "重启过一次" '1' "$(restarts)"
 check "没有留下备份" 'no' "$([[ -e "${CFG}/server.json.bak" ]] && echo yes || echo no)"
 
 run 'derp_cmd enable' >/dev/null
+check "重复开启不换证书（指纹不变）" "${PIN}" "$(run 'derp_pin')"
 check "重复开启不会叠加服务" '1' "$(q '[.services[] | select(.tag=="derp")] | length')"
 check "重复开启不会叠加规则" '1' "$(q '[.route.rules[] | select(.action=="route-options")] | length')"
 
@@ -141,6 +153,7 @@ run 'derp_cmd disable' >/dev/null
 check "关闭后去掉服务" 'null' "$(q '.services')"
 check "关闭后去掉改写规则、保留其它规则" '[{"inbound":"anytls-in","outbound":"anytls-out"}]' "$(q '.route.rules')"
 check "关闭后与开启前完全一致" "${ORIGINAL}" "$(q .)"
+check "关闭不删证书（再开指纹不变）" 'yes' "$([[ -s "${CFG}/derp/derp-tls.crt" ]] && echo yes || echo no)"
 N="$(restarts)"
 run "derp_cmd psk ${PSK_B}" >/dev/null
 check "未开启时只保存 PSK、不重启" "${N} ${PSK_B}" "$(restarts) $(cat "${CFG}/derp/mesh.psk")"
