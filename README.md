@@ -424,7 +424,7 @@ docker run -d --name singr \
 
 ### 手动编译和运行
 
-需要 Go 1.25.5 或更高版本（发布构建用的是 1.26.8）。
+需要 Go 1.25.5 或更高版本（发布构建用的是 1.26.10）。
 
 ```sh
 git clone https://github.com/makt28/SingR.git && cd SingR
