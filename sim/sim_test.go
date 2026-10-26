@@ -20,8 +20,8 @@
 //      bytes we pumped. If they don't, node-side is at fault.
 //
 // Run with:
-//   GOCACHE=/Users/makt/Desktop/SingR/.cache/go-build go test ./sim -v
-//   SINGR_TRAFFIC_DEBUG=1 GOCACHE=/Users/makt/Desktop/SingR/.cache/go-build go test ./sim -v
+//   go test ./sim -v
+//   SINGR_TRAFFIC_DEBUG=1 go test ./sim -v
 package sim
 
 import (

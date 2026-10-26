@@ -12,7 +12,7 @@
 // adds zero invisible bytes to the report.
 //
 // Run with:
-//   GOCACHE=$(pwd)/.cache/go-build go test ./sim -v -run AnyTLS
+//   go test ./sim -v -run AnyTLS
 package sim
 
 import (

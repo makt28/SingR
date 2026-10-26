@@ -34,14 +34,14 @@ multiple SingR instances reporting the same `node_id`, or environment).
 ## Running
 
 ```sh
-GOCACHE=$(pwd)/.cache/go-build go test ./sim -v
+go test ./sim -v
 ```
 
 To get the gated `[TRAFFIC]` debug logs from `poet/poet.go`,
 `poet/controller/controller.go`, and `poet/api/sspanel/sspanel.go`:
 
 ```sh
-SINGR_TRAFFIC_DEBUG=1 GOCACHE=$(pwd)/.cache/go-build go test ./sim -v
+SINGR_TRAFFIC_DEBUG=1 go test ./sim -v
 ```
 
 The `[TRAFFIC]` logs print:
