@@ -2,10 +2,10 @@ package naive
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -17,18 +17,14 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	aTLS "github.com/sagernet/sing/common/tls"
 	sHttp "github.com/sagernet/sing/protocol/http"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 )
 
 var (
@@ -49,9 +45,25 @@ type Inbound struct {
 	listener         *listener.Listener
 	network          []string
 	networkIsDefault bool
-	authenticator    *auth.Authenticator
+	users            *userTable
 	tlsConfig        tls.ServerConfig
 	httpServer       *http.Server
+
+	// SingR panel hot reload, see singr_reload.go.
+	//
+	// reloadMu serializes Start, Close and ConfigureFromPanelNode. tlsMu
+	// guards tlsConfig against the accept paths (tlsListener for TCP,
+	// tlsSwitch for QUIC), which read it per connection so an SNI change
+	// takes effect without rebinding. detour is captured at construction so
+	// the request path never reads options/listener while a reload swaps
+	// them.
+	reloadMu  sync.Mutex
+	tlsMu     sync.RWMutex
+	started   atomic.Bool
+	closed    bool
+	h3Server  io.Closer
+	tlsSwitch *tlsSwitch
+	detour    string
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveInboundOptions) (adapter.Inbound, error) {
@@ -68,18 +80,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}),
 		networkIsDefault: options.Network == "",
 		network:          options.Network.Build(),
-		authenticator:    auth.NewAuthenticator(options.Users),
+		users:            newUserTable(options.Users),
+		//nolint:staticcheck
+		detour: options.ListenOptions.Detour,
 	}
+	inbound.tlsSwitch = newTLSSwitch(inbound)
 	if common.Contains(inbound.network, N.NetworkUDP) {
 		if options.TLS == nil || !options.TLS.Enabled {
 			return nil, E.New("TLS is required for QUIC server")
 		}
 	}
-	if len(options.Users) == 0 {
-		return nil, E.New("missing users")
-	}
+	// SingR: no "missing users" check — a panel-driven inbound starts with
+	// `users: []` and is filled by the panel before Start.
 	if options.TLS != nil {
-		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
+		tlsConfig, err := newNaiveTLS(ctx, logger, options, inbound.network)
 		if err != nil {
 			return nil, err
 		}
@@ -92,55 +106,27 @@ func (n *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	// Hold reloadMu so a concurrent pre-Start ConfigureFromPanelNode cannot
+	// swap listener/TLS out from under us. Register our own Close rather
+	// than upstream's scope.Add(n.listener.Close) / scope.Add(n.httpServer.Close):
+	// those method values bind what exists now, but hot reload swaps them,
+	// so shutdown would close the stale ones and leak the live ones.
+	// Registered first so a partial Start is still cleaned up.
+	n.reloadMu.Lock()
+	defer n.reloadMu.Unlock()
+	scope.Add(n.Close)
 	if n.tlsConfig != nil {
 		err := n.tlsConfig.Start()
 		if err != nil {
 			return E.Cause(err, "create TLS config")
 		}
-		scope.Add(n.tlsConfig.Close)
 	}
-	scope.Add(n.listener.Close)
-	if common.Contains(n.network, N.NetworkTCP) {
-		tcpListener, err := n.listener.ListenTCP()
-		if err != nil {
-			return err
-		}
-		n.httpServer = &http.Server{
-			//nolint:staticcheck
-			Handler: h2c.NewHandler(n, &http2.Server{}),
-			BaseContext: func(listener net.Listener) context.Context {
-				return n.ctx
-			},
-		}
-		listener := net.Listener(tcpListener)
-		if n.tlsConfig != nil {
-			if len(n.tlsConfig.NextProtos()) == 0 {
-				n.tlsConfig.SetNextProtos([]string{http2.NextProtoTLS, "http/1.1"})
-			} else if !common.Contains(n.tlsConfig.NextProtos(), http2.NextProtoTLS) {
-				n.tlsConfig.SetNextProtos(append([]string{http2.NextProtoTLS}, n.tlsConfig.NextProtos()...))
-			}
-			listener = aTLS.NewListener(tcpListener, n.tlsConfig)
-		}
-		go func() {
-			sErr := n.httpServer.Serve(listener)
-			if sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
-				n.logger.Error("http server serve error: ", sErr)
-			}
-		}()
-		scope.Add(n.httpServer.Close)
+	httpServer, h3Server, err := n.serve(n.listener)
+	if err != nil {
+		return err
 	}
-
-	if common.Contains(n.network, N.NetworkUDP) {
-		http3Server, err := ConfigureHTTP3ListenerFunc(n.ctx, n.logger, n.listener, n, n.tlsConfig, n.options)
-		if err == nil {
-			scope.Add(http3Server.Close)
-		} else if len(n.network) > 1 {
-			n.logger.Warn(E.Cause(err, "naive http3 disabled"))
-		} else {
-			return err
-		}
-	}
-
+	n.httpServer, n.h3Server = httpServer, h3Server
+	n.started.Store(true)
 	return nil
 }
 
@@ -155,9 +141,13 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		n.badRequest(ctx, request, E.New("missing naive padding"))
 		return
 	}
-	userName, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
+	// SingR: authenticate by password only and take the identity from the
+	// user table, never from the client-supplied username — metadata.User
+	// drives accounting.
+	var userName string
+	_, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
-		authOk = n.authenticator.Verify(userName, password)
+		userName, authOk = n.users.lookup(password)
 	}
 	if !authOk {
 		rejectHTTP(writer, http.StatusProxyAuthRequired)
@@ -208,17 +198,17 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net.Conn, userName string, source M.Socksaddr, destination M.Socksaddr) {
 	if userName != "" {
-		n.logger.InfoContext(ctx, "[", userName, "] inbound connection from ", source)
-		n.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", destination)
+		n.logger.DebugContext(ctx, "[", userName, "] inbound connection from ", source)
+		n.logger.DebugContext(ctx, "[", userName, "] inbound connection to ", destination)
 	} else {
-		n.logger.InfoContext(ctx, "inbound connection from ", source)
-		n.logger.InfoContext(ctx, "inbound connection to ", destination)
+		n.logger.DebugContext(ctx, "inbound connection from ", source)
+		n.logger.DebugContext(ctx, "inbound connection to ", destination)
 	}
 	var metadata adapter.InboundContext
 	metadata.Inbound = n.Tag()
 	metadata.InboundType = n.Type()
 	//nolint:staticcheck
-	metadata.InboundDetour = n.listener.ListenOptions().Detour
+	metadata.InboundDetour = n.detour
 	//nolint:staticcheck
 	metadata.Source = source
 	metadata.Destination = destination
@@ -237,8 +227,11 @@ func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net
 	}
 }
 
+// badRequest covers probes and misconfigured clients (not CONNECT, no
+// padding, wrong password), so SingR logs it at debug, like anytls'
+// pre-auth handshake noise.
 func (n *Inbound) badRequest(ctx context.Context, request *http.Request, err error) {
-	n.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", request.RemoteAddr))
+	n.logger.DebugContext(ctx, E.Cause(err, "process connection from ", request.RemoteAddr))
 }
 
 func rejectHTTP(writer http.ResponseWriter, statusCode int) {

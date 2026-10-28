@@ -1,13 +1,14 @@
 # SingR
 
-基于 sing-box 的 **旧版 SSPanel（`/mod_mu` 接口）后端**。面板里节点类型照旧填 `V2ray`，SingR 根据节点地址里的 `path` 把它跑成 AnyTLS 或 Hysteria2：
+基于 sing-box 的 **旧版 SSPanel（`/mod_mu` 接口）后端**。面板里节点类型照旧填 `V2ray`，SingR 根据节点地址里的 `path` 把它跑成 AnyTLS、Hysteria2 或 NaiveProxy：
 
 | 节点地址里的 `path` | 实际运行的协议 |
 | --- | --- |
 | `path=/anytls` | AnyTLS（TCP） |
 | `path=/hy2` | Hysteria2（QUIC/UDP） |
+| `path=/naive` | NaiveProxy（同一端口上 TCP 走 HTTP/2、UDP 走 HTTP/3） |
 
-两种协议共用同一套用户同步、流量上报、限速和审计。项目地址：<https://github.com/makt28/SingR>
+三种协议共用同一套用户同步、流量上报、限速和审计。项目地址：<https://github.com/makt28/SingR>
 
 ---
 
@@ -26,16 +27,17 @@
 ```text
 sa.example.com;14555;0;ws;;path=/anytls|host=example.com
 sa.example.com;14556;0;ws;;path=/hy2|host=example.com
+sa.example.com;14557;0;ws;;path=/naive|host=example.com
 ```
 
 - `14555`：监听端口。
-- `path=/anytls` 或 `path=/hy2`：选择协议（不带 `/` 也认）。
+- `path=/anytls`、`path=/hy2` 或 `path=/naive`：选择协议（不带 `/` 也认）。
 - `host=`：TLS 的 SNI，证书需要覆盖这个域名。
 - 末尾还可以追加 `|relay_server=...|relay_port=...`，SingR 会解析保存，但目前不会据此生成中转。
 
 ### 第 2 步：准备证书
 
-AnyTLS 和 Hysteria2 都必须有 TLS 证书，没有证书进程不会启动。三种方式任选一种：
+AnyTLS、Hysteria2 和 NaiveProxy 都必须有 TLS 证书，没有证书进程不会启动（NaiveProxy 原版客户端不认自签证书）。三种方式任选一种：
 
 | 方式 | 做法 |
 | --- | --- |
@@ -61,7 +63,7 @@ singr add \
   --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
 ```
 
-`singr add` 缺必填参数（`--api-url` / `--api-key` / `--node-id` / `--protocol`）时会逐项询问；四项都给齐则不再追问可选的 SNI 和证书路径，留空按默认处理。`--protocol` 可选 `anytls` 或 `hysteria2`。
+`singr add` 缺必填参数（`--api-url` / `--api-key` / `--node-id` / `--protocol`）时会逐项询问；四项都给齐则不再追问可选的 SNI 和证书路径，留空按默认处理。`--protocol` 可选 `anytls`、`hysteria2` 或 `naive`。
 
 **Docker**：
 
@@ -84,7 +86,7 @@ Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全�
 | 地址 | 节点域名 |
 | 端口 | 节点地址里的端口；Hysteria2 开了端口跳跃就填区间，如 `40000-60000` |
 | SNI | 节点地址里的 `host=` |
-| 密码 | 用户的 **UUID**（不是 passwd） |
+| 密码 | 用户的 **UUID**（不是 passwd）。NaiveProxy 的用户名随便填，只认密码 |
 | Hysteria2 obfs | 默认开启：`obfs=salamander`，`obfs-password=<SNI>`。不填连不上，见[「Hysteria2」](#hysteria2) |
 
 ---
@@ -144,10 +146,10 @@ CERT 列：
 必须知道的几点：
 
 - **任何一个节点起不来，整个进程都会退出。** 所以 `add` / `del` 每次都会先备份，改完重启并检查，失败就自动回滚。
-- **端口要在面板侧错开。** 两个节点下发到同一个端口时，第二个节点会监听失败，进程看起来正常，但这个节点实际连不上。
+- **端口要在面板侧错开。** 两个节点下发到同一个端口时，第二个节点会监听失败，进程看起来正常，但这个节点实际连不上。NaiveProxy 同时占用端口的 TCP 和 UDP，和 AnyTLS（TCP）、Hysteria2（UDP）都不能共用端口号。
 - **删除时优先用 `@序号` 或 InTag 指定节点。** NodeID 只在单个面板内唯一，有歧义时 `singr del 16` 会拒绝执行并列出候选。不要写 `#1`，shell 会把 `#` 后面当成注释。
 - 只剩一个节点时不能删除。要换节点，先 `add` 新的再 `del` 旧的。
-- InTag 自动分配：同协议的第一个节点用 `anytls-in`，之后的节点用 `anytls-in-<节点ID>`；hysteria2 同理。
+- InTag 自动分配：同协议的第一个节点用 `anytls-in`，之后的节点用 `anytls-in-<节点ID>`；hysteria2、naive 同理。
 
 ---
 
@@ -168,7 +170,7 @@ Docker 的配置目录是 `/etc/singr-docker`。启动日志会打印实际使�
 inbound/anytls[anytls-in]: no TLS certificate configured, using default /etc/singr/certs/default.pem + /etc/singr/certs/default.key
 ```
 
-AnyTLS 和 Hysteria2 默认用同一张证书，只要证书覆盖各自的 SNI 即可。不同节点要用不同证书时，用 `singr add --cert-path` 单独指定。写了具体路径的节点不受默认路径影响。
+AnyTLS、Hysteria2 和 NaiveProxy 默认用同一张证书，只要证书覆盖各自的 SNI 即可。不同节点要用不同证书时，用 `singr add --cert-path` 单独指定。写了具体路径的节点不受默认路径影响。
 
 测试时可以先用自签证书，客户端需要开启「允许不安全证书」：
 
@@ -320,14 +322,29 @@ realm 用于服务器在 NAT 后、没有公网端口的场景。SingR 节点一
 
 ---
 
+## NaiveProxy
+
+一个 naive 节点在同一个端口上同时开两种承载：TCP 走 HTTP/2（客户端写 `https://`），UDP 走 HTTP/3（客户端写 `quic://`）。只想开一种，就在 `server.json` 的 `naive-in` 里加 `"network": "tcp"` 或 `"udp"`。
+
+- **客户端自己不会在两者之间切换**，也不会自动回落。想让用户在 UDP 被封时还能用，订阅里同一个节点出两条：`naive+https://任意:<uuid>@host:port` 和 `naive+quic://任意:<uuid>@host:port`，交给客户端的自动选择去挑。
+- **只认密码**（UUID，没有时用 passwd），用户名随便填。
+- **证书必须是真的。** 原版 NaiveProxy 客户端基于 Chromium，严格校验证书，没有跳过校验的选项。
+- 代理 UDP 只有 sing-box 客户端能用（`udp_over_tcp`），原版 NaiveProxy 只代理 TCP。
+- 面板改端口时，两种承载一起迁移：任一边绑不上就整体不变，下个周期重试。改 SNI 只换 TLS 配置，不断线。
+- 防火墙要同时放行这个端口的 TCP 和 UDP。
+
+更多说明见 [release/poet/naive.md](release/poet/naive.md)。
+
+---
+
 ## 常见问题
 
 **启动后没有监听端口**
 
-- 节点地址里是否有 `ws` 和 `path=/anytls`（或 `/hy2`）。
+- 节点地址里是否有 `ws` 和 `path=/anytls`（或 `/hy2`、`/naive`）。
 - `panel.json` 的 `intag` 是否和 `server.json` 里的入站 `tag` 一致（`singr list` 显示 `无 inbound` 就是不一致）。
-- 日志出现 `invalid anytls listen port from panel` 或 `invalid hysteria2 listen port from panel`，说明面板返回的端口是 0 或超出范围。
-- Hysteria2 走 UDP，用 `ss -lunp | grep singr` 查看（注意是 `-u`）。
+- 日志出现 `invalid anytls listen port from panel`、`invalid hysteria2 listen port from panel` 或 `invalid naive listen port from panel`，说明面板返回的端口是 0 或超出范围。
+- Hysteria2 走 UDP，用 `ss -lunp | grep singr` 查看（注意是 `-u`）。NaiveProxy TCP 和 UDP 都要有。
 
 **面板连接失败**
 
@@ -401,7 +418,7 @@ docker run -d --name singr \
 | `--api-url` | `SINGR_API_URL` | 面板地址（必填） | |
 | `--api-key` | `SINGR_API_KEY` | 面板 apikey（必填） | |
 | `--node-id` | `SINGR_NODE_ID` | 节点 ID（必填） | |
-| `--protocol` | `SINGR_PROTOCOL` | `anytls` 或 `hysteria2`（必填） | |
+| `--protocol` | `SINGR_PROTOCOL` | `anytls`、`hysteria2` 或 `naive`（必填） | |
 | `--sni` | `SINGR_SNI` | 入站 `server_name` | 空 |
 | `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书路径。用安装脚本时填宿主机路径；用 `docker run` / compose 时填容器内路径，需要自己挂载 | 空，即使用默认路径 |
 | `--cert-url` / `--key-url` | — | 仅安装脚本支持，见「证书」 | |
@@ -412,7 +429,7 @@ docker run -d --name singr \
 
 说明：
 
-- 必须用 host 网络：端口由面板下发，Hysteria2 还要走 UDP。
+- 必须用 host 网络：端口由面板下发，Hysteria2 和 NaiveProxy 还要走 UDP。
 - 上面的参数只在第一次启动时用来生成 `/etc/singr-docker/panel.json`，之后一律以这个文件为准。
 - 要加节点请用 `singr add`。不要重跑 `install-docker.sh`：它检测到已安装会直接拒绝。
 - 不装管理脚本的话，也可以单独下载它来用 `singr porthop`：
@@ -431,7 +448,7 @@ git clone https://github.com/makt28/SingR.git && cd SingR
 make build
 install -m 755 ./sing-box /usr/local/bin/singr
 mkdir -p /etc/singr/certs
-cp release/poet/panel_anytls.json /etc/singr/panel.json   # 用 hysteria2 就换成 panel_hysteria2.json
+cp release/poet/panel_anytls.json /etc/singr/panel.json   # 用 hysteria2 / naive 就换成 panel_hysteria2.json / panel_naive.json
 cp release/poet/server.json       /etc/singr/server.json
 /usr/local/bin/singr run -c /etc/singr/server.json -p /etc/singr/panel.json
 ```
