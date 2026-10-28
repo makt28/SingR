@@ -136,6 +136,64 @@ func TestParseSSPanelNodeInfoHysteria2AliasWithoutSlash(t *testing.T) {
 	}
 }
 
+func TestParseV2rayNodeResponseNaiveAlias(t *testing.T) {
+	client := newTestClient("V2ray")
+	nodeInfo, err := client.ParseV2rayNodeResponse(&NodeInfoResponse{
+		RawServerString: "naive.example.com;14556;0;ws;;path=/naive|host=sni.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nodeInfo.NodeType != "naive" {
+		t.Fatalf("NodeType = %q, want naive", nodeInfo.NodeType)
+	}
+	if nodeInfo.PanelNodeType != "V2ray" {
+		t.Fatalf("PanelNodeType = %q, want V2ray", nodeInfo.PanelNodeType)
+	}
+	if nodeInfo.Port != 14556 {
+		t.Fatalf("Port = %d, want 14556", nodeInfo.Port)
+	}
+	if nodeInfo.TransportProtocol != "tcp" {
+		t.Fatalf("TransportProtocol = %q, want tcp", nodeInfo.TransportProtocol)
+	}
+	if nodeInfo.Host != "sni.example.com" {
+		t.Fatalf("Host = %q, want sni.example.com", nodeInfo.Host)
+	}
+}
+
+func TestParseSSPanelNodeInfoNaiveAliasWithoutSlash(t *testing.T) {
+	client := newTestClient("V2ray")
+	customConfig, err := json.Marshal(CustomConfig{
+		OffsetPortNode: "14556",
+		Network:        "ws",
+		Path:           "naive",
+		Host:           "sni.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeInfo, err := client.ParseSSPanelNodeInfo(&NodeInfoResponse{
+		CustomConfig: customConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nodeInfo.NodeType != "naive" {
+		t.Fatalf("NodeType = %q, want naive", nodeInfo.NodeType)
+	}
+	if nodeInfo.Port != 14556 {
+		t.Fatalf("Port = %d, want 14556", nodeInfo.Port)
+	}
+	if nodeInfo.TransportProtocol != "tcp" {
+		t.Fatalf("TransportProtocol = %q, want tcp", nodeInfo.TransportProtocol)
+	}
+	if nodeInfo.Host != "sni.example.com" {
+		t.Fatalf("Host = %q, want sni.example.com", nodeInfo.Host)
+	}
+}
+
 func TestParseV2rayNodeResponseKeepsNormalWebSocket(t *testing.T) {
 	client := newTestClient("V2ray")
 	nodeInfo, err := client.ParseV2rayNodeResponse(&NodeInfoResponse{

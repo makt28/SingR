@@ -1,0 +1,60 @@
+{
+    "log": {
+        "disabled": false,
+        "level": "info",
+        "timestamp": true,
+        "output": "/var/log/singr.log"
+    },
+    "dns": {
+        "servers": [
+            {
+                "tag": "local",
+                "type": "local"
+            }
+        ],
+        "strategy": "prefer_ipv6"
+    },
+    "inbounds": [
+        {
+            "type": "naive",
+            "tag": "naive-in",
+            "listen": "::",
+            "listen_port": 0,
+            "users": [],
+            "tls": {
+                "enabled": true,
+                "server_name": "",
+                "certificate_path": "",
+                "key_path": ""
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "naive-out",
+            "domain_resolver": {
+                "server": "local",
+                "strategy": "prefer_ipv6"
+            }
+        },
+        {
+            "type": "direct",
+            "tag": "direct",
+            "domain_resolver": {
+                "server": "local",
+                "strategy": "prefer_ipv6"
+            }
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "inbound": "naive-in",
+                "outbound": "naive-out"
+            }
+        ],
+        "final": "direct",
+        "auto_detect_interface": false
+    }
+}

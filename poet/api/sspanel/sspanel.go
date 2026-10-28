@@ -169,6 +169,14 @@ func isHysteria2Alias(transportProtocol, path string) bool {
 	return strings.EqualFold(strings.TrimSpace(transportProtocol), "ws") && normalizeAnyTLSPath(path) == "hy2"
 }
 
+// isNaiveAlias detects a panel-side vmess/ws node whose path is "naive",
+// used to drive a naive inbound through SSPanel (which has no native naive
+// node type). Mirrors the AnyTLS alias trick. The transport is reported as
+// tcp; the same inbound also serves HTTP/3 on the UDP side of the port.
+func isNaiveAlias(transportProtocol, path string) bool {
+	return strings.EqualFold(strings.TrimSpace(transportProtocol), "ws") && normalizeAnyTLSPath(path) == "naive"
+}
+
 // GetNodeInfo will pull NodeInfo Config from ssPanel
 func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	path := fmt.Sprintf("/mod_mu/nodes/%d/info", c.NodeID)
@@ -536,6 +544,9 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 	} else if isHysteria2Alias(transportProtocol, path) {
 		nodeType = "hysteria2"
 		effectiveTransport = "udp"
+	} else if isNaiveAlias(transportProtocol, path) {
+		nodeType = "naive"
+		effectiveTransport = "tcp"
 	}
 
 	trafficRate := float64(1)
@@ -865,6 +876,9 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		} else if isHysteria2Alias(transportProtocol, nodeConfig.Path) {
 			nodeType = "hysteria2"
 			transportProtocol = "udp"
+		} else if isNaiveAlias(transportProtocol, nodeConfig.Path) {
+			nodeType = "naive"
+			transportProtocol = "tcp"
 		}
 	case "trojan":
 		enableTLS = true

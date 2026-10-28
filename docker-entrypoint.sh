@@ -13,7 +13,7 @@
 #   --api-url / SINGR_API_URL              panel apihost           (required*)
 #   --api-key / SINGR_API_KEY              panel apikey            (required*)
 #   --node-id / SINGR_NODE_ID             panel nodeid (int)      (required*)
-#   --protocol / SINGR_PROTOCOL           anytls | hysteria2      (required*)
+#   --protocol / SINGR_PROTOCOL           anytls | hysteria2 | naive (required*)
 #   --panel-type / SINGR_PANEL_TYPE       default SSpanel
 #   --node-type / SINGR_NODE_TYPE         default V2ray
 #   --timeout / SINGR_TIMEOUT             default 20
@@ -96,8 +96,9 @@ normalize_protocol() {
     case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
         anytls) echo anytls;;
         hysteria2|hy2) echo hysteria2;;
+        naive) echo naive;;
         "") echo "";;
-        *) die "不支持的协议：$1（仅 anytls / hysteria2）";;
+        *) die "不支持的协议：$1（仅 anytls / hysteria2 / naive）";;
     esac
 }
 PROTOCOL="$(normalize_protocol "${PROTOCOL}")"
@@ -110,7 +111,7 @@ fi
 
 # --- seed panel.json from parameters once -----------------------------------
 if [[ ! -f "${PANEL}" ]]; then
-    [[ -n "${PROTOCOL}" ]] || die "首次启动缺少 --protocol（anytls / hysteria2）。"
+    [[ -n "${PROTOCOL}" ]] || die "首次启动缺少 --protocol（anytls / hysteria2 / naive）。"
     [[ -n "${API_URL}" ]]  || die "首次启动缺少 --api-url。"
     [[ -n "${API_KEY}" ]]  || die "首次启动缺少 --api-key。"
     [[ "${NODE_ID}" =~ ^[0-9]+$ ]] || die "首次启动缺少合法 --node-id（整数）。"

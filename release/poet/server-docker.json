@@ -47,6 +47,19 @@
         "certificate_path": "",
         "key_path": ""
       }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": 0,
+      "users": [],
+      "tls": {
+        "enabled": true,
+        "server_name": "",
+        "certificate_path": "",
+        "key_path": ""
+      }
     }
   ],
   "outbounds": [
@@ -61,6 +74,14 @@
     {
       "type": "direct",
       "tag": "hysteria2-out",
+      "domain_resolver": {
+        "server": "local",
+        "strategy": "prefer_ipv6"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "naive-out",
       "domain_resolver": {
         "server": "local",
         "strategy": "prefer_ipv6"
@@ -84,6 +105,10 @@
       {
         "inbound": "hysteria2-in",
         "outbound": "hysteria2-out"
+      },
+      {
+        "inbound": "naive-in",
+        "outbound": "naive-out"
       }
     ],
     "final": "direct",

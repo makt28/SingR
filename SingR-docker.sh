@@ -443,6 +443,7 @@ node_norm_proto() {
     case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
         anytls) echo anytls ;;
         hysteria2 | hy2) echo hysteria2 ;;
+        naive) echo naive ;;
         *) return 1 ;;
     esac
 }
@@ -562,7 +563,7 @@ node_effective_cert() {
 }
 
 # tag 是否已被某个节点占用。只看 panel.json：server.json 里存在同名 inbound 但没有
-# 节点引用它（默认配置铺的 anytls-in / hysteria2-in 超集就是这种），那不是"占用"，
+# 节点引用它（默认配置铺的 anytls-in / hysteria2-in / naive-in 超集就是这种），那不是"占用"，
 # 而是可以直接接管的模板——第一次 add 就该落在 anytls-in 上，与老装机保持一致。
 node_tag_used() {
     jq -e --arg t "$1" '[(.nodes // [])[].intag] | index($t) != null' "${PANEL_CONFIG}" >/dev/null 2>&1
@@ -691,6 +692,10 @@ node_inbound_template() {
         hysteria2)
             echo '{"type":"hysteria2","tag":"","listen":"::","listen_port":0,"users":[],"up_mbps":300,"down_mbps":300,"ignore_client_bandwidth":false,"obfs":{"type":"salamander","password":""},"tls":{"enabled":true,"server_name":"","certificate_path":"","key_path":""}}'
             ;;
+        naive)
+            # 不写 network = 同一端口上 TCP（HTTP/2）与 UDP（HTTP/3）都开。
+            echo '{"type":"naive","tag":"","listen":"::","listen_port":0,"users":[],"tls":{"enabled":true,"server_name":"","certificate_path":"","key_path":""}}'
+            ;;
         *) return 1 ;;
     esac
 }
@@ -802,7 +807,7 @@ node_add() {
             [[ -z "${api_url}" ]] && read -r -p "面板地址 (--api-url，如 https://panel.example.com): " api_url
             [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
             [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
-            [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 (--protocol): " protocol
+            [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 / naive (--protocol): " protocol
             [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
             if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
                 echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
@@ -830,7 +835,7 @@ node_add() {
     esac
     local proto
     proto="$(node_norm_proto "${protocol}")" || {
-        echo -e "${red}--protocol 只能是 anytls / hysteria2${plain}"
+        echo -e "${red}--protocol 只能是 anytls / hysteria2 / naive${plain}"
         return 1
     }
     # 证书两个参数要么都给要么都不给：只给一个多半是敲漏了，别猜。都不给就把
@@ -905,7 +910,7 @@ node_add() {
         eff_key="$(node_default_key_path)"
     fi
 
-    # 启动前预检。anytls 与 hysteria2 都强制 TLS，缺证书的 inbound 建不起来，而
+    # 启动前预检。anytls、hysteria2 与 naive 都强制 TLS，缺证书的 inbound 建不起来，而
     # 任一节点 Start() 失败会让 poet/panel/panel.go 走 os.Exit(1)，把同进程的其他
     # 节点一起带下线。在这里拒绝，比落盘后靠 node_apply 回滚干净得多。
     if [[ ! -s "${eff_cert}" || ! -s "${eff_key}" ]]; then
@@ -937,7 +942,8 @@ node_add() {
         echo
         node_list
         echo
-        echo -e "${yellow}提示：同一台机上的多个节点必须在面板侧配置不同端口，否则第二个监听会起不来。${plain}"
+        echo -e "${yellow}提示：同一台机上的多个节点必须在面板侧配置不同端口，否则第二个监听会起不来。"
+        echo -e "      naive 同时占用该端口的 TCP 与 UDP，和 anytls（TCP）、hysteria2（UDP）都不能共用端口号。${plain}"
         node_cert_renew_hint
         return 0
     fi
@@ -2294,7 +2300,7 @@ show_usage() {
     echo "singr derp [子命令]         DERP 中继（组网）：enable/disable/port，详见 singr derp help"
     echo "------------------------------------------"
     echo "添加节点参数："
-    echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2"
+    echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive"
     echo "  --sni HOST --cert-path PATH --key-path PATH（宿主机路径，容器按原路径挂载）"
     echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
     echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"

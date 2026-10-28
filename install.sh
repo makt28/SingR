@@ -302,7 +302,7 @@ EOF
             log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
         elif [[ -f "${PROJECT_DIR}/release/poet/server.json" ]]; then
             cp "${PROJECT_DIR}/release/poet/server.json" "${CONFIG_DIR}/server.json"
-            log_info "已安装默认 sing-box 配置（anytls + hysteria2 超集）：${CONFIG_DIR}/server.json"
+            log_info "已安装默认 sing-box 配置（anytls + hysteria2 + naive 超集）：${CONFIG_DIR}/server.json"
         elif [[ -f "${PROJECT_DIR}/release/poet/server_anytls.json" ]]; then
             cp "${PROJECT_DIR}/release/poet/server_anytls.json" "${CONFIG_DIR}/server.json"
             log_info "已安装默认 sing-box 配置：${CONFIG_DIR}/server.json"
@@ -357,6 +357,19 @@ EOF
         "certificate_path": "",
         "key_path": ""
       }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": 0,
+      "users": [],
+      "tls": {
+        "enabled": true,
+        "server_name": "",
+        "certificate_path": "",
+        "key_path": ""
+      }
     }
   ],
   "outbounds": [
@@ -371,6 +384,14 @@ EOF
     {
       "type": "direct",
       "tag": "hysteria2-out",
+      "domain_resolver": {
+        "server": "local",
+        "strategy": "prefer_ipv6"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "naive-out",
       "domain_resolver": {
         "server": "local",
         "strategy": "prefer_ipv6"
@@ -394,6 +415,10 @@ EOF
       {
         "inbound": "hysteria2-in",
         "outbound": "hysteria2-out"
+      },
+      {
+        "inbound": "naive-in",
+        "outbound": "naive-out"
       }
     ],
     "final": "direct",
@@ -401,7 +426,7 @@ EOF
   }
 }
 EOF
-            log_info "已生成默认 sing-box 配置（anytls + hysteria2 超集）：${CONFIG_DIR}/server.json"
+            log_info "已生成默认 sing-box 配置（anytls + hysteria2 + naive 超集）：${CONFIG_DIR}/server.json"
         fi
     else
         log_warn "保留已有 sing-box 配置：${CONFIG_DIR}/server.json"
@@ -616,7 +641,7 @@ print_usage() {
     echo "证书：新装的 server.json 把 certificate_path/key_path 留空，此时使用默认路径"
     echo "  ${CERT_DIR}/default.pem   # .crt 后缀也认"
     echo "  ${CERT_DIR}/default.key"
-    echo "anytls 与 hysteria2 都强制 TLS，没有证书不会启动。也可用 singr add 的"
+    echo "anytls、hysteria2 与 naive 都强制 TLS，没有证书不会启动。也可用 singr add 的"
     echo "--cert-path/--key-path 为单个节点指定别的路径（如 certbot 的 live 目录），"
     echo "或用 singr cert-source 让默认证书从 https 地址自动下载、到期前自动更新。"
     echo ""

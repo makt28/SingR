@@ -11,11 +11,11 @@
 # unit, or /usr/local/SingR. A host uses one installer or the other.
 #
 # Usage:
-#   bash install-docker.sh --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 [opts]
+#   bash install-docker.sh --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive [opts]
 #
 # 本脚本只负责装第一个节点。已经装过之后再跑会被拒绝（重复运行不会让新参数生效，
 # 却会先删掉正在服务的容器）。同一台机上再加节点请用：
-#   singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 \
+#   singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive \
 #             --sni HOST [--cert-path PATH --key-path PATH | --cert-url URL --key-url URL]
 # 查看/删除：singr list / singr del <NodeID>
 #
@@ -23,7 +23,7 @@
 #   --api-url URL              (required)   panel apihost
 #   --api-key KEY              (required)   panel apikey
 #   --node-id N                (required)   panel node id
-#   --protocol anytls|hysteria2 (required)
+#   --protocol anytls|hysteria2|naive (required)
 #   --panel-type NAME          (default SSpanel)
 #   --node-type NAME           (default V2ray)
 #   --timeout N                (default 20)
@@ -86,7 +86,7 @@ guard_existing_install() {
     [[ -f "${CONFIG_DIR}/panel.json" ]] || return 0
     die "检测到 ${CONFIG_DIR}/panel.json 已存在：本机已经装过 SingR（Docker）。
 重复运行安装脚本不会让新参数生效，反而会先删掉正在运行的容器。请改用：
-  · 新增节点：  singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2 \\
+  · 新增节点：  singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive \\
                           --sni HOST [--cert-path PATH --key-path PATH]
   · 查看节点：  singr list
   · 删除节点：  singr del <NodeID>
@@ -133,8 +133,8 @@ validate() {
     [[ "${NODE_ID}" =~ ^[0-9]+$ ]] || die "缺少合法 --node-id（整数）。"
     validate_certs
     case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
-        anytls|hysteria2|hy2) ;;
-        *) die "缺少或非法 --protocol（anytls / hysteria2）。";;
+        anytls|hysteria2|hy2|naive) ;;
+        *) die "缺少或非法 --protocol（anytls / hysteria2 / naive）。";;
     esac
 }
 
