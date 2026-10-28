@@ -261,6 +261,22 @@ show_enable_status() {
     else
         echo -e "是否开机自启：${red}否${plain}"
     fi
+    show_bbr_status
+}
+
+# TCP 拥塞控制是不是 BBR。naive 的 HTTP/2 和 anytls 都跑在 TCP 上，下载方向用的是
+# 服务端内核的拥塞算法，cubic 在跨境丢包线路上掉速很明显。docker 版走 host 网络，
+# 看的同样是宿主机内核。读不到（非 Linux）就不显示。
+show_bbr_status() {
+    local cc
+    cc="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+    [[ -n "${cc}" ]] || return 0
+    if [[ "${cc}" == bbr* ]]; then
+        echo -e "BBR：${green}已开启${plain}"
+    else
+        echo -e "BBR：${red}未开启${plain}（当前 ${cc}）"
+        echo -e "  ${yellow}在 /etc/sysctl.conf 加入 net.core.default_qdisc=fq 和 net.ipv4.tcp_congestion_control=bbr，再执行 sysctl -p${plain}"
+    fi
 }
 
 show_status() {
