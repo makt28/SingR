@@ -346,6 +346,133 @@ node_norm_proto() {
     esac
 }
 
+# ---- 协议由面板决定（Go 侧判断的 shell 镜像）----
+#
+# 协议不用手填：面板节点 server 字符串里的 ws + path=/anytls、/hy2、/naive 已经决定了
+# 它，二进制启动时也是按这个判断（poet/api/sspanel 的 ParseV2rayNodeResponse +
+# isAnyTLSAlias / isHysteria2Alias / isNaiveAlias）。手填的协议和面板不一致，inbound
+# 类型就错了。所以 add 先请求一次面板、照抄同一套规则判断，不认识就在改配置之前拒绝。
+#
+# 只照抄老 API 这一条路：脚本写的 panel.json 一律 disablecustomconfig: true，二进制
+# 只走 ParseV2rayNodeResponse。Go 侧的 alias 规则改了，这里要一起改
+# （scripts/test-node-detect.sh 用同一批 server 字符串守着）。
+
+node_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "${s}"
+}
+
+node_lower_trim() {
+    node_trim "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+}
+
+# curl -K 配置文件里双引号字符串的转义：\ 和 " 前面加反斜杠。
+node_curl_quote() {
+    local s="${1//\\/\\\\}"
+    printf '%s' "${s//\"/\\\"}"
+}
+
+# GET <api_url>/mod_mu/nodes/<id>/info（和二进制一样带 key 与 muKey 两个参数）。
+# 响应体写到 <out>，stdout 只回显 HTTP 状态码。api-key 经 curl -K - 从 stdin 传，
+# 不进命令行 —— 命令行参数 ps 谁都看得到。
+node_panel_fetch() { # <api_url> <api_key> <node_id> <timeout> <out>
+    printf 'url = "%s"\nget\ndata-urlencode = "key=%s"\ndata-urlencode = "muKey=%s"\n' \
+        "$(node_curl_quote "${1%/}/mod_mu/nodes/$3/info")" \
+        "$(node_curl_quote "$2")" "$(node_curl_quote "$2")" |
+        curl -sS --connect-timeout 10 --max-time "$4" -o "$5" -w '%{http_code}' -K -
+}
+
+# 照抄 ParseV2rayNodeResponse 判断协议的那几步。
+# stdout：协议<TAB>端口<TAB>host（host 可能为空）；认不出时原因走 stderr，返回 1。
+node_panel_parse_server() { # <server 字符串>
+    local raw="$1" f transport="" path="" host="" item key val
+    local -a conf=() extra=()
+    IFS=';' read -r -a conf <<<"${raw}"
+    if [[ ${#conf[@]} -lt 6 ]]; then
+        echo -e "${red}面板节点信息格式不对：${raw}（至少要 6 段，用 ; 分隔）${plain}" >&2
+        return 1
+    fi
+    # 端口 / alterId 不是整数时二进制的 GetNodeInfo 一样会失败，这里提前拦下。
+    if [[ ! "${conf[1]}" =~ ^[0-9]+$ ]] || ((10#${conf[1]} < 1 || 10#${conf[1]} > 65535)); then
+        echo -e "${red}面板节点端口不对：「${conf[1]}」（要 1-65535 的整数）${plain}" >&2
+        return 1
+    fi
+    if [[ ! "${conf[2]}" =~ ^-?[0-9]+$ ]]; then
+        echo -e "${red}面板节点信息格式不对：第 3 段 alterId「${conf[2]}」不是整数${plain}" >&2
+        return 1
+    fi
+    # 第 4、5 段：tls 是开关，另一个非空值就是传输方式（后者覆盖前者，与 Go 一致）。
+    for f in "${conf[3]}" "${conf[4]}"; do
+        f="$(node_lower_trim "${f}")"
+        [[ "${f}" == "tls" || -z "${f}" ]] || transport="${f}"
+    done
+    # 第 6 段：key=value 用 | 分隔。path 取第一个 = 之后的全部（path 里可能带 =），
+    # 其余的值只取到下一个 = 为止 —— 都和 Go 的 strings.Split 写法一致。
+    IFS='|' read -r -a extra <<<"${conf[5]}"
+    for item in "${extra[@]}"; do
+        [[ "${item}" == *=* ]] || continue
+        key="$(node_lower_trim "${item%%=*}")"
+        val="${item#*=}"
+        case "${key}" in
+            path) path="$(node_trim "${val}")" ;;
+            host) host="$(node_trim "${val%%=*}")" ;;
+        esac
+    done
+    path="$(node_lower_trim "${path}")"
+    path="${path#/}"
+    if [[ "${transport}" == "ws" ]]; then
+        case "${path}" in
+            anytls) printf 'anytls\t%s\t%s\n' "$((10#${conf[1]}))" "${host}"; return 0 ;;
+            hy2) printf 'hysteria2\t%s\t%s\n' "$((10#${conf[1]}))" "${host}"; return 0 ;;
+            naive) printf 'naive\t%s\t%s\n' "$((10#${conf[1]}))" "${host}"; return 0 ;;
+        esac
+    fi
+    echo -e "${red}认不出面板节点的协议：传输方式「${transport:-空}」，path「${path:-空}」${plain}" >&2
+    echo -e "${yellow}SingR 只认 ws + path=/anytls、/hy2、/naive（在面板的节点地址里配置）。${plain}" >&2
+    return 1
+}
+
+# 请求面板并判断协议。stdout 同 node_panel_parse_server；失败原因走 stderr。
+node_panel_detect() { # <api_url> <api_key> <node_id> <node_type> <timeout>
+    local api_url="$1" api_key="$2" node_id="$3" node_type="$4" timeout="$5"
+    local out code rc=0 server msg
+
+    # 其他 node-type 走不到 alias 分支，面板节点永远不会被认成这三种协议。
+    case "$(node_lower_trim "${node_type}")" in
+        v2ray | vmess) ;;
+        *)
+            echo -e "${red}--node-type ${node_type} 无法用于 anytls / hysteria2 / naive，请用默认的 V2ray${plain}" >&2
+            return 1
+            ;;
+    esac
+    command -v curl >/dev/null 2>&1 || { echo -e "${red}需要 curl 来请求面板${plain}" >&2; return 1; }
+
+    out="$(mktemp)" || return 1
+    code="$(node_panel_fetch "${api_url}" "${api_key}" "${node_id}" "${timeout}" "${out}")" || rc=$?
+    if ((rc != 0)); then
+        rm -f "${out}"
+        echo -e "${red}连不上面板 ${api_url}（curl 退出码 ${rc}）${plain}" >&2
+        return 1
+    fi
+    if ! jq -e '.ret == 1' "${out}" >/dev/null 2>&1; then
+        msg="$(jq -r '.msg // .data // empty | tostring' "${out}" 2>/dev/null | head -c 200)"
+        [[ -z "${msg}" ]] && msg="$(head -c 200 "${out}" | tr -d '\r' | tr '\n' ' ')"
+        rm -f "${out}"
+        echo -e "${red}面板拒绝了节点信息请求（HTTP ${code}）：${msg:-空响应}${plain}" >&2
+        echo -e "${yellow}检查 --api-url、--api-key 与 --node-id。${plain}" >&2
+        return 1
+    fi
+    server="$(jq -r '.data.server // empty | tostring' "${out}" 2>/dev/null)"
+    rm -f "${out}"
+    if [[ -z "${server}" ]]; then
+        echo -e "${red}面板没有返回节点 #${node_id} 的地址信息（data.server 为空）${plain}" >&2
+        return 1
+    fi
+    node_panel_parse_server "${server}"
+}
+
 node_configs_ready() {
     if [[ ! -f "${PANEL_CONFIG}" || ! -f "${SERVER_CONFIG}" ]]; then
         echo -e "${red}未找到 ${PANEL_CONFIG} 或 ${SERVER_CONFIG}，请先完成安装${plain}"
@@ -701,11 +828,10 @@ node_add() {
     # 必填项都给齐了说明是一次性的命令行调用，可选项留空即按默认处理，不再追问。
     # 非交互（脚本调用）则直接报缺参数。
     if [[ -t 0 ]]; then
-        if [[ -z "${api_url}" || -z "${api_key}" || -z "${node_id}" || -z "${protocol}" ]]; then
+        if [[ -z "${api_url}" || -z "${api_key}" || -z "${node_id}" ]]; then
             [[ -z "${api_url}" ]] && read -r -p "面板地址 (--api-url，如 https://panel.example.com): " api_url
             [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
             [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
-            [[ -z "${protocol}" ]] && read -r -p "协议 anytls / hysteria2 / naive (--protocol): " protocol
             [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
             if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
                 echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
@@ -731,11 +857,13 @@ node_add() {
         true | false) ;;
         *) echo -e "${red}--enable-device-limit 必须是 true / false${plain}"; return 1 ;;
     esac
-    local proto
-    proto="$(node_norm_proto "${protocol}")" || {
-        echo -e "${red}--protocol 只能是 anytls / hysteria2 / naive${plain}"
-        return 1
-    }
+    local proto=""
+    if [[ -n "${protocol}" ]]; then
+        proto="$(node_norm_proto "${protocol}")" || {
+            echo -e "${red}--protocol 只能是 anytls / hysteria2 / naive${plain}"
+            return 1
+        }
+    fi
     # 证书两个参数要么都给要么都不给：只给一个多半是敲漏了，别猜。都不给就把
     # server.json 的路径留空，交给二进制解析默认路径（见 node_default_cert_path）。
     if [[ -n "${cert_src}" && -z "${key_src}" ]] || [[ -z "${cert_src}" && -n "${key_src}" ]]; then
@@ -766,10 +894,26 @@ node_add() {
         return 1
     fi
 
-    if [[ "${proto}" == "hysteria2" && -z "${sni}" ]]; then
+    # 协议以面板为准（见 node_panel_detect）。--protocol 只做校验：和面板不一致就拒绝，
+    # 而不是照它写出一个类型不对的 inbound。面板请求失败也在这里停下 —— 落盘后再靠
+    # node_apply 回滚，会让同进程的其他节点白白重启一次。
+    local detected panel_port panel_host
+    echo -e "${green}正在向面板查询节点 #${node_id} 的协议...${plain}"
+    detected="$(node_panel_detect "${api_url}" "${api_key}" "${node_id}" "${node_type}" "${timeout}")" || return 1
+    IFS=$'\t' read -r detected panel_port panel_host <<<"${detected}"
+    if [[ -n "${proto}" && "${proto}" != "${detected}" ]]; then
+        echo -e "${red}--protocol ${proto} 与面板不一致：面板节点 #${node_id} 是 ${detected}${plain}"
+        echo -e "${yellow}协议由面板节点的 path 决定（/anytls、/hy2、/naive）。去掉 --protocol，或先改面板。${plain}"
+        return 1
+    fi
+    proto="${detected}"
+    echo -e "${green}面板节点 #${node_id}：协议 ${proto}，端口 ${panel_port}${panel_host:+，SNI ${panel_host}}${plain}"
+
+    # 面板给了 host= 就由它决定 SNI（会覆盖 --sni），两者都空才会落到空 SNI。
+    if [[ "${proto}" == "hysteria2" && -z "${sni}" && -z "${panel_host}" ]]; then
         echo -e "${yellow}提示：hysteria2 默认开着 salamander obfs 且密码留空，此时密钥取自 SNI。"
-        echo -e "      SNI 也为空会让 obfs 静默关闭（配置显示开着，但实际没生效），"
-        echo -e "      客户端按文档配了 obfs 反而连不上。建议指定 --sni。${plain}"
+        echo -e "      面板没给 host= 又没指定 --sni，obfs 会静默关闭（配置显示开着，但实际没生效），"
+        echo -e "      客户端按文档配了 obfs 反而连不上。建议指定 --sni 或在面板节点地址里加 host=。${plain}"
     fi
 
     if node_has_placeholder; then
@@ -2030,7 +2174,8 @@ show_usage() {
     echo "SingR derp [子命令]         DERP 中继（组网）：enable/disable/port，详见 singr derp help"
     echo "------------------------------------------"
     echo "添加节点参数："
-    echo "  --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive"
+    echo "  --api-url URL --api-key KEY --node-id N [--protocol anytls|hysteria2|naive]"
+    echo "  （协议按面板节点的 path 自动判断：/anytls、/hy2、/naive；给了 --protocol 只做校验）"
     echo "  --sni HOST --cert-path PATH --key-path PATH"
     echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
     echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"

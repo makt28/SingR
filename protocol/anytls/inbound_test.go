@@ -192,6 +192,28 @@ func TestAnyTLSConfigureFromPanelNodeRejectsInvalidPort(t *testing.T) {
 	}
 }
 
+// A panel node of another protocol bound to this inbound must fail loudly
+// and leave the configuration alone. It used to return nil, leaving the
+// inbound on server.json's listen_port 0 (a random port).
+func TestAnyTLSConfigureFromPanelNodeRejectsOtherNodeType(t *testing.T) {
+	h := newTestAnyTLSInbound(t, testFreeTCPPort(t), "initial.example.com")
+	defer h.Close()
+	oldOptions := h.options
+
+	for _, nodeType := range []string{C.TypeHysteria2, C.TypeNaive, "V2ray", ""} {
+		err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: nodeType, Port: uint32(testFreeTCPPort(t)), Host: "other.example.com"})
+		if err == nil {
+			t.Fatalf("node type %q: expected mismatch error", nodeType)
+		}
+		if h.options.ListenPort != oldOptions.ListenPort || h.options.TLS.ServerName != oldOptions.TLS.ServerName {
+			t.Fatalf("node type %q: mismatched node changed options", nodeType)
+		}
+	}
+	if err := h.ConfigureFromPanelNode(nil); err != nil {
+		t.Fatalf("nil node info: %v", err)
+	}
+}
+
 func TestAnyTLSConfigureFromPanelNodeNoOpPreservesComponents(t *testing.T) {
 	port := testFreeTCPPort(t)
 	h := newTestAnyTLSInbound(t, port, "initial.example.com")

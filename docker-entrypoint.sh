@@ -13,7 +13,8 @@
 #   --api-url / SINGR_API_URL              panel apihost           (required*)
 #   --api-key / SINGR_API_KEY              panel apikey            (required*)
 #   --node-id / SINGR_NODE_ID             panel nodeid (int)      (required*)
-#   --protocol / SINGR_PROTOCOL           anytls | hysteria2 | naive (required*)
+#   --protocol / SINGR_PROTOCOL           anytls | hysteria2 | naive (required*;
+#                                         install-docker.sh fills it in from the panel)
 #   --panel-type / SINGR_PANEL_TYPE       default SSpanel
 #   --node-type / SINGR_NODE_TYPE         default V2ray
 #   --timeout / SINGR_TIMEOUT             default 20

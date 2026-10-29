@@ -1,0 +1,32 @@
+# Panel node "server" strings for the ws-path protocol aliases (/anytls, /hy2, /naive).
+#
+# Read by two implementations of the same rule, which must not drift:
+#   - Go:    poet/api/sspanel  TestV2rayAliasFixtures  (ParseV2rayNodeResponse, the runtime)
+#   - shell: scripts/test-node-detect.sh  (node_panel_parse_server in the SingR.sh /
+#            SingR-docker.sh SYNC BLOCK, which picks the inbound type at `singr add`)
+#
+# Columns, TAB separated (the server string is last and may contain spaces):
+#   go     NodeType ParseV2rayNodeResponse returns with NodeType "V2ray", or ERR
+#   shell  protocol node_panel_parse_server prints, or - when it must refuse
+#          (it also refuses ports the controller / inbounds would reject at startup)
+#   port   expected port (- for ERR rows)
+#   host   expected host= value (- when empty)
+#   server the raw string
+anytls	anytls	14555	xxxx.com	sa.example.com;14555;0;ws;;path=/anytls|host=xxxx.com|relay_server=r.example.com|relay_port=42132
+anytls	anytls	443	-	example.com;443;0;ws;;path=anytls
+hysteria2	hysteria2	443	h.example.com	example.com;443;0;tls;ws;path=/hy2|host=h.example.com
+naive	naive	8443	n.example.com	example.com;8443;0;ws;tls;path=/naive|host=n.example.com
+hysteria2	hysteria2	443	sp.example.com	example.com;443;0; WS ;TLS; Path = /HY2 | host = sp.example.com 
+naive	naive	443	h.example.com	example.com;443;0;ws;;path=/naive|host=h.example.com=junk
+hysteria2	hysteria2	443	-	example.com;443;0;ws;;path=/hy2;ignored=1
+anytls	anytls	443	-	example.com;443;0;tcp;ws;path=/anytls
+V2ray	-	443	w.example.com	example.com;443;0;ws;tls;path=/ws|host=w.example.com
+V2ray	-	443	-	example.com;443;0;tcp;tls;path=/anytls
+V2ray	-	443	-	example.com;443;0;ws;;path=/anytls=x
+V2ray	-	443	-	example.com;443;0;ws;;path=//hy2
+V2ray	-	443	a.example.com	example.com;443;0;ws;;host=a.example.com
+anytls	-	0	-	example.com;0;0;ws;;path=/anytls
+anytls	-	70000	-	example.com;70000;0;ws;;path=/anytls
+ERR	-	-	-	example.com;443;0;ws;tls
+ERR	-	-	-	example.com;abc;0;ws;;path=/anytls
+ERR	-	-	-	example.com;443;x;ws;;path=/anytls

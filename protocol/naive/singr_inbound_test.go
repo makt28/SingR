@@ -99,6 +99,27 @@ func TestNaiveConfigureFromPanelNodePreStart(t *testing.T) {
 	assertPortBound(t, initialPort, false)
 }
 
+// See TestAnyTLSConfigureFromPanelNodeRejectsOtherNodeType. The started
+// inbound must stay on its port; the mismatched node's port stays free.
+func TestNaiveConfigureFromPanelNodeRejectsOtherNodeType(t *testing.T) {
+	port := testFreePort(t)
+	h := newStartedNaiveInbound(t, port)
+	defer h.Close()
+
+	for _, nodeType := range []string{C.TypeAnyTLS, C.TypeHysteria2, "V2ray", ""} {
+		otherPort := testFreePort(t)
+		err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: nodeType, Port: uint32(otherPort), Host: "other.example.com"})
+		if err == nil {
+			t.Fatalf("node type %q: expected mismatch error", nodeType)
+		}
+		assertPortBound(t, otherPort, false)
+		assertPortBound(t, port, true)
+	}
+	if err := h.ConfigureFromPanelNode(nil); err != nil {
+		t.Fatalf("nil node info: %v", err)
+	}
+}
+
 // Both transports serve, and a port change moves both of them.
 func TestNaiveServesHTTP2AndHTTP3AcrossPortReload(t *testing.T) {
 	initialPort := testFreePort(t)

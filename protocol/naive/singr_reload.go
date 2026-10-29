@@ -133,9 +133,16 @@ func closeServing(httpServer *http.Server, h3Server io.Closer, lis *listener.Lis
 // nodeInfo.Port must be in (0, 65535]; an out-of-range value is rejected
 // and the previous configuration is left in place (defensive against a
 // panel that briefly returns Port=0).
+//
+// A panel node of another type is an error (api.NodeTypeMismatch), not a
+// no-op: at startup it fails the node, at runtime reloadPending keeps
+// logging it while the current configuration stays in place.
 func (n *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
-	if nodeInfo == nil || nodeInfo.NodeType != C.TypeNaive {
+	if nodeInfo == nil {
 		return nil
+	}
+	if nodeInfo.NodeType != C.TypeNaive {
+		return api.NodeTypeMismatch(C.TypeNaive, nodeInfo.NodeType)
 	}
 	if nodeInfo.Port <= 0 || nodeInfo.Port > 65535 {
 		return E.New("invalid naive listen port from panel: ", nodeInfo.Port)

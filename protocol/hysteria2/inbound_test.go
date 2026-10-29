@@ -289,6 +289,26 @@ func TestHysteria2ScopeCloseReleasesHotReloadedListener(t *testing.T) {
 	assertUDPPortBound(t, reloadPort, false)
 }
 
+// See TestAnyTLSConfigureFromPanelNodeRejectsOtherNodeType.
+func TestHysteria2ConfigureFromPanelNodeRejectsOtherNodeType(t *testing.T) {
+	h := newTestHysteria2Inbound(t, testFreeUDPPort(t), "initial.example.com")
+	defer h.Close()
+	oldOptions := h.options
+
+	for _, nodeType := range []string{C.TypeAnyTLS, C.TypeNaive, "V2ray", ""} {
+		err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: nodeType, Port: uint32(testFreeUDPPort(t)), Host: "other.example.com"})
+		if err == nil {
+			t.Fatalf("node type %q: expected mismatch error", nodeType)
+		}
+		if h.options.ListenPort != oldOptions.ListenPort || h.options.TLS.ServerName != oldOptions.TLS.ServerName {
+			t.Fatalf("node type %q: mismatched node changed options", nodeType)
+		}
+	}
+	if err := h.ConfigureFromPanelNode(nil); err != nil {
+		t.Fatalf("nil node info: %v", err)
+	}
+}
+
 func TestHysteria2ConfigureFromPanelNodeRejectsInvalidPort(t *testing.T) {
 	h := newTestHysteria2Inbound(t, testFreeUDPPort(t), "initial.example.com")
 	defer h.Close()

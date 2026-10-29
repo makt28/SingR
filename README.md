@@ -58,12 +58,13 @@ singr add \
   --api-url https://your-sspanel.example.com \
   --api-key your-apikey \
   --node-id 44 \
-  --protocol anytls \
   --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
   --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
 ```
 
-`singr add` 缺必填参数（`--api-url` / `--api-key` / `--node-id` / `--protocol`）时会逐项询问；四项都给齐则不再追问可选的 SNI 和证书路径，留空按默认处理。`--protocol` 可选 `anytls`、`hysteria2` 或 `naive`。
+协议不用指定：`singr add` 先请求面板，按节点地址里的 path 判断（`/anytls`、`/hy2`、`/naive`），面板请求失败或 path 认不出时直接报错，不改任何配置。仍可以给 `--protocol anytls|hysteria2|naive`，但只用来核对，和面板不一致就拒绝。
+
+`singr add` 缺必填参数（`--api-url` / `--api-key` / `--node-id`）时会逐项询问；三项都给齐则不再追问可选的 SNI 和证书路径，留空按默认处理。
 
 **Docker**：
 
@@ -72,12 +73,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makt28/SingR/main/install-do
   --api-url https://your-sspanel.example.com \
   --api-key your-apikey \
   --node-id 44 \
-  --protocol anytls \
   --cert-path /etc/letsencrypt/live/a.example.com/fullchain.pem \
   --key-path  /etc/letsencrypt/live/a.example.com/privkey.pem
 ```
 
-Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全一样。配置在 `/etc/singr-docker`，与裸机的 `/etc/singr` 互不影响。一台机器选一种即可。
+Docker 版安装脚本同样按面板判断协议，面板不通时在装 docker 之前就中止。Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全一样。配置在 `/etc/singr-docker`，与裸机的 `/etc/singr` 互不影响。一台机器选一种即可。
 
 ### 第 4 步：客户端填写
 
@@ -120,7 +120,7 @@ Docker 版会装上同样的 `singr` 管理命令，后续操作和裸机完全�
 
 ```sh
 singr list                    # 查看节点
-singr add --api-url ... --api-key ... --node-id 57 --protocol hysteria2 --sni b.example.com
+singr add --api-url ... --api-key ... --node-id 57 --sni b.example.com   # 协议按面板 path 判断
 singr del @2                  # @序号取自 list 的 # 列
 ```
 
@@ -418,7 +418,7 @@ docker run -d --name singr \
 | `--api-url` | `SINGR_API_URL` | 面板地址（必填） | |
 | `--api-key` | `SINGR_API_KEY` | 面板 apikey（必填） | |
 | `--node-id` | `SINGR_NODE_ID` | 节点 ID（必填） | |
-| `--protocol` | `SINGR_PROTOCOL` | `anytls`、`hysteria2` 或 `naive`（必填） | |
+| `--protocol` | `SINGR_PROTOCOL` | `anytls`、`hysteria2` 或 `naive`。安装脚本可不填（按面板判断，填了只做核对）；直接 `docker run` / compose 时必填，且要和面板节点的 path 一致 | |
 | `--sni` | `SINGR_SNI` | 入站 `server_name` | 空 |
 | `--cert-path` / `--key-path` | `SINGR_CERT_PATH` / `SINGR_KEY_PATH` | 证书路径。用安装脚本时填宿主机路径；用 `docker run` / compose 时填容器内路径，需要自己挂载 | 空，即使用默认路径 |
 | `--cert-url` / `--key-url` | — | 仅安装脚本支持，见「证书」 | |

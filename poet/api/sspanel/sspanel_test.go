@@ -2,6 +2,9 @@ package sspanel
 
 import (
 	"encoding/json"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/poet/api"
@@ -237,5 +240,53 @@ func TestParseUserListResponseOldNodeConnector(t *testing.T) {
 	}
 	if user.DeviceLimit != 2 {
 		t.Fatalf("DeviceLimit = %d, want 2", user.DeviceLimit)
+	}
+}
+
+// TestV2rayAliasFixtures pins the ws-path alias rule against the fixture
+// file that scripts/test-node-detect.sh also reads: `singr add` picks the
+// inbound type with a shell copy of this rule, so the two must agree.
+func TestV2rayAliasFixtures(t *testing.T) {
+	data, err := os.ReadFile("testdata/v2ray_alias_servers.tsv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.SplitN(line, "\t", 5)
+		if len(fields) != 5 {
+			t.Fatalf("bad fixture line %q", line)
+		}
+		wantType, wantPort, wantHost, server := fields[0], fields[2], fields[3], fields[4]
+		if wantHost == "-" {
+			wantHost = ""
+		}
+		rows++
+		nodeInfo, err := newTestClient("V2ray").ParseV2rayNodeResponse(&NodeInfoResponse{RawServerString: server})
+		if wantType == "ERR" {
+			if err == nil {
+				t.Errorf("%q: parsed as %s, want error", server, nodeInfo.NodeType)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%q: %v", server, err)
+			continue
+		}
+		if nodeInfo.NodeType != wantType {
+			t.Errorf("%q: NodeType = %q, want %q", server, nodeInfo.NodeType, wantType)
+		}
+		if got := strconv.FormatUint(uint64(nodeInfo.Port), 10); got != wantPort {
+			t.Errorf("%q: Port = %s, want %s", server, got, wantPort)
+		}
+		if nodeInfo.Host != wantHost {
+			t.Errorf("%q: Host = %q, want %q", server, nodeInfo.Host, wantHost)
+		}
+	}
+	if rows == 0 {
+		t.Fatal("no fixture rows")
 	}
 }

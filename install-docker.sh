@@ -11,11 +11,13 @@
 # unit, or /usr/local/SingR. A host uses one installer or the other.
 #
 # Usage:
-#   bash install-docker.sh --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive [opts]
+#   bash install-docker.sh --api-url URL --api-key KEY --node-id N [opts]
+#
+# 协议不用指定：安装前先请求面板，按节点地址里的 path（/anytls、/hy2、/naive）判断。
 #
 # 本脚本只负责装第一个节点。已经装过之后再跑会被拒绝（重复运行不会让新参数生效，
 # 却会先删掉正在服务的容器）。同一台机上再加节点请用：
-#   singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive \
+#   singr add --api-url URL --api-key KEY --node-id N \
 #             --sni HOST [--cert-path PATH --key-path PATH | --cert-url URL --key-url URL]
 # 查看/删除：singr list / singr del <NodeID>
 #
@@ -23,7 +25,7 @@
 #   --api-url URL              (required)   panel apihost
 #   --api-key KEY              (required)   panel apikey
 #   --node-id N                (required)   panel node id
-#   --protocol anytls|hysteria2|naive (required)
+#   --protocol anytls|hysteria2|naive  可选：只做校验，与面板判断的不一致就中止
 #   --panel-type NAME          (default SSpanel)
 #   --node-type NAME           (default V2ray)
 #   --timeout N                (default 20)
@@ -72,6 +74,7 @@ LOG_MAX_FILE="5"
 
 # --- app flags (forwarded verbatim to the container entrypoint) -------------
 API_URL=""; API_KEY=""; NODE_ID=""; PROTOCOL=""
+NODE_TYPE="V2ray"; TIMEOUT="20"   # 判断协议时请求面板要用
 CERT_SRC=""; KEY_SRC=""       # 宿主机证书路径，交给 entrypoint 写进 server.json
 CERT_URL=""; KEY_URL=""       # 默认证书更新源，只存进 cert-source.json，不进 RUN_FLAGS
 declare -a APP_FLAGS=()
@@ -86,7 +89,7 @@ guard_existing_install() {
     [[ -f "${CONFIG_DIR}/panel.json" ]] || return 0
     die "检测到 ${CONFIG_DIR}/panel.json 已存在：本机已经装过 SingR（Docker）。
 重复运行安装脚本不会让新参数生效，反而会先删掉正在运行的容器。请改用：
-  · 新增节点：  singr add --api-url URL --api-key KEY --node-id N --protocol anytls|hysteria2|naive \\
+  · 新增节点：  singr add --api-url URL --api-key KEY --node-id N \\
                           --sni HOST [--cert-path PATH --key-path PATH]
   · 查看节点：  singr list
   · 删除节点：  singr del <NodeID>
@@ -100,10 +103,10 @@ parse_args() {
             --api-url)      API_URL="$2"; APP_FLAGS+=(--api-url "$2"); shift 2;;
             --api-key)      API_KEY="$2"; APP_FLAGS+=(--api-key "$2"); shift 2;;
             --node-id)      NODE_ID="$2"; APP_FLAGS+=(--node-id "$2"); shift 2;;
-            --protocol)     PROTOCOL="$2"; APP_FLAGS+=(--protocol "$2"); shift 2;;
+            --protocol)     PROTOCOL="$2"; shift 2;;   # 判断完再以面板的结果交给 entrypoint
             --panel-type)   APP_FLAGS+=(--panel-type "$2"); shift 2;;
-            --node-type)    APP_FLAGS+=(--node-type "$2"); shift 2;;
-            --timeout)      APP_FLAGS+=(--timeout "$2"); shift 2;;
+            --node-type)    NODE_TYPE="$2"; APP_FLAGS+=(--node-type "$2"); shift 2;;
+            --timeout)      TIMEOUT="$2"; APP_FLAGS+=(--timeout "$2"); shift 2;;
             --speed-limit)  APP_FLAGS+=(--speed-limit "$2"); shift 2;;
             --device-limit) APP_FLAGS+=(--device-limit "$2"); shift 2;;
             --enable-device-limit) APP_FLAGS+=(--enable-device-limit "$2"); shift 2;;
@@ -132,10 +135,37 @@ validate() {
     [[ -n "${API_KEY}" ]]  || die "缺少 --api-key。"
     [[ "${NODE_ID}" =~ ^[0-9]+$ ]] || die "缺少合法 --node-id（整数）。"
     validate_certs
+    [[ "${TIMEOUT}" =~ ^[0-9]+$ ]] || die "--timeout 必须是整数。"
     case "$(echo "${PROTOCOL}" | tr '[:upper:]' '[:lower:]')" in
-        anytls|hysteria2|hy2|naive) ;;
-        *) die "缺少或非法 --protocol（anytls / hysteria2 / naive）。";;
+        "") ;;
+        anytls) PROTOCOL="anytls";;
+        hysteria2|hy2) PROTOCOL="hysteria2";;
+        naive) PROTOCOL="naive";;
+        *) die "非法 --protocol（anytls / hysteria2 / naive；不给则按面板判断）。";;
     esac
+}
+
+# 协议由面板节点决定：管理脚本里的 node_panel_detect 请求面板、按 path 判断（规则只维护
+# 那一份，和 singr add 共用）。api-key 走 stdin。--protocol 只用来核对。
+# 失败时 panel.json 还没生成，修好后可以直接重跑本脚本。
+detect_protocol() {
+    local detected
+    log_info "正在向面板查询节点 #${NODE_ID} 的协议..."
+    detected="$(printf '%s\n' "${API_KEY}" |
+        /usr/bin/SingR _panel-detect "${API_URL}" "${NODE_ID}" "${NODE_TYPE}" "${TIMEOUT}")" ||
+        die "无法从面板确定节点协议，安装中止。修好后可直接重跑本脚本。"
+    # 管理脚本是从仓库下载的；万一下到的旧版本不认 _panel-detect，它会打印用法并返回 0。
+    case "${detected}" in
+        anytls|hysteria2|naive) ;;
+        *) die "管理脚本没有返回可用的协议（版本太旧？）：${detected:0:80}";;
+    esac
+    if [[ -n "${PROTOCOL}" && "${PROTOCOL}" != "${detected}" ]]; then
+        die "--protocol ${PROTOCOL} 与面板不一致：面板节点 #${NODE_ID} 是 ${detected}。
+协议由面板节点的 path 决定（/anytls、/hy2、/naive）。去掉 --protocol，或先改面板。"
+    fi
+    PROTOCOL="${detected}"
+    APP_FLAGS+=(--protocol "${PROTOCOL}")
+    log_info "面板节点 #${NODE_ID}：协议 ${PROTOCOL}"
 }
 
 # 证书参数：路径一对、URL 一对，各自要么都给要么都不给，两种方式二选一。
@@ -284,9 +314,11 @@ main() {
     validate
     guard_existing_install
     install_tools
+    # 管理脚本先装：判断协议要用它，并且要赶在装 docker 之前 —— 面板不通就别白装一趟。
+    install_management_script
+    detect_protocol
     install_docker
     write_conf
-    install_management_script
 
     if [[ -n "${CERT_SRC}" ]]; then
         /usr/bin/SingR _cert-mount-check "${CERT_SRC}" "${KEY_SRC}" ||

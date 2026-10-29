@@ -121,9 +121,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 // nodeInfo.Port must be in (0, 65535]; an out-of-range value is an error and
 // the previous configuration is left in place. Defensive against a panel
 // that briefly returns Port=0 or other bad values.
+//
+// A panel node of another type is an error (api.NodeTypeMismatch), not a
+// no-op: at startup it fails the node, at runtime reloadPending keeps
+// logging it while the current configuration stays in place.
 func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
-	if nodeInfo == nil || nodeInfo.NodeType != C.TypeAnyTLS {
+	if nodeInfo == nil {
 		return nil
+	}
+	if nodeInfo.NodeType != C.TypeAnyTLS {
+		return api.NodeTypeMismatch(C.TypeAnyTLS, nodeInfo.NodeType)
 	}
 	if nodeInfo.Port <= 0 || nodeInfo.Port > 65535 {
 		return E.New("invalid anytls listen port from panel: ", nodeInfo.Port)
