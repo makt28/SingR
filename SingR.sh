@@ -96,9 +96,16 @@ update_singr() {
     fi
     bash <(curl -fsSL "${INSTALL_URL}") "${version}"
     if [[ $? == 0 ]]; then
-        restart 0
-        show_version 0
-        echo -e "${green}更新完成${plain}"
+        if node_none_configured; then
+            # install.sh 每次都会 systemctl enable，没有节点时要再暂停一次，否则开机后无限重启。
+            node_backend_idle
+            show_version 0
+            echo -e "${green}更新完成${plain}。当前没有节点，${APP_NAME} 保持停止；singr add 添加节点后自动启动"
+        else
+            restart 0
+            show_version 0
+            echo -e "${green}更新完成${plain}"
+        fi
     fi
     [[ $# == 0 ]] && before_show_menu
 }
@@ -124,6 +131,10 @@ uninstall_singr() {
 }
 
 start() {
+    if ! node_guard_start; then
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
     check_status
     if [[ $? == 0 ]]; then
         echo -e "${green}${APP_NAME} 已运行，无需再次启动${plain}"
@@ -151,6 +162,10 @@ stop() {
 }
 
 restart() {
+    if ! node_guard_start; then
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
     systemctl restart "${SERVICE_NAME}"
     sleep 2
     if systemctl is-active --quiet "${SERVICE_NAME}"; then
@@ -314,6 +329,10 @@ show_status() {
 #                                                          stdout 回显 "<certpath>|<keypath>"，其余输出走 stderr
 #   node_backend_restart                                -> 重启后端
 #   node_backend_verify                                 -> 0=确实起来了（须能识别 crash-loop）
+#   node_backend_idle                                   -> 没有节点了：停掉后端，开着开机自启就
+#                                                          暂停它并留标记（否则开机后无限拉起）
+#   node_backend_resume                                 -> 又有节点了：恢复被 idle 暂停的开机自启
+#                                                          （只认标记，用户自己关的不动）
 #   node_cert_renew_hint                                -> 打印该后端的证书续期建议
 #
 # 两种后端都原地引用证书（不复制）：server.json 写的就是证书的真实路径。docker 靠
@@ -609,6 +628,25 @@ node_count() {
     jq -r '(.nodes // []) | length' "${PANEL_CONFIG}" 2>/dev/null || echo 0
 }
 
+# panel.json 里一个节点都没有（最后一个节点被 singr del 删掉之后）。这时进程以
+# 'no Node with InTag found' 退出，start/restart 据此直接拦下。没有 jq、文件不在或
+# 解析不了时返回 1 —— 判断不了就别拦（node_count 解析失败会回显 0，不能拿它判断）。
+node_none_configured() {
+    command -v jq >/dev/null 2>&1 || return 1
+    jq -e '(.nodes // []) | length == 0' "${PANEL_CONFIG}" >/dev/null 2>&1
+}
+
+# 没有节点时进程起不来（见 node_none_configured），start/restart 先过这一关，别让后端白拉一次。
+# 有节点了就顺带恢复被 node_backend_idle 暂停的开机自启 —— 用 singr config 手写节点的
+# 情况走的是这里，而不是 node_add。
+node_guard_start() {
+    if node_none_configured; then
+        echo -e "${red}当前没有节点，${APP_NAME} 无法启动。先用 singr add 添加节点（添加后会自动启动）${plain}"
+        return 1
+    fi
+    node_backend_resume
+}
+
 # install.sh 铺的占位节点（apihost=your-sspanel.example.com / apikey=your-apikey）
 # 不是真节点，留着会在启动时 GetNodeInfo 失败，把同进程的真节点一起拖死。
 node_has_placeholder() {
@@ -700,6 +738,12 @@ node_apply() {
     fi
     echo -e "${red}${APP_NAME} 未能正常启动，正在回滚配置...${plain}"
     node_restore
+    # 从零节点加第一个节点失败：回滚后又没有节点了，重启只会再退出一次，回到停止状态。
+    if [[ "$(node_count)" == "0" ]]; then
+        node_backend_idle
+        echo -e "${yellow}已回滚到变更前的配置（没有节点），${APP_NAME} 保持停止。请用 singr log 查看失败原因${plain}"
+        return 1
+    fi
     node_backend_restart
     if node_backend_verify; then
         echo -e "${yellow}已回滚到变更前的配置，${APP_NAME} 已恢复运行。请用 singr log 查看失败原因${plain}"
@@ -981,6 +1025,7 @@ node_add() {
 
     echo -e "${green}已添加节点：${api_url} #${node_id}（${proto}，InTag=${tag}）${plain}"
     if node_apply; then
+        node_backend_resume
         echo
         node_list
         echo
@@ -1061,11 +1106,13 @@ node_del() {
     local tag
     tag="$(node_resolve_tag "${sel}")" || return 1
 
+    # 最后一个节点也能删：没有节点进程跑不起来，所以删完不走重启校验，而是让后端停下
+    # （node_backend_idle，顺带暂停开机自启），singr add 新节点时再恢复。
+    local last=0
     if [[ "$(node_count)" == "1" ]]; then
-        echo -e "${red}这是最后一个节点。删掉之后 panel.json 将没有任何节点，进程会以"
-        echo -e "'no Node with InTag found' 退出。${plain}"
-        echo -e "${yellow}要换节点请先 singr add 新节点、再删旧的；要彻底移除请用 singr uninstall。${plain}"
-        return 1
+        last=1
+        echo -e "${yellow}这是最后一个节点。没有节点 ${APP_NAME} 无法运行，删除后会停止 ${APP_NAME}；"
+        echo -e "之后用 singr add 添加节点会自动重新启动。${plain}"
     fi
 
     confirm "确定删除节点 ${sel}（InTag=${tag}）吗" "n" || return 0
@@ -1090,6 +1137,12 @@ node_del() {
     }
 
     echo -e "${green}已删除节点 ${sel}（InTag=${tag}）${plain}"
+    if ((last)); then
+        node_commit
+        node_backend_idle
+        echo -e "${green}${APP_NAME} 已停止（当前没有节点）。用 singr add 添加节点后会自动启动。${plain}"
+        return 0
+    fi
     if node_apply; then
         echo
         node_list
@@ -1139,6 +1192,26 @@ node_backend_place_cert() {
 
 node_backend_restart() {
     systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
+}
+
+# 没有节点时进程一启动就退出，开着开机自启的话开机后 Restart=on-failure 每 10 秒拉一次。
+# 自启是这里关掉的才留标记，node_backend_resume 只恢复带标记的。
+AUTOSTART_PAUSED="${CONFIG_DIR}/autostart-paused"
+
+node_backend_idle() {
+    if check_enabled && systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1; then
+        : >"${AUTOSTART_PAUSED}"
+        echo -e "${yellow}已暂停开机自启（添加节点后自动恢复）${plain}"
+    fi
+    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+}
+
+node_backend_resume() {
+    [[ -f "${AUTOSTART_PAUSED}" ]] || return 0
+    if systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1; then
+        rm -f "${AUTOSTART_PAUSED}"
+        echo -e "${green}已恢复开机自启${plain}"
+    fi
 }
 
 
@@ -1747,6 +1820,14 @@ derp_change() {
         derp_remove_server || { node_restore; return 1; }
     else
         derp_write_server "${port}" "${url}" "${v4}" "${v6}" || { node_restore; return 1; }
+    fi
+    # 没有节点时进程本来就不运行（见 node_none_configured），重启校验必然失败。只写配置，
+    # 添加节点、进程启动时一并生效。
+    if node_none_configured; then
+        node_commit
+        rm -f "${token_backup}"
+        echo -e "${yellow}当前没有节点，${APP_NAME} 未运行：DERP 配置已写入，添加节点启动后生效${plain}"
+        return 0
     fi
     if node_apply; then
         rm -f "${token_backup}"
