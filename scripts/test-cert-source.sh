@@ -95,8 +95,11 @@ reset; put_remote long
 run "cert_source_set ${URLS}" >/dev/null
 check "首次配置：下载到默认证书" "$(fp "${TMP}/long.pem")" "$(fp "${CFG}/certs/default.pem")"
 check "首次配置：写入更新源" "https://remote/cert.pem" "$(jq -r .cert_url "${CFG}/cert-source.json")"
-check "更新源文件权限 600" "600" "$(stat -f %Lp "${CFG}/cert-source.json" 2>/dev/null || stat -c %a "${CFG}/cert-source.json")"
-check "私钥权限 600" "600" "$(stat -f %Lp "${CFG}/certs/default.key" 2>/dev/null || stat -c %a "${CFG}/certs/default.key")"
+# 先试 GNU 的 -c，再退到 BSD 的 -f：反过来不行 —— GNU stat 的 -f 是"看文件系统"，
+# 不报错还会吐出一大段无关内容，|| 后面那半句永远轮不到（在 Linux 上这两条必红）。
+mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+check "更新源文件权限 600" "600" "$(mode "${CFG}/cert-source.json")"
+check "私钥权限 600" "600" "$(mode "${CFG}/certs/default.key")"
 [[ -f "${TMP}/systemd/singr-cert-update.timer" ]] && pass "装上每日 timer" || fail "装上每日 timer" "timer 文件" "无"
 check "首次配置：不重启" "0" "$(restarts)"
 

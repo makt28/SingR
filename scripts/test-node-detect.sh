@@ -187,7 +187,17 @@ cp "${REPO_DIR}/release/poet/server.json" "${CFG}/server.json"
 echo '{"nodes":[]}' > "${CFG}/panel.json"
 echo x > "${CFG}/certs/default.pem"
 echo x > "${CFG}/certs/default.key"
-snapshot() { cat "${CFG}/server.json" "${CFG}/panel.json" | shasum | cut -d' ' -f1; }
+# 配置的内容指纹。shasum 是 perl 带的，精简的 Linux 环境里没有；它缺席时这个函数
+# 只会输出空串，"拒绝时配置没动"这类断言就成了空串比空串、永远成立。
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_stdin() { sha256sum | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    hash_stdin() { shasum -a 256 | cut -d' ' -f1; }
+else
+    echo "需要 sha256sum 或 shasum" >&2
+    exit 1
+fi
+snapshot() { cat "${CFG}/server.json" "${CFG}/panel.json" | hash_stdin; }
 
 reset_state
 respond 200 "$(node_json 'a.example.com;443;0;ws;tls;path=/hy2|host=h.example.com')"
