@@ -26,7 +26,7 @@ func (a *reloadRetryTestAPI) GetNodeInfo() (*api.NodeInfo, error) {
 		a.served = true
 		return a.node, nil
 	}
-	return nil, errors.New(api.NodeNotModified)
+	return nil, api.ErrNodeNotModified
 }
 
 // reloadRetryTestInbound fails ConfigureFromPanelNode a fixed number of

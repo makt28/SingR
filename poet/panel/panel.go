@@ -2,15 +2,14 @@ package panel
 
 import (
 	"context"
-	"os"
+	"fmt"
 	"sync"
 
 	"dario.cat/mergo"
-	"github.com/sagernet/sing-box/adapter"
+
 	"github.com/sagernet/sing-box/poet/api"
 	"github.com/sagernet/sing-box/poet/api/sspanel"
 	"github.com/sagernet/sing-box/poet/controller"
-
 	SS "github.com/sagernet/sing-box/poet/shortcuts"
 )
 
@@ -19,7 +18,7 @@ type Panel struct {
 	access      sync.Mutex
 	panelConfig *Config
 	Running     bool
-	//Service
+	// Service
 	Nodes []*controller.Controller
 }
 
@@ -31,95 +30,88 @@ func NewPanel(panelConfig *Config) *Panel {
 	return p
 }
 
-// Start the panel
-func (p *Panel) Start() {
-
+// Start builds one controller per panel node and starts them all.
+//
+// Any failure is returned, not handled by exiting: the caller (Box.preStart)
+// turns it into a failed startup, so the process still ends non-zero — which
+// is what the management scripts' backup → restart → verify → rollback relies
+// on — but through sing-box's normal shutdown path instead of an os.Exit in
+// the middle of a library call. On failure the nodes that did start are
+// stopped again.
+func (p *Panel) Start() error {
 	p.access.Lock()
 	defer p.access.Unlock()
 
-	//暂存对象
 	ss := SS.Singleton()
-
 	ctx := context.Background()
-
 	log := ss.Logger
-	log.Info("\n\tStart the panel..")
 
-	//node counter
-	nodeCounter := 0
+	log.Info("\n\tStart the panel..")
 
 	// Load Nodes config
 	for _, nodeConfig := range p.panelConfig.NodesConfig {
+		if nodeConfig == nil || nodeConfig.ApiConfig == nil {
+			return fmt.Errorf("panel config has a node without ApiConfig")
+		}
 		log.Info("processing NodeId: ", nodeConfig.ApiConfig.NodeID)
 
-		//inbound
-		var inbound *adapter.Inbound
-
 		inTag := nodeConfig.InTag
-		outTag := nodeConfig.OutTag
-		if in, ok := ss.Inbounds[inTag]; ok {
-			inbound = in
-		} else {
-			log.Warn("unkown inbound with Tag:", nodeConfig.ApiConfig.InTag)
+		inbound := ss.Inbound(inTag)
+		if inbound == nil {
+			log.Warn("unknown inbound with Tag: ", inTag)
 			continue
 		}
 
-		//panel webapi
+		// panel webapi
 		var apiClient api.API
-
 		switch nodeConfig.PanelType {
 		case "SSpanel":
 			apiClient = sspanel.New(nodeConfig.ApiConfig)
 		default:
-			log.Panic("unsupport panel type: ", nodeConfig.PanelType)
+			log.Error("unsupported panel type: ", nodeConfig.PanelType)
 			continue
 		}
 
 		// Register controller service
 		controllerConfig := getDefaultControllerConfig()
 		controllerConfig.PanelType = nodeConfig.PanelType
-
 		if nodeConfig.ControllerConfig != nil {
 			if err := mergo.Merge(controllerConfig, nodeConfig.ControllerConfig, mergo.WithOverride); err != nil {
-				log.Panic("read Controller Config Failed!")
+				log.Error("read ControllerConfig of NodeId ", nodeConfig.ApiConfig.NodeID, " failed: ", err)
 				continue
 			}
 		}
 		controllerService := controller.New(ctx, *controllerConfig, inbound, apiClient, log)
 		p.Nodes = append(p.Nodes, controllerService)
 
-		//set Contrl
-		ss.SetContrl(controllerService, inTag, outTag)
-
-		nodeCounter++
+		ss.SetController(controllerService, inTag)
 	}
 
-	//empty node
-	if nodeCounter == 0 {
-		log.Panic("no Node with InTag found!")
-		os.Exit(1)
+	if len(p.Nodes) == 0 {
+		// The management scripts and the docker entrypoint quote this
+		// message; keep the wording.
+		return fmt.Errorf("no Node with InTag found")
 	}
 
 	// Start all the nodes
-	for _, node := range p.Nodes {
-		err := node.Start()
-		if err != nil {
-			log.Panic("Panel Start fialed: ", err)
-			os.Exit(1)
+	for i, node := range p.Nodes {
+		if err := node.Start(); err != nil {
+			for _, started := range p.Nodes[:i] {
+				_ = started.Close()
+			}
+			return fmt.Errorf("panel node on inbound %s failed to start: %w", node.InboundTag(), err)
 		}
 	}
-
 	p.Running = true
+	return nil
 }
 
 // Close the panel
 func (p *Panel) Close() {
 	p.access.Lock()
 	defer p.access.Unlock()
-
 	for _, node := range p.Nodes {
 		node.Close()
 	}
-
 	p.Running = false
 }

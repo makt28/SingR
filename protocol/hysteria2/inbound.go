@@ -62,6 +62,10 @@ type Inbound struct {
 
 	// reloadMu serializes ConfigureFromPanelNode against itself and Close.
 	reloadMu sync.Mutex
+	// closed is set by Close (under reloadMu). ConfigureFromPanelNode is a
+	// no-op afterwards: POET.Stop does not wait for a monitor tick already
+	// in flight, and that tick must not rebuild a service on a closed inbound.
+	closed bool
 	// started is set true after Start has begun listening. Before Start,
 	// ConfigureFromPanelNode just stashes new options and rebuilds the
 	// not-yet-started components; after Start it performs a live rebuild.
@@ -328,38 +332,23 @@ func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 	if nodeInfo == nil {
 		return nil
 	}
-	if nodeInfo.NodeType != C.TypeHysteria2 {
-		return api.NodeTypeMismatch(C.TypeHysteria2, nodeInfo.NodeType)
-	}
-	if nodeInfo.Port <= 0 || nodeInfo.Port > 65535 {
-		return E.New("invalid hysteria2 listen port from panel: ", nodeInfo.Port)
+	if err := api.ValidatePanelNode(C.TypeHysteria2, nodeInfo); err != nil {
+		return err
 	}
 
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	// A panel tick still in flight after shutdown must not bring a new
+	// listener up on a closed inbound.
+	if h.closed {
+		return nil
+	}
 
+	update := api.PlanListenUpdate(nodeInfo, h.options.ListenPort, h.options.TLS)
 	newOpts := h.options
-	newOpts.ListenPort = uint16(nodeInfo.Port)
-	if nodeInfo.Host != "" {
-		if newOpts.TLS == nil {
-			newOpts.TLS = &option.InboundTLSOptions{Enabled: true}
-		} else {
-			tlsCopy := *newOpts.TLS
-			newOpts.TLS = &tlsCopy
-		}
-		newOpts.TLS.ServerName = nodeInfo.Host
-	}
-
-	portChanged := newOpts.ListenPort != h.options.ListenPort
-	oldSNI := ""
-	if h.options.TLS != nil {
-		oldSNI = h.options.TLS.ServerName
-	}
-	newSNI := ""
-	if newOpts.TLS != nil {
-		newSNI = newOpts.TLS.ServerName
-	}
-	sniChanged := newSNI != oldSNI
+	newOpts.ListenPort = update.Port
+	newOpts.TLS = update.TLS
+	portChanged, sniChanged, newSNI := update.PortChanged, update.SNIChanged, update.SNI
 
 	if h.started.Load() && !portChanged && !sniChanged {
 		return nil
@@ -429,6 +418,7 @@ func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 		_ = common.Close(oldTLS)
 		h.logger.Info("hysteria2 TLS hot-reloaded with SNI ", newSNI)
 	}
+	h.warnIfObfsOff()
 	return nil
 }
 
@@ -521,15 +511,56 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		return err
 	}
 	h.started.Store(true)
+	h.warnIfObfsOff()
 	return nil
+}
+
+// obfsSecretMissing reports whether the options carry an obfs block that
+// resolves to an empty secret. sing-quic only wraps the socket when the
+// secret is non-empty, so such a block is silently off: the config says
+// obfuscation is on, the server speaks plain QUIC, and clients that enable
+// obfs as documented cannot connect.
+//
+//   - salamander: an empty password falls back to the TLS server name (the
+//     panel's host=); it is off only when both are empty.
+//   - gecko: there is no fallback, an empty password is always off.
+func obfsSecretMissing(options option.Hysteria2InboundOptions) bool {
+	if options.Obfs == nil || options.Obfs.Password != "" {
+		return false
+	}
+	switch options.Obfs.Type {
+	case hysteria2.ObfsTypeSalamander:
+		return options.TLS == nil || options.TLS.ServerName == ""
+	case hysteria2.ObfsTypeGecko:
+		return true
+	}
+	return false
+}
+
+// warnIfObfsOff logs the silent-off case above. It is called once the
+// inbound serves with its effective options — after Start and after every
+// hot reload — not from buildComponents, which also runs at construction,
+// before the panel has delivered its host=.
+func (h *Inbound) warnIfObfsOff() {
+	if !obfsSecretMissing(h.options) {
+		return
+	}
+	h.logger.Warn("obfs is configured (type ", h.options.Obfs.Type, ") but its secret is empty — no obfs password, and no TLS server name from server.json or the panel node's host= to fall back on. Obfuscation is OFF: clients that enable obfs cannot connect. Set obfs.password, give the panel node a host=, or remove the obfs block.")
 }
 
 func (h *Inbound) InterfaceUpdated(ctx context.Context) {
 	h.service.Reset()
 }
 
+// Close releases whatever is live now, including a hot-reloaded service.
+// Idempotent: it is registered with the start scope and may also be called
+// directly.
 func (h *Inbound) Close() error {
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
 	return closeComponents(h.tlsConfig, h.listener.Load(), h.service)
 }

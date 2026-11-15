@@ -1,0 +1,792 @@
+#!/usr/bin/env bash
+#
+# SingR management script — DOCKER backend.
+#
+# Mirrors SingR.sh (the bare-metal/systemd script) verb-for-verb, but drives a
+# Docker container instead of a systemd unit. A host runs either the bare-metal
+# install OR the docker install, never both, so this installs as the same
+# `singr` / `SingR` command. Config is isolated to /etc/singr-docker so it can
+# never collide with the bare-metal /etc/singr paths.
+#
+# Backend detection: this script is only installed by install-docker.sh, which
+# also writes ${CONFIG_DIR}/docker.conf. Its presence == docker mode.
+
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
+
+APP_NAME="SingR"
+CONFIG_DIR="${SINGR_CONFIG_DIR:-/etc/singr-docker}"
+CERT_DIR="${CONFIG_DIR}/certs"
+PANEL_CONFIG="${CONFIG_DIR}/panel.json"
+SERVER_CONFIG="${CONFIG_DIR}/server.json"
+DOCKER_CONF="${CONFIG_DIR}/docker.conf"
+SELF_CMD="/usr/bin/SingR"
+
+RELEASE_REPO="${SINGR_RELEASE_REPO:-makt28/SingR}"
+RELEASE_BRANCH="${SINGR_RELEASE_BRANCH:-main}"
+INSTALL_URL="https://raw.githubusercontent.com/${RELEASE_REPO}/${RELEASE_BRANCH}/install-docker.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/${RELEASE_REPO}/${RELEASE_BRANCH}/SingR-docker.sh"
+
+# Hysteria2 端口跳跃（宿主机 iptables NAT REDIRECT）——与裸机版一致，host 网络下
+# 容器与宿主机共享网络栈，所以这段完全复用，不涉及 docker。
+PORTHOP_RULES="${CONFIG_DIR}/porthop.rules"
+PORTHOP_COMMENT="singr-porthop"
+PORTHOP_SERVICE="singr-porthop"
+PORTHOP_SERVICE_FILE="/etc/systemd/system/${PORTHOP_SERVICE}.service"
+
+[[ ${EUID} -ne 0 ]] && echo -e "${red}错误：${plain} 必须使用 root 用户运行此脚本！\n" && exit 1
+
+# ---- 容器运行参数默认值（docker.conf 覆盖）--------------------------------
+IMAGE="ghcr.io/makt28/singr:latest"
+CONTAINER="singr"
+RESTART="always"
+LOG_MAX_SIZE="10m"
+LOG_MAX_FILE="5"
+RUN_FLAGS=()
+
+load_conf() {
+    if [[ -f "${DOCKER_CONF}" ]]; then
+        # shellcheck source=/dev/null
+        source "${DOCKER_CONF}"
+    fi
+}
+load_conf
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || {
+        echo -e "${red}未检测到 docker，请先运行 install-docker.sh 安装${plain}"
+        exit 1
+    }
+}
+
+#@include lib/common.sh
+
+container_exists()  { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER}"; }
+# 用真实 State.Status 判断，而不是 `docker ps`——崩溃重启中的容器 `docker ps`
+# 也会列出（Restarting），会把 crash-loop 误判成"已运行"。只有 status==running
+# 才算真在跑（restarting/exited/created 都不算）。
+container_running() { [[ "$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null)" == "running" ]]; }
+
+# 删旧建新（update / 首次 bootstrap / 证书挂载变化共用）。RUN_FLAGS 是首启引导参数；
+# 因为 entrypoint 只在 panel.json 不存在时生成，重建不会覆盖已有配置。
+#
+# 除了整体挂载 ${CONFIG_DIR}，还把 server.json 引用的证书所在目录按原路径只读挂进去
+# （cert_mount_dirs），容器里看到的证书路径和宿主机一模一样。
+container_recreate() {
+    require_docker
+    local -a cert_mounts=()
+    local d
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] && cert_mounts+=(--mount "type=bind,source=${d},target=${d},readonly")
+    done < <(cert_mount_dirs)
+    docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+    docker run -d \
+        --name "${CONTAINER}" \
+        --network host \
+        --restart "${RESTART}" \
+        --log-opt max-size="${LOG_MAX_SIZE}" \
+        --log-opt max-file="${LOG_MAX_FILE}" \
+        -v "${CONFIG_DIR}:${CONFIG_DIR}" \
+        "${cert_mounts[@]}" \
+        "${IMAGE}" "${RUN_FLAGS[@]}"
+}
+
+# docker run -d 只要容器被创建就返回 0，即使入口随即退出（例如缺证书）。
+# 采样两次 State.Status + RestartCount：既要当前在 running，又要重启计数不再增长，
+# 才算真正起来了——否则是 crash-loop（缺证书等会不停重启，单次采样可能恰好抓到
+# 短暂的 running）。
+verify_running() {
+    sleep 2
+    container_running || return 1
+    local r1 r2
+    r1="$(docker inspect -f '{{.RestartCount}}' "${CONTAINER}" 2>/dev/null)"
+    sleep 3
+    container_running || return 1
+    r2="$(docker inspect -f '{{.RestartCount}}' "${CONTAINER}" 2>/dev/null)"
+    [[ "${r1}" == "${r2}" ]]
+}
+
+# 从镜像引用里取出 repo（去掉 tag 和 @digest）。正确区分 registry 端口冒号与
+# tag 冒号：tag 冒号只会出现在最后一个 / 之后的段里，所以只有当最后一段含冒号
+# 时才去掉 tag。否则 ${IMAGE%:*} 会把 localhost:5000/img 误截成 localhost。
+image_repo() {
+    local ref="${1%@*}"        # 去掉 @sha256:... digest
+    local last="${ref##*/}"    # 最后一段（name[:tag]）
+    if [[ "${last}" == *:* ]]; then
+        ref="${ref%:*}"        # 最后一段带 tag → 去掉（此时末尾冒号即 tag 冒号）
+    fi
+    printf '%s' "${ref}"
+}
+
+check_status() {
+    require_docker
+    container_exists || return 2
+    container_running || return 1
+    return 0
+}
+
+# 容器的 restart 策略（no / always / unless-stopped / on-failure）
+container_restart_policy() {
+    docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "${CONTAINER}" 2>/dev/null
+}
+
+# dockerd 本身是否开机自启——容器 --restart 策略只有在 docker 服务开机启动时才生效
+docker_daemon_enabled() {
+    systemctl is-enabled --quiet docker 2>/dev/null
+}
+
+# 开机自启 = 容器 restart 策略 + docker 服务开机自启，两者都要满足
+show_enable_status() {
+    local pol; pol="$(container_restart_policy)"
+    if [[ "${pol}" == "always" || "${pol}" == "unless-stopped" ]]; then
+        echo -e "是否开机自启：${green}是${plain}（容器 --restart=${pol}）"
+    else
+        echo -e "是否开机自启：${red}否${plain}（容器 --restart=${pol:-无}）"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && ! docker_daemon_enabled; then
+        echo -e "  ${yellow}⚠ docker 服务未开机自启，容器重启后不会自动拉起：systemctl enable docker${plain}"
+    fi
+    show_bbr_status
+}
+
+start() {
+    require_docker
+    if ! node_guard_start; then
+        if [[ $# == 0 ]]; then before_show_menu; fi
+        return 1
+    fi
+    local rc=0
+    if container_running; then
+        echo -e "${green}${APP_NAME} 已运行，无需再次启动${plain}"
+    elif container_ensure && verify_running; then
+        echo -e "${green}${APP_NAME} 启动成功${plain}"
+    else
+        echo -e "${red}${APP_NAME} 启动失败（容器未在运行，可能缺证书），请用 singr log 查看日志${plain}"; rc=1
+    fi
+    if [[ $# == 0 ]]; then before_show_menu; fi
+    return ${rc}
+}
+
+stop() {
+    require_docker
+    local rc=0
+    if docker stop "${CONTAINER}" >/dev/null 2>&1; then
+        echo -e "${green}${APP_NAME} 停止成功${plain}"
+    else
+        echo -e "${red}${APP_NAME} 停止失败${plain}"; rc=1
+    fi
+    if [[ $# == 0 ]]; then before_show_menu; fi
+    return ${rc}
+}
+
+restart() {
+    require_docker
+    if ! node_guard_start; then
+        if [[ $# == 0 ]]; then before_show_menu; fi
+        return 1
+    fi
+    local rc=0
+    # 证书挂载变了（singr config 改了证书路径等）就重建，否则就地重启。
+    if container_ensure && verify_running; then
+        echo -e "${green}${APP_NAME} 重启成功${plain}"
+    else
+        echo -e "${red}${APP_NAME} 重启失败（容器未在运行，可能缺证书），请用 singr log 查看日志${plain}"; rc=1
+    fi
+    if [[ $# == 0 ]]; then before_show_menu; fi
+    return ${rc}
+}
+
+status() {
+    require_docker
+    docker ps -a --filter "name=^/${CONTAINER}$" \
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null || true
+    if container_exists; then echo; show_enable_status; fi
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+enable() {
+    require_docker
+    container_exists || { echo -e "${red}容器不存在，请先 singr start${plain}"; if [[ $# == 0 ]]; then before_show_menu; fi; return 1; }
+    docker update --restart=always "${CONTAINER}" >/dev/null 2>&1 || true
+    # 容器自启依赖 dockerd 自身开机启动，一并设上，否则重启后不生效
+    systemctl enable docker >/dev/null 2>&1 || true
+    RESTART="always"; save_restart
+    echo -e "${green}${APP_NAME} 已设置开机自启（容器 --restart=always + docker 服务开机自启）${plain}"
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+disable() {
+    require_docker
+    # 只取消容器自启，不动 docker 服务（宿主机可能还跑着别的容器）
+    docker update --restart=no "${CONTAINER}" >/dev/null 2>&1 || true
+    RESTART="no"; save_restart
+    echo -e "${green}${APP_NAME} 已取消开机自启（容器 --restart=no；docker 服务未改动）${plain}"
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+save_restart() {
+    [[ -f "${DOCKER_CONF}" ]] || return 0
+    if grep -q '^RESTART=' "${DOCKER_CONF}"; then
+        sed -i "s/^RESTART=.*/RESTART=\"${RESTART}\"/" "${DOCKER_CONF}"
+    else
+        echo "RESTART=\"${RESTART}\"" >> "${DOCKER_CONF}"
+    fi
+}
+
+# 用 # 作分隔符，IMAGE 里的 / 不会破坏 sed。
+save_image() {
+    [[ -f "${DOCKER_CONF}" ]] || return 0
+    if grep -q '^IMAGE=' "${DOCKER_CONF}"; then
+        sed -i "s#^IMAGE=.*#IMAGE=\"${IMAGE}\"#" "${DOCKER_CONF}"
+    else
+        echo "IMAGE=\"${IMAGE}\"" >> "${DOCKER_CONF}"
+    fi
+}
+
+show_log() {
+    require_docker
+    docker logs -f --tail 200 "${CONTAINER}"
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+update_singr() {
+    require_docker
+    local version="${2:-}"
+    if [[ $# == 0 ]]; then
+        read -r -p "输入指定版本（如 v0.5.0 或 0.5.0），留空为最新版: " version
+    fi
+
+    # 无版本 → :latest 频道；指定版本 → 换 tag。docker tag 同时提供 v 前缀与纯
+    # semver 两种，用户给哪种都行，不做前缀改写。
+    local repo image
+    repo="$(image_repo "${IMAGE}")"
+    if [[ -n "${version}" ]]; then
+        image="${repo}:${version}"
+    else
+        image="${repo}:latest"
+    fi
+
+    echo -e "${green}拉取镜像：${image}${plain}"
+    if ! docker pull "${image}"; then
+        echo -e "${red}镜像拉取失败，未做变更${plain}"
+        if [[ $# == 0 ]]; then before_show_menu; fi
+        return 1
+    fi
+
+    IMAGE="${image}"
+    save_image
+    # 没有节点时进程起不来，重建出来的容器会按 --restart 无限重启。删掉旧容器（它还挂着
+    # 旧镜像），singr add 添加节点时 container_ensure 会用新镜像重建。
+    if node_none_configured; then
+        docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+        echo -e "${green}镜像已更新为 ${image}${plain}。当前没有节点，容器未启动；singr add 添加节点后自动用新镜像启动"
+        if [[ $# == 0 ]]; then before_show_menu; fi
+        return 0
+    fi
+    local rc=0
+    if container_recreate && verify_running; then
+        show_version 0
+        echo -e "${green}更新完成${plain}"
+    else
+        echo -e "${red}容器未能正常启动（可能证书缺失或新镜像有问题），请用 singr log 查看日志。旧容器已被替换。${plain}"; rc=1
+    fi
+    if [[ $# == 0 ]]; then before_show_menu; fi
+    return ${rc}
+}
+
+uninstall_singr() {
+    confirm "确定要卸载 ${APP_NAME}（docker）吗？配置目录 ${CONFIG_DIR} 也会被删除" "n" || {
+        [[ $# == 0 ]] && show_menu
+        return 0
+    }
+    require_docker
+    docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+    docker rmi "${IMAGE}" >/dev/null 2>&1 || true
+
+    # 清理 Hysteria2 端口跳跃：flush 活动 NAT 规则 + 停用并删除 singr-porthop.service，
+    # 否则 UDP 重定向会残留，且服务会引用即将被删除的 /usr/bin/SingR。
+    porthop_flush_all
+    if [[ -f "${PORTHOP_SERVICE_FILE}" ]]; then
+        systemctl disable --now "${PORTHOP_SERVICE}" >/dev/null 2>&1 || true
+        rm -f "${PORTHOP_SERVICE_FILE}"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    cert_timer_remove
+
+    rm -rf "${CONFIG_DIR}"
+    echo -e "${green}卸载成功${plain}"
+    echo "如需删除管理脚本，请运行：rm -f /usr/bin/SingR /usr/bin/singr"
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+config() {
+    local editor="${EDITOR:-vi}"
+    echo "1. 修改面板配置：${CONFIG_DIR}/panel.json"
+    echo "2. 修改 sing-box 配置：${CONFIG_DIR}/server.json"
+    read -r -p "请选择 [1-2，默认 1]: " num
+    case "${num}" in
+        2) "${editor}" "${CONFIG_DIR}/server.json" ;;
+        *) "${editor}" "${CONFIG_DIR}/panel.json" ;;
+    esac
+    confirm "是否重启 ${APP_NAME}" "y" && restart 0
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+show_version() {
+    require_docker
+    # docker 下「版本」分两层：docker.conf 里锁定的镜像 tag，和容器内二进制自报版本。
+    echo -e "${green}配置镜像（docker.conf）：${plain}${IMAGE}"
+    if container_exists; then
+        echo -e "${green}容器当前镜像：${plain}$(docker inspect -f '{{.Config.Image}}' "${CONTAINER}" 2>/dev/null)"
+    fi
+    echo -e "${green}二进制版本：${plain}"
+    if container_running; then
+        docker exec "${CONTAINER}" singr version 2>&1 | sed 's/^/  /'
+    elif docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        echo -e "  ${yellow}(容器未运行，取镜像内二进制)${plain}"
+        docker run --rm --entrypoint singr "${IMAGE}" version 2>&1 | sed 's/^/  /'
+    else
+        echo -e "  ${red}容器未运行且本地无镜像 ${IMAGE}，无法查看。可先 singr start 或 docker pull${plain}"
+    fi
+    if [[ $# == 0 ]]; then before_show_menu; fi
+}
+
+show_status() {
+    check_status
+    case $? in
+        0) echo -e "${APP_NAME} 状态：${green}已运行${plain}"; show_enable_status ;;
+        1) echo -e "${APP_NAME} 状态：${yellow}未运行（容器已创建）${plain}"; show_enable_status ;;
+        2) echo -e "${APP_NAME} 状态：${red}未安装（无容器）${plain}" ;;
+    esac
+}
+
+#@include lib/node.sh
+
+# ---- 节点管理：docker 后端实现（SYNC BLOCK 的钩子 + 证书挂载）----
+#
+# 证书和裸机一样原地引用：server.json 里写的就是宿主机上的真实路径，容器靠"同路径
+# 只读挂载"看到它们。要挂哪些目录由 cert_mount_dirs 从 server.json 现算，不另存一份
+# 登记；container_ensure 发现挂载集合变了就重建容器（挂载在 docker run 时就定死了，
+# docker restart 改不了）。
+#
+# 只挂目录，不挂文件：certbot 之类都是 rename 原子替换，文件级 bind mount 钉住的是
+# 旧 inode，容器里永远读不到新证书。挂目录则续期后容器内立刻可见，二进制自己监视
+# 证书文件（common/tls/std_server.go 的 fswatch）并重新加载，不用重启。
+#
+# 旧版本是"复制进挂载目录 + certs.json 登记源 + certs_sync 每次重启前重新复制"，
+# 前提是"证书不热重载，反正要重启"——这个前提不成立。certs_migrate 负责把旧机器
+# 迁过来。
+
+CERTS_MAP="${CONFIG_DIR}/certs.json"   # 旧版本的证书源登记，只有 certs_migrate 还认它
+CERT_MIGRATION_NOTICE="${CONFIG_DIR}/cert-migration-notice.txt"
+
+# 目录 d 能否同路径挂进容器。不能时把原因回显到 stdout 并返回 0（"有问题"）。
+#   · `:` 和 `,` 是 --mount 的分隔符，没法转义。
+#   · 系统目录：同路径挂载会把容器里的同名目录整个盖掉 —— /etc 盖掉就没了 CA 证书，
+#     /usr 盖掉连二进制都没了，/tmp 只读会让 entrypoint 的 mktemp 失败。
+cert_mount_problem() {
+    local d="$1"
+    case "${d}" in
+        *:* | *,*)
+            printf '%s' "${d} 含 : 或 ,，docker --mount 无法表达"
+            return 0
+            ;;
+        / | /bin | /boot | /dev | /etc | /lib | /lib32 | /lib64 | /libx32 | /opt | /proc | /run | /sbin | /sys | /tmp | /usr | /var | \
+            /bin/* | /dev/* | /lib/* | /lib64/* | /proc/* | /run/* | /sbin/* | /sys/* | /usr/* | /opt/singr | /opt/singr/*)
+            printf '%s' "${d} 是系统目录，同路径挂载会盖掉容器里的同名目录；请把证书放进单独的子目录"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 一个证书文件要挂的目录：它所在的目录，加上解析符号链接后真实文件所在的目录。
+# certbot 的 live/<域名>/fullchain.pem 是指向 ../../archive/<域名>/ 的软链，只挂
+# live/<域名> 容器里就是断链。落在 ${CONFIG_DIR} 下的已经整体挂载，不再输出。
+cert_dirs_for() {
+    local p="$1" d real=""
+    [[ -e "${p}" ]] && real="$(readlink -f "${p}" 2>/dev/null)"
+    for d in "$(dirname "${p}")" "${real:+$(dirname "${real}")}"; do
+        [[ -n "${d}" ]] || continue
+        case "${d}/" in "${CONFIG_DIR}/"*) continue ;; esac
+        printf '%s\n' "${d}"
+    done
+}
+
+# 添加节点 / 首次安装时的预检：0 = 这个证书路径挂得进容器。不行时原因打到 stderr。
+cert_path_mountable() {
+    local p="$1" d why
+    if [[ "${p}" != /* ]]; then
+        echo -e "${red}证书路径必须是绝对路径：${p}${plain}" >&2
+        return 1
+    fi
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        if why="$(cert_mount_problem "${d}")"; then
+            echo -e "${red}无法把证书目录挂进容器：${why}${plain}" >&2
+            return 1
+        fi
+    done < <(cert_dirs_for "${p}")
+    return 0
+}
+
+# 容器需要的证书挂载目录，每行一个：排序去重，并去掉已被其他目录包含的子目录。
+#
+# 来源：server.json 存在就只看它（含 TLS 为空、走默认证书的 inbound —— default.pem
+# 可以是指向别处的软链）；还不存在（首次安装、entrypoint 尚未生成配置）就看 RUN_FLAGS
+# 里交给 entrypoint 的 --cert-path / --key-path。两者不能取并集：RUN_FLAGS 永久留在
+# docker.conf 里，用户事后换了证书、删了旧目录，--mount 遇到不存在的源会直接拒绝
+# 建容器。同理，不存在的目录不挂，交给 entrypoint 报出"缺证书：<路径>"。
+cert_mount_dirs() {
+    local -a paths=()
+    local p d why tag pair i
+    if [[ -f "${SERVER_CONFIG}" ]]; then
+        if ! command -v jq >/dev/null 2>&1; then
+            echo -e "${yellow}[证书] 未安装 jq，无法计算证书挂载${plain}" >&2
+            return 0
+        fi
+        while IFS= read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            pair="$(node_effective_cert "${tag}")"
+            paths+=("${pair%%|*}" "${pair##*|}")
+        done < <(jq -r '.inbounds[]? | select(.tls.enabled == true) | (.tag // empty)' "${SERVER_CONFIG}" 2>/dev/null)
+    else
+        for ((i = 0; i < ${#RUN_FLAGS[@]}; i++)); do
+            case "${RUN_FLAGS[i]}" in
+                --cert-path | --key-path) paths+=("${RUN_FLAGS[i + 1]:-}") ;;
+            esac
+        done
+    fi
+    for p in "${paths[@]}"; do
+        [[ -n "${p}" ]] || continue
+        if [[ "${p}" != /* ]]; then
+            echo -e "${yellow}[证书] 不是绝对路径，容器内无法解析：${p}${plain}" >&2
+            continue
+        fi
+        while IFS= read -r d; do
+            [[ -n "${d}" && -d "${d}" ]] || continue
+            if why="$(cert_mount_problem "${d}")"; then
+                echo -e "${yellow}[证书] 跳过挂载：${why}${plain}" >&2
+                continue
+            fi
+            printf '%s\n' "${d}"
+        done < <(cert_dirs_for "${p}")
+    done | LC_ALL=C sort -u |
+        awk '{ for (k in kept) if (index($0, kept[k] "/") == 1) next; kept[NR] = $0; print }'
+}
+
+# 容器当前的证书挂载（不含整体挂载的 ${CONFIG_DIR}），格式同 cert_mount_dirs。
+container_cert_mounts() {
+    docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "${CONTAINER}" 2>/dev/null |
+        grep -vxF "${CONFIG_DIR}" | grep -v '^$' | LC_ALL=C sort -u
+}
+
+# 让容器跑在当前配置上：挂载没变就 docker restart / start，变了（或容器不存在）就
+# 重建。start / restart / 节点增删都走这里，所以 singr config、singr add 改了证书
+# 路径之后，下一次重启自然带上新挂载。
+container_ensure() {
+    if container_exists && [[ "$(cert_mount_dirs 2>/dev/null)" == "$(container_cert_mounts)" ]]; then
+        if container_running; then
+            docker restart "${CONTAINER}" >/dev/null
+        else
+            docker start "${CONTAINER}" >/dev/null
+        fi
+    else
+        container_recreate >/dev/null
+    fi
+}
+
+node_backend_place_cert() {
+    local cert_src="$2" key_src="$3" p
+    for p in "${cert_src}" "${key_src}"; do
+        [[ -s "${p}" ]] || {
+            echo -e "${red}找不到证书文件：${p}${plain}" >&2
+            return 1
+        }
+        cert_path_mountable "${p}" || return 1
+    done
+    printf '%s|%s' "${cert_src}" "${key_src}"
+}
+
+node_backend_restart() {
+    container_ensure || true
+}
+
+node_backend_verify() { verify_running; }
+
+# 没有节点时进程一启动就退出，容器的 --restart 策略会让它（含开机后）无限重启。
+# 只改容器当前的策略、不写 docker.conf：node_backend_resume 按 docker.conf 的 RESTART
+# 恢复，重建容器时也天然用回它。自启是这里关掉的才留标记。
+AUTOSTART_PAUSED="${CONFIG_DIR}/autostart-paused"
+
+node_backend_idle() {
+    case "$(container_restart_policy)" in
+        always | unless-stopped | on-failure*)
+            if docker update --restart=no "${CONTAINER}" >/dev/null 2>&1; then
+                : >"${AUTOSTART_PAUSED}"
+                echo -e "${yellow}已暂停容器自动重启（添加节点后自动恢复）${plain}"
+            fi
+            ;;
+    esac
+    docker stop "${CONTAINER}" >/dev/null 2>&1 || true
+}
+
+node_backend_resume() {
+    [[ -f "${AUTOSTART_PAUSED}" ]] || return 0
+    if container_exists; then
+        docker update --restart="${RESTART}" "${CONTAINER}" >/dev/null 2>&1 || return 0
+    fi
+    rm -f "${AUTOSTART_PAUSED}"
+    echo -e "${green}已恢复容器自动重启（--restart=${RESTART}）${plain}"
+}
+
+node_cert_renew_hint() {
+    echo -e "${yellow}证书续期提示：容器按原路径挂载证书所在目录，续期（certbot renew 等）后进程会"
+    echo -e "自动重新加载，无需重启，也不需要 --deploy-hook（default.pem 软链到 certbot 的除外，"
+    echo -e "那种情况监视不到 live/ 里的变化，仍需 --deploy-hook \"singr restart\"）。默认证书可以用"
+    echo -e "  singr cert-source"
+    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。${plain}"
+}
+
+# 把旧版本（复制模型）的机器迁到原地引用。certs.json 存在才跑，跑完改名，所以是一次
+# 性的。调用点在脚本入口（见末尾分发），任何一条 singr 命令都会触发 —— 包括 certbot
+# 钩子里残留的 `singr cert-sync`。只挂在 start/restart 上的话，升级了脚本却没重启的
+# 机器会一直用着不再同步的旧副本，直到证书过期。
+#
+# 逐条处理 {"<intag>": {"cert": 源, "key": 源}}：
+#   · inbound 已不存在            → 残留登记，丢弃
+#   · inbound 用默认证书（TLS 为空）→ 丢弃登记。default.pem 只剩一份不再同步的旧副本，
+#                                    记进提示文件
+#   · 显式路径指向挂载目录里的副本 → 改写回源路径，副本移进 certs/.migrated-<时间>/
+#   · 源已不存在 / 源目录挂不进容器 → 保留副本和现有路径，记进提示文件
+# 有改写且容器在运行，就重建并校验；起不来则还原 server.json、按旧挂载重建，保留
+# certs.json，下次再试。
+certs_migrate() {
+    [[ -f "${CERTS_MAP}" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    command -v docker >/dev/null 2>&1 || return 0
+
+    local stamp notices="" rewritten=0 tag src_cert src_key cur_cert cur_key tmp c
+    local -a copies=()
+    stamp="$(date +%Y%m%d%H%M%S)"
+    echo -e "${yellow}[证书] 检测到旧版本的证书登记 ${CERTS_MAP}，迁移为原地引用（容器直接挂载证书所在目录）...${plain}"
+
+    if [[ -f "${SERVER_CONFIG}" ]]; then
+        cp -f "${SERVER_CONFIG}" "${SERVER_CONFIG}.migrate-bak" || return 0
+        while IFS=$'\t' read -r tag src_cert src_key; do
+            [[ -n "${tag}" ]] || continue
+            node_inbound_exists "${tag}" || continue
+            cur_cert="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.certificate_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+            cur_key="$(jq -r --arg t "${tag}" '(first(.inbounds[]? | select(.tag==$t) | .tls.key_path)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+            if [[ -z "${cur_cert}" && -z "${cur_key}" ]]; then
+                notices+="${tag}: 使用默认证书 $(node_default_cert_path)，它是 ${src_cert} 的旧副本，今后不再自动同步。
+    处理办法：singr cert-source 配置默认证书更新源；或用 singr config 把该 inbound 的
+    certificate_path / key_path 写成 ${src_cert} / ${src_key} 后重启。
+"
+                continue
+            fi
+            case "${cur_cert}" in "${CONFIG_DIR}"/*) ;; *) continue ;; esac
+            [[ "${src_cert}" == "${cur_cert}" ]] && continue
+            if [[ ! -s "${src_cert}" || ! -s "${src_key}" ]]; then
+                notices+="${tag}: 证书源 ${src_cert} 已不存在，继续使用副本 ${cur_cert}，今后不再自动同步。
+"
+                continue
+            fi
+            if ! cert_path_mountable "${src_cert}" 2>/dev/null || ! cert_path_mountable "${src_key}" 2>/dev/null; then
+                notices+="${tag}: 证书源 ${src_cert} 所在目录挂不进容器，继续使用副本 ${cur_cert}，今后不再自动同步。
+"
+                continue
+            fi
+            tmp="$(mktemp)" || continue
+            if jq --arg t "${tag}" --arg c "${src_cert}" --arg k "${src_key}" '
+                .inbounds |= map(if .tag == $t then (.tls.certificate_path = $c | .tls.key_path = $k) else . end)
+            ' "${SERVER_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${SERVER_CONFIG}"; then
+                rewritten=1
+                copies+=("${cur_cert}" "${cur_key}")
+                echo -e "${green}[证书] ${tag}: 改为直接引用 ${src_cert}${plain}"
+            else
+                rm -f "${tmp}"
+            fi
+        done < <(jq -r 'to_entries[] | [.key, (.value.cert // ""), (.value.key // "")] | @tsv' "${CERTS_MAP}" 2>/dev/null)
+    fi
+
+    if [[ "${rewritten}" == 1 ]] && container_running; then
+        container_recreate >/dev/null
+        if ! verify_running; then
+            echo -e "${red}[证书] 迁移后容器未能正常启动，已还原 server.json；${CERTS_MAP} 保留，下次执行 singr 命令时重试${plain}"
+            mv -f "${SERVER_CONFIG}.migrate-bak" "${SERVER_CONFIG}"
+            container_recreate >/dev/null
+            verify_running || echo -e "${red}[证书] 还原后仍未能启动，请立即用 singr log 排查${plain}"
+            return 1
+        fi
+    fi
+    rm -f "${SERVER_CONFIG}.migrate-bak"
+
+    # 不再被任何 inbound 引用的旧副本收起来（不删：里面有私钥，留给运维决定）。
+    for c in "${copies[@]}"; do
+        [[ -f "${c}" ]] || continue
+        jq -e --arg p "${c}" '[.inbounds[]?.tls | (.certificate_path // ""), (.key_path // "")] | index($p) != null' \
+            "${SERVER_CONFIG}" >/dev/null 2>&1 && continue
+        mkdir -m 700 -p "${CERT_DIR}/.migrated-${stamp}" && mv -f "${c}" "${CERT_DIR}/.migrated-${stamp}/"
+    done
+    mv -f "${CERTS_MAP}" "${CERTS_MAP}.migrated-${stamp}"
+
+    if [[ -n "${notices}" ]]; then
+        printf '# %s 从复制模型迁移时，以下证书没法自动续期。处理完删掉本文件。\n%s\n' \
+            "$(date '+%F %T')" "${notices}" >>"${CERT_MIGRATION_NOTICE}"
+        echo -e "${yellow}[证书] 以下证书迁移后不再自动续期（已记入 ${CERT_MIGRATION_NOTICE}）：${plain}"
+        printf '%s' "${notices}"
+    fi
+    echo -e "${green}[证书] 迁移完成，不再需要 singr cert-sync / certbot --deploy-hook${plain}"
+    return 0
+}
+
+#@include lib/cert-source.sh
+
+#@include lib/derp.sh
+
+#@include lib/porthop.sh
+
+show_usage() {
+    echo "${APP_NAME} 管理脚本使用方法（Docker 版）："
+    echo "------------------------------------------"
+    echo "SingR 或 singr              显示管理菜单"
+    echo "singr start                 启动 SingR 容器"
+    echo "singr stop                  停止容器"
+    echo "singr restart               重启容器"
+    echo "singr status                查看容器状态"
+    echo "singr enable                设置开机自启 (--restart=always)"
+    echo "singr disable               取消开机自启 (--restart=no)"
+    echo "singr log                   查看容器日志"
+    echo "singr update [版本]         拉取镜像并重建（留空=最新，或指定 v0.5.0）"
+    echo "singr config                修改配置并重启"
+    echo "singr version               查看版本"
+    echo "singr uninstall             卸载（删容器与配置）"
+    echo "singr update_shell          更新管理脚本"
+    echo "singr porthop               Hysteria2 端口跳跃管理"
+    echo "------------------------------------------"
+    echo "singr list                  查看当前节点"
+    echo "singr add [参数]            添加节点（不带参数则逐项询问）"
+    echo "singr del <@序号>           删除节点，序号取自 singr list 的 # 列"
+    echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
+    echo "singr cert-source           查看/配置默认证书的远程更新源"
+    echo "singr cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
+    echo "singr derp [子命令]         DERP 中继（组网）：enable/disable/port，详见 singr derp help"
+    echo "------------------------------------------"
+    echo "添加节点参数："
+    echo "  --api-url URL --api-key KEY --node-id N [--protocol anytls|hysteria2|naive]"
+    echo "  （协议按面板节点的 path 自动判断：/anytls、/hy2、/naive；给了 --protocol 只做校验）"
+    echo "  --sni HOST --cert-path PATH --key-path PATH（宿主机路径，容器按原路径挂载）"
+    echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
+    echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"
+    echo "  [--speed-limit 0] [--device-limit 0] [--enable-device-limit false]"
+    echo "  [--update-periodic 60]"
+    echo "------------------------------------------"
+}
+
+show_menu() {
+    local line="  ${green}──────────────────────────────────────${plain}"
+    echo -e "
+  ${green}${APP_NAME} 后端管理脚本（Docker）${plain}
+${line}
+  0. 修改配置
+${line}
+  2. 更新 SingR（拉镜像重建）
+  3. 卸载 SingR
+${line}
+  4. 启动 SingR
+  5. 停止 SingR
+  6. 重启 SingR
+  7. 查看 SingR 状态
+  8. 查看 SingR 日志
+${line}
+  9. 设置开机自启
+ 10. 取消开机自启
+${line}
+ 11. 查看 SingR 版本
+ 12. 更新管理脚本
+${line}
+ 13. Hysteria2 端口跳跃管理
+ 14. 节点管理（查看 / 添加 / 删除）
+ 15. 默认证书更新源
+ 16. DERP 中继（组网）
+${line}"
+    show_status | sed 's/^/  /'
+    echo -e "${line}"
+    # 没装好 / 没有 jq 时节点列表是空的，别留下两条挨着的分割线。
+    local nodes
+    nodes="$(node_list_brief)"
+    if [[ -n "${nodes}" ]]; then
+        printf '%s\n' "${nodes}"
+        echo -e "${line}"
+    fi
+    read -r -p "请输入选择 [0-16]: " num
+    case "${num}" in
+        0) config ;;
+        2) update_singr ;;
+        3) uninstall_singr ;;
+        4) start ;;
+        5) stop ;;
+        6) restart ;;
+        7) status ;;
+        8) show_log ;;
+        9) enable ;;
+        10) disable ;;
+        11) show_version ;;
+        12) update_shell ;;
+        13) porthop_menu && before_show_menu ;;
+        14) node_menu && before_show_menu ;;
+        15) cert_source_cmd; before_show_menu ;;
+        16) derp_cmd; before_show_menu ;;
+        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" && before_show_menu ;;
+    esac
+}
+
+# 旧版本证书登记的一次性迁移（见 certs_migrate）。卸载、更新脚本自身、开机重放端口
+# 跳跃规则这几条不触发：前两者马上就不需要它了，后者跑在开机路径上，dockerd 此时
+# 也正在拉起容器，不该在这里重建。
+case "${1:-}" in
+    uninstall | update_shell | porthop-apply | porthop-flush) ;;
+    *) certs_migrate ;;
+esac
+
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        start) start 0 ;;
+        stop) stop 0 ;;
+        restart) restart 0 ;;
+        status) status 0 ;;
+        enable) enable 0 ;;
+        disable) disable 0 ;;
+        log) show_log 0 ;;
+        update) update_singr 0 "${2:-}" ;;
+        config) config 0 ;;
+        uninstall) uninstall_singr 0 ;;
+        version) show_version 0 ;;
+        update_shell) update_shell ;;
+        list | nodes) node_list ;;
+        add) shift; node_add "$@" ;;
+        del | delete | rm) node_del "${2:-}" ;;
+        cert-source) shift; cert_source_cmd "$@" ;;
+        cert-update) cert_update_cmd "${2:-}" ;;
+        derp) shift; derp_cmd "$@" ;;
+        porthop) porthop_menu ;;
+        porthop-apply) porthop_reapply_all ;;
+        porthop-flush) porthop_flush_all ;;
+        _bootstrap) container_recreate ;;   # 供 install-docker.sh 首次创建调用
+        _cert-mount-check) cert_path_mountable "${2:-}" && cert_path_mountable "${3:-}" ;;   # 供 install-docker.sh 预检
+        # 供 install-docker.sh 判断首个节点的协议，规则只维护一份（SYNC BLOCK 里的 node_panel_detect）。
+        # api-key 从 stdin 读，不进命令行。stdout 只输出协议名。
+        _panel-detect)
+            node_require_jq >&2 || exit 1
+            IFS= read -r _api_key
+            _detected="$(node_panel_detect "${2:-}" "${_api_key}" "${3:-}" "${4:-V2ray}" "${5:-20}")" || exit 1
+            printf '%s\n' "${_detected%%$'\t'*}"
+            ;;
+        *) show_usage ;;
+    esac
+else
+    show_menu
+fi

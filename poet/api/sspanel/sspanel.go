@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"reflect"
 	"regexp"
@@ -127,9 +128,21 @@ func (c *APIClient) assembleURL(path string) string {
 	return c.APIHost + path
 }
 
+// requestError strips the request URL out of a transport error. net/http
+// wraps every failure in a *url.Error whose text repeats the full URL, and
+// ours carries the panel key as a query parameter (?key=…&muKey=…) — printed
+// as is, a panel that is briefly unreachable writes the key into the log.
+func requestError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
+}
+
 func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (*Response, error) {
 	if err != nil {
-		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
+		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), requestError(err))
 	}
 	if res == nil {
 		return nil, fmt.Errorf("request %s failed: empty response", c.assembleURL(path))
@@ -187,7 +200,7 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		Get(path)
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
 	if err == nil && res != nil && res.StatusCode() == 304 {
-		return nil, errors.New(api.NodeNotModified)
+		return nil, api.ErrNodeNotModified
 	}
 
 	var responseETag string
@@ -224,11 +237,12 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 			nodeInfo, err = c.ParseV2rayNodeResponse(nodeInfoResponse)
 		case "trojan":
 			nodeInfo, err = c.ParseTrojanNodeResponse(nodeInfoResponse)
-		case "shadowsocks":
-			nodeInfo, err = c.ParseSSNodeResponse(nodeInfoResponse)
-		case "shadowsocks-plugin":
-			nodeInfo, err = c.ParseSSPluginNodeResponse(nodeInfoResponse)
 		default:
+			// Shadowsocks / Shadowsocks-Plugin used to be parsed here
+			// (XrayR inheritance), but no SingR inbound can take panel
+			// users for them, so such a node only failed later, at the
+			// first user sync. It now fails here, with the node type in
+			// the message.
 			return nil, fmt.Errorf("unsupported Node type: %s", c.NodeType)
 		}
 	} else {
@@ -261,7 +275,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		Get(path)
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
 	if err == nil && res != nil && res.StatusCode() == 304 {
-		return nil, errors.New(api.UserNotModified)
+		return nil, api.ErrUserNotModified
 	}
 
 	var responseETag string
@@ -391,7 +405,7 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
 	if err == nil && res != nil && res.StatusCode() == 304 {
-		return nil, errors.New(api.RuleNotModified)
+		return nil, api.ErrRuleNotModified
 	}
 
 	var responseETag string
@@ -573,112 +587,6 @@ func (c *APIClient) ParseV2rayNodeResponse(nodeInfoResponse *NodeInfoResponse) (
 		TrafficRate:       trafficRate,
 		RelayServer:       relayServer,
 		RelayPort:         uint32(relayPort),
-	}
-
-	return nodeInfo, nil
-}
-
-// ParseSSNodeResponse parse the response for the given node info format
-func (c *APIClient) ParseSSNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var port uint32 = 0
-	var speedLimit uint64 = 0
-	var method string
-	path := "/mod_mu/users"
-	res, err := c.client.R().
-		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetResult(&Response{}).
-		ForceContentType("application/json").
-		Get(path)
-
-	response, err := c.parseResponse(res, path, err)
-	if err != nil {
-		return nil, err
-	}
-
-	userListResponse := new([]UserResponse)
-
-	if err := json.Unmarshal(response.Data, userListResponse); err != nil {
-		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(userListResponse), err)
-	}
-
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          c.NodeType,
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		TransportProtocol: "tcp",
-		CypherMethod:      method,
-	}
-
-	return nodeInfo, nil
-}
-
-// ParseSSPluginNodeResponse parse the response for the given node info format
-func (c *APIClient) ParseSSPluginNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var enableTLS bool
-	var path, host, transportProtocol string
-	var speedLimit uint64 = 0
-
-	serverConf := strings.Split(nodeInfoResponse.RawServerString, ";")
-	parsedPort, err := strconv.ParseInt(serverConf[1], 10, 32)
-	if err != nil {
-		return nil, err
-	}
-	port := uint32(parsedPort)
-	port = port - 1 // Shadowsocks-Plugin requires two ports, one for ss the other for other stream protocol
-	if port <= 0 {
-		return nil, fmt.Errorf("Shadowsocks-Plugin listen port must bigger than 1")
-	}
-	// Compatible with more node types config
-	for _, value := range serverConf[3:5] {
-		switch value {
-		case "tls":
-			enableTLS = true
-		case "ws":
-			transportProtocol = "ws"
-		case "obfs":
-			transportProtocol = "tcp"
-		}
-	}
-
-	extraServerConf := strings.Split(serverConf[5], "|")
-	for _, item := range extraServerConf {
-		conf := strings.Split(item, "=")
-		key := conf[0]
-		if key == "" {
-			continue
-		}
-		value := conf[1]
-		switch key {
-		case "path":
-			rawPath := strings.Join(conf[1:], "=") // In case of the path strings contains the "="
-			path = rawPath
-		case "host":
-			host = value
-		}
-	}
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          c.NodeType,
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		TransportProtocol: transportProtocol,
-		EnableTLS:         enableTLS,
-		Path:              path,
-		Host:              host,
 	}
 
 	return nodeInfo, nil

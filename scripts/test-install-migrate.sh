@@ -40,7 +40,7 @@ JSON
     migrate_config
     local cfg="${CONFIG_DIR}/server.json"
     assert_jq '.dns.strategy == "prefer_ipv6"' "${cfg}"
-    assert_jq '.dns.servers[0].tag == "google"' "${cfg}"
+    assert_jq '.dns.servers[0] == {"tag":"local","type":"local"}' "${cfg}"
     assert_jq '(.outbounds[] | select(.tag=="legacy") | .domain_resolver.strategy) == "ipv4_only"' "${cfg}"
     assert_jq '(.outbounds[] | select(.tag=="default") | .domain_resolver.strategy) == "prefer_ipv6"' "${cfg}"
     assert_jq '[.outbounds[] | has("domain_strategy")] | any | not' "${cfg}"

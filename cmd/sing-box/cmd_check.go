@@ -31,6 +31,8 @@ func check() error {
 	if err != nil {
 		return err
 	}
+	// SingR: check what `run` would actually build (see applyPanelOptions).
+	options = applyPanelOptions(options)
 	ctx, cancel := context.WithCancel(service.ExtendContext(globalCtx))
 	instance, err := box.New(box.Options{
 		Context: ctx,

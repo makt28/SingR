@@ -261,9 +261,20 @@ func certificateUnset(tlsOptions *option.InboundTLSOptions) bool {
 	return !tlsOptions.Insecure
 }
 
-func create(options option.Options) (*box.Box, context.CancelFunc, error) {
+// applyPanelOptions is everything SingR lays over the parsed config before a
+// box is built from it. `run` and `check` must both go through it: check used
+// to build from the raw config, so on a superset server.json (or one that
+// relies on the default certificate) it failed with "missing certificate" —
+// which also turned every SIGHUP reload into a no-op, because the reload
+// starts with a check.
+func applyPanelOptions(options option.Options) option.Options {
 	options = filterInboundsByPanel(options)
 	options = applyDefaultCertificatePaths(options)
+	return options
+}
+
+func create(options option.Options) (*box.Box, context.CancelFunc, error) {
+	options = applyPanelOptions(options)
 	if disableColor {
 		if options.Log == nil {
 			options.Log = &option.LogOptions{}

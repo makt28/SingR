@@ -2,6 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sagernet/sing-box/poet/api"
@@ -81,5 +84,50 @@ func TestAuthenticatorUserAliasesRefresh(t *testing.T) {
 	}
 	if _, found := authenticator.LoadUser("new-uuid"); !found {
 		t.Fatal("new alias did not resolve")
+	}
+}
+
+// AddIP's check-then-store must be atomic: many connections arriving at once
+// from distinct addresses may not all slip under the limit.
+func TestUserAddIPEnforcesLimitUnderConcurrency(t *testing.T) {
+	const limit = 3
+	user := &User{}
+	user.SetIPLimit(limit)
+
+	var admitted atomic.Int32
+	var wait sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			if user.AddIP(fmt.Sprintf("192.0.2.%d", i)) {
+				admitted.Add(1)
+			}
+		}(i)
+	}
+	wait.Wait()
+	if got := admitted.Load(); got != limit {
+		t.Fatalf("admitted %d distinct addresses, want %d", got, limit)
+	}
+	if got := user.GetIPNumber(); got != limit {
+		t.Fatalf("tracked addresses = %d, want %d", got, limit)
+	}
+
+	// A report cycle drains the table and frees the slots.
+	if drained := user.ResetIPTable(); len(drained) != limit {
+		t.Fatalf("drained %d addresses, want %d", len(drained), limit)
+	}
+	if !user.AddIP("198.51.100.1") {
+		t.Fatal("address refused after the table was drained")
+	}
+}
+
+// Limit 0 (EnableDeviceLimit off) admits everyone.
+func TestUserAddIPWithoutLimitAdmitsAll(t *testing.T) {
+	user := &User{}
+	for i := 0; i < 16; i++ {
+		if !user.AddIP(fmt.Sprintf("192.0.2.%d", i)) {
+			t.Fatalf("address %d refused although no limit is set", i)
+		}
 	}
 }

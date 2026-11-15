@@ -45,6 +45,10 @@ type Inbound struct {
 
 	// reloadMu serializes ConfigureFromPanelNode and Close.
 	reloadMu sync.Mutex
+	// closed is set by Close (under reloadMu). ConfigureFromPanelNode is a
+	// no-op afterwards: POET.Stop does not wait for a monitor tick already
+	// in flight, and that tick must not start a listener on a closed inbound.
+	closed bool
 	// tlsMu guards reads of tlsConfig from the connection accept path
 	// against hot-reload swaps.
 	tlsMu sync.RWMutex
@@ -129,38 +133,23 @@ func (h *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 	if nodeInfo == nil {
 		return nil
 	}
-	if nodeInfo.NodeType != C.TypeAnyTLS {
-		return api.NodeTypeMismatch(C.TypeAnyTLS, nodeInfo.NodeType)
-	}
-	if nodeInfo.Port <= 0 || nodeInfo.Port > 65535 {
-		return E.New("invalid anytls listen port from panel: ", nodeInfo.Port)
+	if err := api.ValidatePanelNode(C.TypeAnyTLS, nodeInfo); err != nil {
+		return err
 	}
 
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	// A panel tick still in flight after shutdown must not bring a new
+	// listener up on a closed inbound.
+	if h.closed {
+		return nil
+	}
 
+	update := api.PlanListenUpdate(nodeInfo, h.options.ListenPort, h.options.TLS)
 	newOpts := h.options
-	newOpts.ListenPort = uint16(nodeInfo.Port)
-	if nodeInfo.Host != "" {
-		if newOpts.TLS == nil {
-			newOpts.TLS = &option.InboundTLSOptions{Enabled: true}
-		} else {
-			tlsCopy := *newOpts.TLS
-			newOpts.TLS = &tlsCopy
-		}
-		newOpts.TLS.ServerName = nodeInfo.Host
-	}
-
-	portChanged := newOpts.ListenPort != h.options.ListenPort
-	oldSNI := ""
-	if h.options.TLS != nil {
-		oldSNI = h.options.TLS.ServerName
-	}
-	newSNI := ""
-	if newOpts.TLS != nil {
-		newSNI = newOpts.TLS.ServerName
-	}
-	sniChanged := newSNI != oldSNI
+	newOpts.ListenPort = update.Port
+	newOpts.TLS = update.TLS
+	portChanged, sniChanged, newSNI := update.PortChanged, update.SNIChanged, update.SNI
 
 	started := h.started.Load()
 	if started && !portChanged && !sniChanged {
@@ -277,9 +266,16 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	return nil
 }
 
+// Close releases whatever is live now, including a hot-reloaded listener.
+// Idempotent: it is registered with the start scope and may also be called
+// directly.
 func (h *Inbound) Close() error {
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
 	return common.Close(h.listener, h.tlsConfig)
 }
 

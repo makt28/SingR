@@ -446,3 +446,27 @@ func testAnyTLSSelfSignedCertificate(t *testing.T) (string, string) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
 	return string(certPEM), string(keyPEM)
 }
+
+// A panel tick that lands after Close must not bring a listener back up:
+// POET.Stop does not wait for a monitor tick already in flight.
+func TestAnyTLSConfigureFromPanelNodeAfterCloseIsNoOp(t *testing.T) {
+	port := testFreeTCPPort(t)
+	reloadPort := testFreeTCPPort(t)
+	h := newTestAnyTLSInbound(t, port, "initial.example.com")
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
+		t.Fatal(err)
+	}
+	assertTCPPortBound(t, port, true)
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: C.TypeAnyTLS, Port: uint32(reloadPort), Host: "initial.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	assertTCPPortBound(t, reloadPort, false)
+	assertTCPPortBound(t, port, false)
+	// Close stays idempotent (the start scope calls it again at shutdown).
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

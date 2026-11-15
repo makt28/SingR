@@ -5,33 +5,53 @@ import (
 	"github.com/sagernet/sing-box/poet/controller"
 )
 
-func (ss *singleton) SetInboud(in *adapter.Inbound, tag string) {
-	// ins := *in
-	// tags := ins.Tag()
-	ss.Inbounds[tag] = in
+// SetInbound registers an inbound under its tag (called by the inbound
+// manager for every inbound it creates).
+func (ss *singleton) SetInbound(in *adapter.Inbound, tag string) {
+	ss.access.Lock()
+	defer ss.access.Unlock()
+	ss.inbounds[tag] = in
 }
 
-func (ss *singleton) GetInoud(tag string) *adapter.Inbound {
-	if in, ok := ss.Inbounds[tag]; ok {
-		return in
-	}
-	return nil
+// Inbound returns the inbound registered under tag, or nil.
+func (ss *singleton) Inbound(tag string) *adapter.Inbound {
+	ss.access.RLock()
+	defer ss.access.RUnlock()
+	return ss.inbounds[tag]
 }
 
-func (ss *singleton) SetContrl(ct *controller.Controller, inTag string, outTag string) {
-	ss.InContrls[inTag] = ct
-	ss.OutContrls[outTag] = ct
+// RemoveInbound forgets the inbound registered under tag.
+func (ss *singleton) RemoveInbound(tag string) {
+	ss.access.Lock()
+	defer ss.access.Unlock()
+	delete(ss.inbounds, tag)
 }
 
-func (ss *singleton) GetContrlWithInTag(inTag string) *controller.Controller {
-	if ct, ok := ss.InContrls[inTag]; ok {
-		return ct
-	}
-	return nil
+// ClearInbounds forgets every registered inbound.
+func (ss *singleton) ClearInbounds() {
+	ss.access.Lock()
+	defer ss.access.Unlock()
+	ss.inbounds = make(map[string]*adapter.Inbound)
 }
-func (ss *singleton) GetContrlWithOutTag(outTag string) *controller.Controller {
-	if ct, ok := ss.OutContrls[outTag]; ok {
-		return ct
-	}
-	return nil
+
+// SetController binds a panel node's controller to the inbound tag its
+// connections arrive on.
+func (ss *singleton) SetController(ct *controller.Controller, inTag string) {
+	ss.access.Lock()
+	defer ss.access.Unlock()
+	ss.controllers[inTag] = ct
+}
+
+// ControllerByInTag returns the controller bound to an inbound tag, or nil.
+func (ss *singleton) ControllerByInTag(inTag string) *controller.Controller {
+	ss.access.RLock()
+	defer ss.access.RUnlock()
+	return ss.controllers[inTag]
+}
+
+// RemoveController unbinds the controller of an inbound tag.
+func (ss *singleton) RemoveController(inTag string) {
+	ss.access.Lock()
+	defer ss.access.Unlock()
+	delete(ss.controllers, inTag)
 }

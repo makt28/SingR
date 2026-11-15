@@ -71,6 +71,6 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	}
 	m.inbounds = append(m.inbounds, inbound)
 	m.inboundByTag[tag] = inbound
-	POET.SetInboud(&inbound, tag)
+	POET.SetInbound(&inbound, tag)
 	return nil
 }

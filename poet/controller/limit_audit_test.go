@@ -36,9 +36,9 @@ func TestDetermineRateMatchesXrayR(t *testing.T) {
 
 func TestSyncUserListAppliesPerUserSpeedLimit(t *testing.T) {
 	users := []api.UserInfo{
-		{UID: 1, SpeedLimit: 0},     // 0 → fall back to node = 50
-		{UID: 2, SpeedLimit: 30},    // user < node → 30
-		{UID: 3, SpeedLimit: 9999},  // user > node → 50
+		{UID: 1, SpeedLimit: 0},    // 0 → fall back to node = 50
+		{UID: 2, SpeedLimit: 30},   // user < node → 30
+		{UID: 3, SpeedLimit: 9999}, // user > node → 50
 	}
 	c, _ := newSpeedLimitTestController(t, &api.NodeInfo{NodeID: 1, NodeType: C.TypeAnyTLS, SpeedLimit: 50}, users)
 
@@ -295,12 +295,8 @@ func (a *auditTestAPI) ReportIllegal(hits *[]api.DetectResult) error {
 	return nil
 }
 
-// errRuleNotModified mirrors the sentinel returned by sspanel.APIClient.
-type ruleNotModifiedErr struct{}
-
-func (ruleNotModifiedErr) Error() string { return api.RuleNotModified }
-
-var errRuleNotModified error = ruleNotModifiedErr{}
+// errRuleNotModified is the sentinel sspanel.APIClient returns on a 304.
+var errRuleNotModified = api.ErrRuleNotModified
 
 func newSpeedLimitTestController(t *testing.T, node *api.NodeInfo, users []api.UserInfo) (*Controller, *incrementalTestInbound) {
 	t.Helper()

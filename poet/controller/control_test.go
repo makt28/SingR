@@ -397,7 +397,7 @@ func TestRefreshDetectRulesKeepsPreviousRulesOnError(t *testing.T) {
 		t.Fatalf("after rule fetch error: MatchAudit = (%v, %d), want previous rules to keep matching", matched, ruleID)
 	}
 
-	apiClient.rulesErr = errors.New(api.RuleNotModified)
+	apiClient.rulesErr = api.ErrRuleNotModified
 	controller.refreshDetectRules()
 	if matched, ruleID := controller.MatchAudit(103, "blocked.example"); !matched || ruleID != 7 {
 		t.Fatalf("after 304 RuleNotModified: MatchAudit = (%v, %d), want previous rules to keep matching", matched, ruleID)
@@ -428,7 +428,7 @@ func (a *syncUserListTestAPI) GetNodeInfo() (*api.NodeInfo, error) {
 func (a *syncUserListTestAPI) GetUserList() (*[]api.UserInfo, error) {
 	a.userListCalls++
 	if a.notModifiedAfterFirst && a.userListCalls > 1 {
-		return nil, errors.New(api.UserNotModified)
+		return nil, api.ErrUserNotModified
 	}
 	return &a.users, nil
 }
