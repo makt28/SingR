@@ -1,4 +1,4 @@
-package shortcuts
+package poet
 
 import (
 	"fmt"
@@ -79,13 +79,3 @@ func VersionLogLine() string {
 	}
 	return line
 }
-
-// func getGitLastTag() (string, error) {
-// 	cmd := exec.Command("git", "describe", "--tags", "--abbrev=0")
-// 	output, err := cmd.Output()
-// 	if err != nil {
-// 		return "", err
-// 	}
-// 	tag := strings.TrimSpace(string(output))
-// 	return tag, nil
-// }

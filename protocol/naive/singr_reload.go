@@ -141,11 +141,8 @@ func (n *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 	if nodeInfo == nil {
 		return nil
 	}
-	if nodeInfo.NodeType != C.TypeNaive {
-		return api.NodeTypeMismatch(C.TypeNaive, nodeInfo.NodeType)
-	}
-	if nodeInfo.Port <= 0 || nodeInfo.Port > 65535 {
-		return E.New("invalid naive listen port from panel: ", nodeInfo.Port)
+	if err := api.ValidatePanelNode(C.TypeNaive, nodeInfo); err != nil {
+		return err
 	}
 
 	n.reloadMu.Lock()
@@ -156,28 +153,11 @@ func (n *Inbound) ConfigureFromPanelNode(nodeInfo *api.NodeInfo) error {
 		return nil
 	}
 
+	update := api.PlanListenUpdate(nodeInfo, n.options.ListenPort, n.options.TLS)
 	newOpts := n.options
-	newOpts.ListenPort = uint16(nodeInfo.Port)
-	if nodeInfo.Host != "" {
-		if newOpts.TLS == nil {
-			newOpts.TLS = &option.InboundTLSOptions{Enabled: true}
-		} else {
-			tlsCopy := *newOpts.TLS
-			newOpts.TLS = &tlsCopy
-		}
-		newOpts.TLS.ServerName = nodeInfo.Host
-	}
-
-	portChanged := newOpts.ListenPort != n.options.ListenPort
-	oldSNI := ""
-	if n.options.TLS != nil {
-		oldSNI = n.options.TLS.ServerName
-	}
-	newSNI := ""
-	if newOpts.TLS != nil {
-		newSNI = newOpts.TLS.ServerName
-	}
-	sniChanged := newSNI != oldSNI
+	newOpts.ListenPort = update.Port
+	newOpts.TLS = update.TLS
+	portChanged, sniChanged, newSNI := update.PortChanged, update.SNIChanged, update.SNI
 
 	started := n.started.Load()
 	if started && !portChanged && !sniChanged {

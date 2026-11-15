@@ -188,25 +188,25 @@ func TestPanelETagsRoundTripAnd304(t *testing.T) {
 		etagKey   string
 		data      string
 		fetch     func(*APIClient) error
-		notModify string
+		notModify error
 	}{
 		{
 			name: "node", path: "/mod_mu/nodes/3/info", etagKey: "node",
 			data:      `{"server":"example.com;14555;0;ws;;path=/anytls","version":"2020.1"}`,
 			fetch:     func(client *APIClient) error { _, err := client.GetNodeInfo(); return err },
-			notModify: api.NodeNotModified,
+			notModify: api.ErrNodeNotModified,
 		},
 		{
 			name: "users", path: "/mod_mu/users", etagKey: "users",
 			data:      `[{"id":101,"email":"one@example.com","uuid":"uuid-101"}]`,
 			fetch:     func(client *APIClient) error { _, err := client.GetUserList(); return err },
-			notModify: api.UserNotModified,
+			notModify: api.ErrUserNotModified,
 		},
 		{
 			name: "rules", path: "/mod_mu/func/detect_rules", etagKey: "rules",
 			data:      `[{"id":7,"regex":"example\\.com"}]`,
 			fetch:     func(client *APIClient) error { _, err := client.GetNodeRule(); return err },
-			notModify: api.RuleNotModified,
+			notModify: api.ErrRuleNotModified,
 		},
 	}
 	for _, test := range tests {
@@ -238,8 +238,8 @@ func TestPanelETagsRoundTripAnd304(t *testing.T) {
 			if client.eTags[test.etagKey] != `"v1"` {
 				t.Fatalf("stored ETag = %q, want %q", client.eTags[test.etagKey], `"v1"`)
 			}
-			if err := test.fetch(client); err == nil || err.Error() != test.notModify {
-				t.Fatalf("second fetch error = %v, want %q", err, test.notModify)
+			if err := test.fetch(client); !errors.Is(err, test.notModify) {
+				t.Fatalf("second fetch error = %v, want %v", err, test.notModify)
 			}
 		})
 	}
@@ -415,3 +415,26 @@ type testTimeoutError struct{}
 func (testTimeoutError) Error() string   { return "simulated timeout" }
 func (testTimeoutError) Timeout() bool   { return true }
 func (testTimeoutError) Temporary() bool { return true }
+
+// The panel key travels as a query parameter, and net/http repeats the full
+// URL in every transport error. An unreachable panel must not put the key
+// into the log.
+func TestRequestErrorDoesNotLeakPanelKey(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	address := server.URL
+	server.Close() // nothing listens here any more
+
+	client := New(&api.Config{APIHost: address, NodeID: 3, Key: "super-secret-key", NodeType: "V2ray", DisableCustomConfig: true, Timeout: 2})
+	client.client.SetRetryWaitTime(time.Millisecond)
+	client.client.SetRetryMaxWaitTime(time.Millisecond)
+	_, err := client.GetNodeInfo()
+	if err == nil {
+		t.Fatal("expected a connection error")
+	}
+	if strings.Contains(err.Error(), "super-secret-key") {
+		t.Fatalf("error leaks the panel key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/mod_mu/nodes/3/info") {
+		t.Fatalf("error no longer names the endpoint: %v", err)
+	}
+}

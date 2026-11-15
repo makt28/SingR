@@ -308,7 +308,7 @@ func setupTestController(t *testing.T, tag string, nodeSpeedLimit uint64) (*cont
 
 	in := &stubInbound{tag: tag}
 	var ai adapter.Inbound = in
-	POET.SetInboud(&ai, tag)
+	POET.SetInbound(&ai, tag)
 
 	ctrl := controller.New(
 		context.Background(),
@@ -321,14 +321,13 @@ func setupTestController(t *testing.T, tag string, nodeSpeedLimit uint64) (*cont
 	// it directly via the test hook.
 	ctrl.SetNodeInfo(&api.NodeInfo{NodeID: 1, NodeType: "anytls", SpeedLimit: nodeSpeedLimit})
 
-	SS.Singleton().SetContrl(ctrl, tag, tag)
+	SS.Singleton().SetController(ctrl, tag)
 
 	t.Cleanup(func() {
 		// Best-effort cleanup so a failing test doesn't poison later
 		// tests in this package.
-		delete(SS.Singleton().Inbounds, tag)
-		delete(SS.Singleton().InContrls, tag)
-		delete(SS.Singleton().OutContrls, tag)
+		SS.Singleton().RemoveInbound(tag)
+		SS.Singleton().RemoveController(tag)
 	})
 
 	return ctrl.Author(), ctrl

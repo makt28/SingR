@@ -13,7 +13,7 @@ import (
 func (c *Controller) syncUserList() error {
 	userInfo, err := c.apiClient.GetUserList()
 	if err != nil {
-		if err.Error() != api.UserNotModified {
+		if !errors.Is(err, api.ErrUserNotModified) {
 			return err
 		}
 		// GetUserList already committed its ETag when the previous
@@ -21,10 +21,10 @@ func (c *Controller) syncUserList() error {
 		// retried through the diff alone: replay the cached list under
 		// 304 until the runtime delta lands (see userSyncPending).
 		if !c.userSyncPending {
-			c.log("GetUserList: 304 UserNotModified", "info")
+			c.logInfo("GetUserList: 304 UserNotModified")
 			return nil
 		}
-		c.log("GetUserList: 304 UserNotModified, retrying pending runtime user sync", "info")
+		c.logInfo("GetUserList: 304 UserNotModified, retrying pending runtime user sync")
 		userInfo = &c.lastUserList
 	}
 
@@ -37,13 +37,13 @@ func (c *Controller) syncUserList() error {
 	// quadratic over-report blowup.
 	if len(deleted) > 0 {
 		if err := c.dumpTrafficForDeleted(deleted); err != nil {
-			c.log(fmt.Sprintf("dump traffic before delete failed, discarding bytes: %v", err), "error")
+			c.logError(fmt.Sprintf("dump traffic before delete failed, discarding bytes: %v", err))
 		}
 	}
 	runtimeUsers := usersFromMap(nextMap)
 	deltaAddedChangedUsers := usersForHashes(nextMap, append(added, changed...))
 	shouldRefreshRuntimeUsers := len(added) > 0 || len(deleted) > 0 || len(changed) > 0
-	c.log(fmt.Sprintf("Sync Users added: %d deleted: %d changed: %d total: %d", len(added), len(deleted), len(changed), len(runtimeUsers)), "info")
+	c.logInfo(fmt.Sprintf("Sync Users added: %d deleted: %d changed: %d total: %d", len(added), len(deleted), len(changed), len(runtimeUsers)))
 
 	// Apply the protocol runtime delta first. Do not commit usersMap or
 	// mutate the authenticator until this succeeds: otherwise the next panel
@@ -65,19 +65,19 @@ func (c *Controller) syncUserList() error {
 	c.lastUserList = nil
 
 	for _, hash := range deleted {
-		c.log(fmt.Sprintf("DeleteUser: %s", hash), "debug")
+		c.logDebug(fmt.Sprintf("DeleteUser: %s", hash))
 		if err := c.author.DelUser(hash); err != nil {
-			c.log(fmt.Sprintf("failed deleteUser: %s %v", hash, err.Error()), "error")
+			c.logError(fmt.Sprintf("failed deleteUser: %s %v", hash, err.Error()))
 		}
 	}
 	for _, hash := range added {
 		u, ok := nextMap[hash]
 		if !ok {
-			c.log(fmt.Sprintf("usersMap none hash: %s", hash), "error")
+			c.logError(fmt.Sprintf("usersMap none hash: %s", hash))
 			continue
 		}
 		if err := c.author.AddUser(hash, u.UID); err != nil {
-			c.log(fmt.Sprintf("failed addUser: %s %v", hash, err.Error()), "error")
+			c.logError(fmt.Sprintf("failed addUser: %s %v", hash, err.Error()))
 		}
 	}
 
@@ -117,13 +117,13 @@ func (c *Controller) applyRuntimeUserDelta(deleted []string, deltaAddedChangedUs
 	if incremental, ok := in.(adapter.PIncrementalUserInbound); ok {
 		if len(deleted) > 0 {
 			if err := incremental.RemoveUsers(deleted); err != nil {
-				c.log(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+				c.logError(fmt.Sprintf("Failed to remove users for node type %s, error: %v", c.nodeInfo.NodeType, err))
 				return err
 			}
 		}
 		if len(deltaAddedChangedUsers) > 0 {
 			if err := incremental.AddUsers(&deltaAddedChangedUsers, c.nodeInfo); err != nil {
-				c.log(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+				c.logError(fmt.Sprintf("Failed to add/update users for node type %s, error: %v", c.nodeInfo.NodeType, err))
 				return err
 			}
 		}
@@ -131,11 +131,11 @@ func (c *Controller) applyRuntimeUserDelta(deleted []string, deltaAddedChangedUs
 	}
 	refresher, ok := in.(adapter.PInbound)
 	if !ok {
-		c.log(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType), "error")
+		c.logError(fmt.Sprintf("unsupported node type: %s", c.nodeInfo.NodeType))
 		return errors.New("inbound type does not support user refresh")
 	}
 	if err := refresher.RefreshUsers(&runtimeUsers, c.nodeInfo); err != nil {
-		c.log(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err), "error")
+		c.logError(fmt.Sprintf("Failed to refresh users for node type %s, error: %v", c.nodeInfo.NodeType, err))
 		return err
 	}
 	return nil
@@ -166,7 +166,7 @@ func (c *Controller) dumpTrafficForDeleted(deleted []string) error {
 	if len(report) == 0 {
 		return nil
 	}
-	c.log(fmt.Sprintf("dumping %d deleted users' traffic before removal", len(report)), "info")
+	c.logInfo(fmt.Sprintf("dumping %d deleted users' traffic before removal", len(report)))
 	if err := c.apiClient.ReportUserTraffic(&report); err != nil {
 		return err
 	}
@@ -241,12 +241,22 @@ func (c *Controller) refreshAllSpeedLimits() {
 	}
 }
 
+// ErrDeviceLimitExceeded is returned by LoadOrCreateUserCounter when the
+// user already has DeviceLimit distinct source IPs registered and this
+// connection comes from another one. Only possible with
+// Config.EnableDeviceLimit. The caller must close the connection: returning
+// it unwrapped would let it through unmetered.
+var ErrDeviceLimitExceeded = errors.New("singr: user device limit exceeded")
+
 // 记录流量
 //
 // Returns the user's send/recv counter pointers along with the User
 // pointer itself so the caller (poet.RoutedConnection) can additionally
 // wrap with a rate-limit conn that calls user.WaitN. Callers that only
 // need counters can ignore the user return.
+//
+// On ErrDeviceLimitExceeded the User is still returned (for logging); the
+// counter pointers are nil.
 func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapter.InboundContext) (send, recv *atomic.Int64, user *User, err error) {
 	hash := metadata.User
 	u, found := c.author.LoadUser(hash)
@@ -254,13 +264,15 @@ func (c *Controller) LoadOrCreateUserCounter(ctx context.Context, metadata adapt
 		return nil, nil, nil, fmt.Errorf("hash:%s is not in user map", hash)
 	}
 	if hash != u.hash {
-		c.log(fmt.Sprintf("traffic user alias mapped alias=%s canonical=%s UID=%d email=%s", hash, u.hash, u.UID, u.Email), "debug")
+		c.logDebug(fmt.Sprintf("traffic user alias mapped alias=%s canonical=%s UID=%d email=%s", hash, u.hash, u.UID, u.Email))
 	}
 	if u.MarkCounterAttached() {
-		c.log(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", u.UID, u.Email, u.hash, metadata.Inbound, metadata.Source.AddrString()), "debug")
+		c.logDebug(fmt.Sprintf("traffic counter attached UID=%d email=%s user=%s inbound=%s source=%s", u.UID, u.Email, u.hash, metadata.Inbound, metadata.Source.AddrString()))
 	}
 
-	u.AddIP(metadata.Source.AddrString())
+	if !u.AddIP(metadata.Source.AddrString()) {
+		return nil, nil, u, ErrDeviceLimitExceeded
+	}
 
 	sendPtr, recvPtr := u.GetTrafficPointer()
 	return sendPtr, recvPtr, u, nil

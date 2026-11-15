@@ -2,6 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sagernet/sing-box/poet/api"
@@ -81,5 +84,79 @@ func TestAuthenticatorUserAliasesRefresh(t *testing.T) {
 	}
 	if _, found := authenticator.LoadUser("new-uuid"); !found {
 		t.Fatal("new alias did not resolve")
+	}
+}
+
+// AddIP's check-then-store must be atomic: many connections arriving at once
+// from distinct addresses may not all slip under the limit.
+//
+// The window between "is there room" and "take the slot" is a few
+// instructions wide, so one burst rarely hits it: release every goroutine of
+// a round from one barrier, and run many rounds against a limit of 1 — the
+// tightest case, where a single extra admission is already a violation.
+func TestUserAddIPEnforcesLimitUnderConcurrency(t *testing.T) {
+	const (
+		rounds  = 400
+		callers = 16
+	)
+	for round := 0; round < rounds; round++ {
+		user := &User{}
+		user.SetIPLimit(1)
+
+		var admitted atomic.Int32
+		var wait sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < callers; i++ {
+			wait.Add(1)
+			go func(i int) {
+				defer wait.Done()
+				<-start
+				if user.AddIP(fmt.Sprintf("192.0.2.%d", i)) {
+					admitted.Add(1)
+				}
+			}(i)
+		}
+		close(start)
+		wait.Wait()
+		if got := admitted.Load(); got != 1 {
+			t.Fatalf("round %d: admitted %d distinct addresses, want 1", round, got)
+		}
+		if got := user.GetIPNumber(); got != 1 {
+			t.Fatalf("round %d: tracked addresses = %d, want 1", round, got)
+		}
+	}
+}
+
+// A report cycle drains the table and frees the slots.
+func TestUserResetIPTableFreesDeviceSlots(t *testing.T) {
+	const limit = 3
+	user := &User{}
+	user.SetIPLimit(limit)
+	for i := 0; i < limit; i++ {
+		if !user.AddIP(fmt.Sprintf("192.0.2.%d", i)) {
+			t.Fatalf("address %d refused below the limit", i)
+		}
+	}
+	if user.AddIP("198.51.100.1") {
+		t.Fatal("address admitted above the limit")
+	}
+	if !user.AddIP("192.0.2.0") {
+		t.Fatal("an already registered address was refused")
+	}
+	if drained := user.ResetIPTable(); len(drained) != limit {
+		t.Fatalf("drained %d addresses, want %d", len(drained), limit)
+	}
+	if !user.AddIP("198.51.100.1") {
+		t.Fatal("address refused after the table was drained")
+	}
+}
+
+// Limit 0 (EnableDeviceLimit off) admits everyone.
+func TestUserAddIPWithoutLimitAdmitsAll(t *testing.T) {
+	user := &User{}
+	for i := 0; i < 16; i++ {
+		if !user.AddIP(fmt.Sprintf("192.0.2.%d", i)) {
+			t.Fatalf("address %d refused although no limit is set", i)
+		}
 	}
 }

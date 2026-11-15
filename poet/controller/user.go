@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"sync"
 
-	// "sync/atomic"
 	"github.com/sagernet/sing/common/atomic"
 
 	"github.com/sagernet/sing-box/poet/api"
@@ -41,7 +40,12 @@ type User struct {
 	ipTable     sync.Map
 	ipNum       atomic.Int32
 	counterSeen atomic.Bool
-	maxIPNum    int
+	// maxIPNum is written by the panel sync goroutine (SetIPLimit) and read
+	// on every routed connection (AddIP). ipAccess makes AddIP's
+	// check-then-store atomic, so two connections from two new addresses
+	// cannot both slip under the limit.
+	maxIPNum atomic.Int32
+	ipAccess sync.Mutex
 
 	// limiter is a SINGLE token bucket shared across both directions.
 	// XrayR/SSPanel semantics: `node_speedlimit` and per-user
@@ -63,37 +67,40 @@ func (u *User) Close() error {
 	return nil
 }
 
+// AddIP registers a source address for the user and reports whether the
+// connection may proceed. It returns false only when a device limit is set
+// (SetIPLimit > 0) and this address would be one more than the limit; an
+// address already registered always passes.
+//
+// The table is drained by ResetIPTable on every report cycle, so the limit
+// counts distinct source addresses that opened a connection within one cycle
+// (UpdatePeriodic, 60 s by default) — a connection that is already running
+// is never cut off, only new ones are refused.
 func (u *User) AddIP(ip string) bool {
-	//先加入ip
-	_, found := u.ipTable.Load(ip)
-	if found {
-		return true //无需限制, 再table中
+	if _, found := u.ipTable.Load(ip); found {
+		return true
 	}
 
-	//判断是否受限
-	if u.maxIPNum > 0 {
-		ipn := u.ipNum.Load()
-		if int(ipn)+1 > u.maxIPNum {
-			return false //超过ip限制
-		}
+	u.ipAccess.Lock()
+	defer u.ipAccess.Unlock()
+	if _, found := u.ipTable.Load(ip); found {
+		return true
 	}
-
+	if limit := u.maxIPNum.Load(); limit > 0 && u.ipNum.Load()+1 > limit {
+		return false
+	}
 	u.ipTable.Store(ip, true)
 	u.ipNum.Add(1)
-
 	return true
 }
 
 func (u *User) DelIP(ip string) bool {
-	//先载入
+	u.ipAccess.Lock()
+	defer u.ipAccess.Unlock()
 	_, found := u.ipTable.Load(ip)
 	if !found {
 		return false
 	}
-
-	// if u.maxIPNum <= 0 {
-	// 	return true
-	// }
 
 	u.ipTable.Delete(ip)
 	u.ipNum.Add(-1)
@@ -105,11 +112,14 @@ func (u *User) GetIPNumber() int {
 }
 
 func (u *User) SetIPLimit(n int) {
-	u.maxIPNum = n
+	if n < 0 {
+		n = 0
+	}
+	u.maxIPNum.Store(int32(n))
 }
 
 func (u *User) GetIPLimit() int {
-	return u.maxIPNum
+	return int(u.maxIPNum.Load())
 }
 
 // WaitN blocks until the user's shared rate limiter allows `n` bytes.
@@ -194,8 +204,6 @@ func (u *User) Hash() string {
 func (u *User) SetTraffic(send, recv int64) {
 	u.sent.Store(send)
 	u.recv.Store(recv)
-	// atomic.StoreUint64(&u.sent, send)
-	// atomic.StoreUint64(&u.recv, recv)
 }
 
 func (u *User) GetTraffic() (int64, int64) {
@@ -217,6 +225,8 @@ func (u *User) ResetTraffic() (int64, int64) {
 func (u *User) ResetIPTable() []string {
 	var iplist []string
 
+	u.ipAccess.Lock()
+	defer u.ipAccess.Unlock()
 	u.ipTable.Range(func(key, value interface{}) bool {
 		if ip, ok := key.(string); ok {
 			iplist = append(iplist, ip)
@@ -230,32 +240,6 @@ func (u *User) ResetIPTable() []string {
 
 	return iplist
 }
-
-// // 对应下面携程模式的快速修改
-// func (u *User) TardyAddTraffic(send, recv int64) {
-// 	if recv > 0 {
-// 		atomic.AddUint64(&u.recv, recv)
-// 	}
-// 	if send > 0 {
-// 		atomic.AddUint64(&u.sent, send)
-// 	}
-// }
-
-// func (u *User) speedUpdater() {
-// 	ticker := time.NewTicker(time.Second)
-// 	for {
-// 		select {
-// 		case <-u.ctx.Done():
-// 			return
-// 		case <-ticker.C:
-// 			sent, recv := u.GetTraffic()
-// 			atomic.StoreUint64(&u.sendSpeed, sent-u.lastSent)
-// 			atomic.StoreUint64(&u.recvSpeed, recv-u.lastRecv)
-// 			atomic.StoreUint64(&u.lastSent, sent)
-// 			atomic.StoreUint64(&u.lastRecv, recv)
-// 		}
-// 	}
-// }
 
 func (u *User) GetSpeed() (int64, int64) {
 	return u.sendSpeed.Load(), u.recvSpeed.Load()
@@ -271,13 +255,6 @@ type Authenticator struct {
 	ctx     context.Context
 }
 
-// func (a *Authenticator) AuthUser(hash string) (bool, statistic.User) {
-// 	if user, found := a.users.Load(hash); found {
-// 		return true, user.(*User)
-// 	}
-// 	return false, nil
-// }
-
 func (a *Authenticator) AddUser(hash string, uid int) error {
 	if _, found := a.users.Load(hash); found {
 		return fmt.Errorf("hash %s already exists", hash)
@@ -289,7 +266,6 @@ func (a *Authenticator) AddUser(hash string, uid int) error {
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	// go meter.speedUpdater()
 	a.users.Store(hash, meter)
 	return nil
 }
@@ -377,15 +353,6 @@ func (a *Authenticator) SetUserDeviceLimit(hash string, maxDevices int) bool {
 	user.SetIPLimit(maxDevices)
 	return true
 }
-
-// func (a *Authenticator) AddTraffic(hash string, send, recv uint64) error {
-// 	meter, found := a.users.Load(hash)
-// 	if !found {
-// 		return fmt.Errorf("hash " + hash + " not found")
-// 	}
-// 	meter.(*User).TardyAddTraffic(send, recv)
-// 	return nil
-// }
 
 // 返回指针列表 复制sync.Map内部的互斥锁,可能会导致并发问题
 func (a *Authenticator) ListUsers() []*User {

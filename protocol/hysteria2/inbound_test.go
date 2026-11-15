@@ -592,3 +592,55 @@ func testSelfSignedCertificate(t *testing.T) (string, string) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
 	return string(certPEM), string(keyPEM)
 }
+
+// See TestAnyTLSConfigureFromPanelNodeAfterCloseIsNoOp.
+func TestHysteria2ConfigureFromPanelNodeAfterCloseIsNoOp(t *testing.T) {
+	port := testFreeUDPPort(t)
+	reloadPort := testFreeUDPPort(t)
+	h := newTestHysteria2Inbound(t, port, "initial.example.com")
+	if err := h.Start(adapter.StartStateStart, newTestScope()); err != nil {
+		t.Fatal(err)
+	}
+	assertUDPPortBound(t, port, true)
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ConfigureFromPanelNode(&api.NodeInfo{NodeType: C.TypeHysteria2, Port: uint32(reloadPort), Host: "initial.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	assertUDPPortBound(t, reloadPort, false)
+	assertUDPPortBound(t, port, false)
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An obfs block that resolves to an empty secret is silently off in
+// sing-quic; the inbound must be able to tell so it can warn.
+func TestObfsSecretMissing(t *testing.T) {
+	withSNI := &option.InboundTLSOptions{Enabled: true, ServerName: "node.example.com"}
+	withoutSNI := &option.InboundTLSOptions{Enabled: true}
+	tests := []struct {
+		name string
+		obfs *option.Hysteria2Obfs
+		tls  *option.InboundTLSOptions
+		want bool
+	}{
+		{"no obfs block", nil, withoutSNI, false},
+		{"salamander, explicit password", &option.Hysteria2Obfs{Type: singquic.ObfsTypeSalamander, Password: "secret"}, withoutSNI, false},
+		{"salamander, falls back to SNI", &option.Hysteria2Obfs{Type: singquic.ObfsTypeSalamander}, withSNI, false},
+		{"salamander, no password and no SNI", &option.Hysteria2Obfs{Type: singquic.ObfsTypeSalamander}, withoutSNI, true},
+		{"salamander, no password and no TLS block", &option.Hysteria2Obfs{Type: singquic.ObfsTypeSalamander}, nil, true},
+		{"gecko, explicit password", &option.Hysteria2Obfs{Type: singquic.ObfsTypeGecko, Password: "secret"}, withSNI, false},
+		{"gecko has no SNI fallback", &option.Hysteria2Obfs{Type: singquic.ObfsTypeGecko}, withSNI, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := option.Hysteria2InboundOptions{Obfs: test.obfs}
+			options.TLS = test.tls
+			if got := obfsSecretMissing(options); got != test.want {
+				t.Fatalf("obfsSecretMissing = %v, want %v", got, test.want)
+			}
+		})
+	}
+}

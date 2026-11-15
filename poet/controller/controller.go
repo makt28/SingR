@@ -23,19 +23,21 @@ type Controller struct {
 	apiClient  api.API
 	nodeInfo   *api.NodeInfo
 	Tag        string
-	// userList   *[]api.UserInfo
-	usersMap map[string]*api.UserInfo
+	usersMap   map[string]*api.UserInfo
+
+	// nodeID is the panel node id used as the log prefix. It is fixed at
+	// construction (it comes from panel.json, not from the panel's answer),
+	// so the log helpers can read it from any goroutine. They used to read
+	// c.nodeInfo.NodeID, which nodeInfoMonitor reassigns while
+	// userInfoMonitor and the per-connection path are logging.
+	nodeID int
 
 	tasks []periodicTask
-	// limitedUsers map[api.UserInfo]LimitInfo
-	// warnedUsers  map[api.UserInfo]int
-	// Panel type: SSpanel, NewV2board, PMpanel, Proxypanel, V2RaySocks, GoV2Panel
+	// Panel type. Only "SSpanel" is wired (see buildUserHash).
 	panelType string
-	// stm          stats.Manager
-	// dispatcher   *mydispatcher.DefaultDispatcher
-	startAt time.Time
-	inbound *adapter.Inbound
-	logger  log.Logger
+	startAt   time.Time
+	inbound   *adapter.Inbound
+	logger    log.Logger
 
 	//用户统计与验证
 	author *Authenticator
@@ -80,9 +82,6 @@ type Controller struct {
 	// only touched from the monitor goroutine; no lock needed.
 	userSyncPending bool
 	lastUserList    []api.UserInfo
-
-	// environment = development testing staging production
-	env string
 }
 
 // detectKey identifies a unique (user, rule) pair for audit dedup.
@@ -109,8 +108,7 @@ func New(ctx context.Context, config Config, inbound *adapter.Inbound, apiClient
 		panelType: config.PanelType,
 		config:    &config,
 		apiClient: apiClient,
-		// userList:  &[]api.UserInfo{},
-		usersMap: make(map[string]*api.UserInfo),
+		usersMap:  make(map[string]*api.UserInfo),
 
 		startAt: time.Now(),
 		inbound: inbound,
@@ -129,16 +127,17 @@ func New(ctx context.Context, config Config, inbound *adapter.Inbound, apiClient
 		panic("singr: failed to initialize authenticator: " + err.Error())
 	}
 	controller.author = author
+	if apiClient != nil {
+		controller.nodeID = apiClient.Describe().NodeID
+	}
 
 	return controller
 }
 
 // Start implement the Start() function of the service interface
 func (c *Controller) Start() error {
-
-	// log := c.config.Logger
-
 	c.clientInfo = c.apiClient.Describe()
+	c.nodeID = c.clientInfo.NodeID
 
 	// First fetch Node Info
 	newNodeInfo, err := c.apiClient.GetNodeInfo()
@@ -148,11 +147,6 @@ func (c *Controller) Start() error {
 	if newNodeInfo.Port == 0 {
 		return errors.New("server port must > 0")
 	}
-
-	//简单验证信息
-	// if newNodeInfo.NodeType != c.clientInfo.NodeType {
-	// 	return errors.New("node type must be same")
-	// }
 
 	c.nodeInfo = newNodeInfo
 	c.Tag = c.buildNodeTag() //== inTag
@@ -187,7 +181,7 @@ func (c *Controller) Start() error {
 
 	// Start periodic tasks
 	for i := range c.tasks {
-		c.log("start periodic task: "+c.tasks[i].tag, "info")
+		c.logInfo("start periodic task: " + c.tasks[i].tag)
 		go c.tasks[i].Start()
 	}
 	return nil
@@ -195,13 +189,10 @@ func (c *Controller) Start() error {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
-	log := c.config.Logger
-
 	for i := range c.tasks {
 		if c.tasks[i].Periodic != nil {
 			if err := c.tasks[i].Periodic.Close(); err != nil {
-				// log.Panic("%s %s periodic task close failed: %s", c.logPrefix(), c.tasks[i].tag, err)
-				log.Panic("periodic task close failed: %s", err)
+				c.logError(fmt.Sprintf("periodic task %s close failed: %v", c.tasks[i].tag, err))
 				return err
 			}
 		}
@@ -210,40 +201,27 @@ func (c *Controller) Close() error {
 	return nil
 }
 
+// InboundTag returns the tag of the inbound this controller drives.
+func (c *Controller) InboundTag() string {
+	if c.inbound == nil || *c.inbound == nil {
+		return ""
+	}
+	return (*c.inbound).Tag()
+}
+
 func (c *Controller) buildNodeTag() string {
 	return fmt.Sprintf("%s_%s_%d", c.nodeInfo.NodeType, c.config.ListenIP, c.nodeInfo.Port)
 }
 
-func (c *Controller) Env() string {
-	if c.env == "" {
-		if os.Getenv("WSL_DISTRO_NAME") != "" {
-			c.env = "development"
-		} else {
-			c.env = "staging"
-		}
-	}
-	return c.env
+// Log helpers: every controller line carries the node id, because one
+// process serves several panel nodes and their logs interleave.
+func (c *Controller) logLine(message any) string {
+	return fmt.Sprintf("Node[%d] %v", c.nodeID, message)
 }
 
-func (c *Controller) log(message any, level string) {
-	message = fmt.Sprintf("Node[%d] %v", c.nodeInfo.NodeID, message)
-
-	switch level {
-	case "debug":
-		if c.Env() == "development" {
-			fmt.Println(time.Now().Format("01-02 15:04:05 "), message) //std output
-		}
-		c.logger.Debug(message)
-	case "warn":
-		c.logger.Warn(message)
-	case "error":
-		c.logger.Error(message)
-	case "panic":
-		c.logger.Panic(message)
-	default:
-		c.logger.Info(message)
-	}
-}
+func (c *Controller) logDebug(message any) { c.logger.Debug(c.logLine(message)) }
+func (c *Controller) logInfo(message any)  { c.logger.Info(c.logLine(message)) }
+func (c *Controller) logError(message any) { c.logger.Error(c.logLine(message)) }
 
 func (c *Controller) nodeInfoMonitor() (err error) {
 	// delay to start
@@ -255,11 +233,11 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	var nodeInfoChanged = true
 	newNodeInfo, err := c.apiClient.GetNodeInfo()
 	if err != nil {
-		if err.Error() == api.NodeNotModified {
+		if errors.Is(err, api.ErrNodeNotModified) {
 			nodeInfoChanged = false
 			newNodeInfo = c.nodeInfo
 		} else {
-			c.log(fmt.Sprintf("nodeInfoMonitor>>GetNodeInfo %v", err), "error")
+			c.logError(fmt.Sprintf("nodeInfoMonitor>>GetNodeInfo %v", err))
 			return nil
 		}
 	}
@@ -276,7 +254,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	// Update User
 	err = c.syncUserList()
 	if err != nil {
-		c.log(fmt.Sprintf("nodeInfoMonitor>>syncUserList %v", err), "error")
+		c.logError(fmt.Sprintf("nodeInfoMonitor>>syncUserList %v", err))
 		return nil
 	}
 
@@ -284,7 +262,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	// against the new value. syncUserList already reapplies limiters for
 	// added/changed users; this catches everyone else. Cheap O(N).
 	if newNodeInfo.SpeedLimit != prevNodeSpeedLimit {
-		c.log(fmt.Sprintf("node speed limit changed %d -> %d Bps; refreshing %d users", prevNodeSpeedLimit, newNodeInfo.SpeedLimit, len(c.usersMap)), "info")
+		c.logInfo(fmt.Sprintf("node speed limit changed %d -> %d Bps; refreshing %d users", prevNodeSpeedLimit, newNodeInfo.SpeedLimit, len(c.usersMap)))
 		c.refreshAllSpeedLimits()
 	}
 
@@ -305,7 +283,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		if configurable, ok := (*c.inbound).(adapter.PStartupConfigurableInbound); ok {
 			if err := configurable.ConfigureFromPanelNode(c.nodeInfo); err != nil {
 				c.reloadPending = true
-				c.log(fmt.Sprintf("nodeInfoMonitor>>ConfigureFromPanelNode %v (will retry next cycle)", err), "error")
+				c.logError(fmt.Sprintf("nodeInfoMonitor>>ConfigureFromPanelNode %v (will retry next cycle)", err))
 			} else {
 				c.reloadPending = false
 			}
@@ -324,7 +302,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// Get server status
 	CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()
 	if err != nil {
-		c.log(fmt.Sprintf("userInfoMonitor>>ReportNodeStatus %v", err), "error")
+		c.logError(fmt.Sprintf("userInfoMonitor>>ReportNodeStatus %v", err))
 	} else {
 		err = c.apiClient.ReportNodeStatus(
 			&api.NodeStatus{
@@ -334,9 +312,9 @@ func (c *Controller) userInfoMonitor() (err error) {
 				Uptime: Uptime,
 			})
 		if err != nil {
-			c.log(err, "error")
+			c.logError(err)
 		}
-		c.log(fmt.Sprintf("userInfoMonitor>>ReportNodeStatus CPU %.2f, Mem %.2f, Disk %.2f, Uptime %v, err %v", CPU/100, Mem/100, Disk/100, strconv.FormatUint(Uptime, 10), err), "info")
+		c.logInfo(fmt.Sprintf("userInfoMonitor>>ReportNodeStatus CPU %.2f, Mem %.2f, Disk %.2f, Uptime %v, err %v", CPU/100, Mem/100, Disk/100, strconv.FormatUint(Uptime, 10), err))
 	}
 
 	// Get User traffic
@@ -345,18 +323,18 @@ func (c *Controller) userInfoMonitor() (err error) {
 	userArr := c.author.ListUsers()
 	debug := os.Getenv("SINGR_TRAFFIC_DEBUG") == "1"
 	if len(userArr) == 0 {
-		c.log("traffic zero online user", "info")
+		c.logInfo("traffic zero online user")
 		// Fall through so accumulated audit hits still get reported.
 	}
 	var sumSent, sumRecv int64
 	if debug {
-		c.log(fmt.Sprintf("[TRAFFIC] userInfoMonitor begin, ListUsers count=%d", len(userArr)), "debug")
+		c.logDebug(fmt.Sprintf("[TRAFFIC] userInfoMonitor begin, ListUsers count=%d", len(userArr)))
 	}
 	for _, user := range userArr {
 		// 获取用户流量
 		sent, recv := user.ResetTraffic()
 		if debug && (sent != 0 || recv != 0) {
-			c.log(fmt.Sprintf("[TRAFFIC] pre-report user UID=%d hash=%s email=%s sent=%d recv=%d", user.UID, user.Hash(), user.Email, sent, recv), "debug")
+			c.logDebug(fmt.Sprintf("[TRAFFIC] pre-report user UID=%d hash=%s email=%s sent=%d recv=%d", user.UID, user.Hash(), user.Email, sent, recv))
 			sumSent += sent
 			sumRecv += recv
 		}
@@ -365,8 +343,6 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 
 		up, down := trafficForSSPanel(sent, recv)
-
-		// c.log(fmt.Sprintf("get traffic user:%s sent:%d up:%d recv:%d down:%d rate:%f", user.hash, sent, up, recv, down, c.nodeInfo.TrafficRate), "debug")
 
 		userTraffic = append(userTraffic, api.UserTraffic{
 			UID:      user.UID,
@@ -388,11 +364,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 	userCounter := len(userTraffic)
 	ipCounter := len(onlineUsers)
 	if debug {
-		c.log(fmt.Sprintf("[TRAFFIC] userInfoMonitor sums sumSent=%d sumRecv=%d records=%d", sumSent, sumRecv, userCounter), "debug")
+		c.logDebug(fmt.Sprintf("[TRAFFIC] userInfoMonitor sums sumSent=%d sumRecv=%d records=%d", sumSent, sumRecv, userCounter))
 	}
 	//report traffic
 	if userCounter > 0 {
-		c.log(fmt.Sprintf("reporting %d user traffic records; first UID=%d email=%s upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Email, userTraffic[0].Upload, userTraffic[0].Download), "info")
+		c.logInfo(fmt.Sprintf("reporting %d user traffic records; first UID=%d email=%s upload=%d download=%d", userCounter, userTraffic[0].UID, userTraffic[0].Email, userTraffic[0].Upload, userTraffic[0].Download))
 		// On failure, the bytes captured by ResetTraffic are intentionally
 		// discarded. Restoring them caused a quadratic over-report blowup
 		// when the panel processed the request but the client saw a
@@ -401,16 +377,16 @@ func (c *Controller) userInfoMonitor() (err error) {
 		// Bounded under-reporting (1 cycle's bytes lost) is preferred
 		// over unbounded over-reporting.
 		if err = c.apiClient.ReportUserTraffic(&userTraffic); err != nil {
-			c.log(fmt.Sprintf("report traffic err:%v (discarding %d records)", err.Error(), userCounter), "error")
+			c.logError(fmt.Sprintf("report traffic err:%v (discarding %d records)", err.Error(), userCounter))
 		}
 	}
 	//report online users
 	if ipCounter > 0 {
 		if err = c.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
-			c.log(fmt.Sprintf("report online users err:%v", err.Error()), "error")
+			c.logError(fmt.Sprintf("report online users err:%v", err.Error()))
 		}
 	}
-	c.log(fmt.Sprintf("userInfoMonitor>>ReportUserOnline userCounter:%d ipCounter:%d", userCounter, ipCounter), "info")
+	c.logInfo(fmt.Sprintf("userInfoMonitor>>ReportUserOnline userCounter:%d ipCounter:%d", userCounter, ipCounter))
 
 	// Drain accumulated audit hits and report them. On failure the slice
 	// is intentionally discarded — keeping it would let one persistently
@@ -418,9 +394,9 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// suppresses repeats within `detectDedupTTL` so dropping a cycle's
 	// worth is bounded.
 	if hits := c.drainDetectResults(); len(hits) > 0 {
-		c.log(fmt.Sprintf("reporting %d audit hits", len(hits)), "info")
+		c.logInfo(fmt.Sprintf("reporting %d audit hits", len(hits)))
 		if err = c.apiClient.ReportIllegal(&hits); err != nil {
-			c.log(fmt.Sprintf("report illegal err:%v (discarding %d records)", err.Error(), len(hits)), "error")
+			c.logError(fmt.Sprintf("report illegal err:%v (discarding %d records)", err.Error(), len(hits)))
 		}
 	}
 
@@ -434,11 +410,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 func (c *Controller) refreshDetectRules() {
 	rules, err := c.apiClient.GetNodeRule()
 	if err != nil {
-		if err.Error() == api.RuleNotModified {
+		if errors.Is(err, api.ErrRuleNotModified) {
 			return
 		}
 		if c.detectGetWarns == 0 {
-			c.log(fmt.Sprintf("GetNodeRule failed (suppressing further warnings): %v", err), "debug")
+			c.logDebug(fmt.Sprintf("GetNodeRule failed (suppressing further warnings): %v", err))
 		}
 		c.detectGetWarns++
 		return

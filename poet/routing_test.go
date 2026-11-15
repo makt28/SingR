@@ -1,4 +1,4 @@
-package shortcuts
+package poet
 
 import (
 	"context"
@@ -153,9 +153,9 @@ func installRoutingTestController(t *testing.T, inboundTag string) (*controller.
 	inbound := adapter.Inbound(&routingTestInbound{tag: inboundTag})
 	service := controller.New(context.Background(), controller.Config{PanelType: "SSpanel"}, &inbound, routingTestAPI{}, logger)
 	service.SetNodeInfo(&api.NodeInfo{NodeID: 1})
-	SS.Singleton().SetContrl(service, inboundTag, "")
+	SS.Singleton().SetController(service, inboundTag)
 	return service, func() {
-		delete(SS.Singleton().InContrls, inboundTag)
+		SS.Singleton().RemoveController(inboundTag)
 		_ = service.Close()
 	}
 }
@@ -194,6 +194,7 @@ func (routingTestAPI) Debug()                                        {}
 type routingTestPacketConn struct {
 	readData []byte
 	written  int
+	closed   bool
 }
 
 func (c *routingTestPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
@@ -206,10 +207,107 @@ func (c *routingTestPacketConn) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) e
 	return nil
 }
 
-func (*routingTestPacketConn) Close() error                     { return nil }
+func (c *routingTestPacketConn) Close() error                   { c.closed = true; return nil }
 func (*routingTestPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
 func (*routingTestPacketConn) SetDeadline(time.Time) error      { return nil }
 func (*routingTestPacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (*routingTestPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 var _ N.PacketConn = (*routingTestPacketConn)(nil)
+
+// A user over their device limit must be cut off, not let through: before
+// this was enforced, User.AddIP's verdict was discarded and the limit did
+// nothing; returning the conn unwrapped instead would have let it through
+// unmetered.
+func TestRoutedConnectionDeviceLimitClosesAndBlocks(t *testing.T) {
+	controllerService, cleanup := installRoutingTestController(t, "device-in")
+	defer cleanup()
+	user := addRoutingTestUser(t, controllerService)
+	controllerService.Author().SetUserDeviceLimit("u101", 1)
+
+	metadataFrom := func(source string) adapter.InboundContext {
+		return adapter.InboundContext{
+			Inbound:     "device-in",
+			User:        "u101",
+			Source:      M.ParseSocksaddr(source),
+			Destination: M.ParseSocksaddr("198.51.100.1:443"),
+		}
+	}
+
+	// First address: admitted and metered.
+	firstServer, firstClient := net.Pipe()
+	defer firstServer.Close()
+	defer firstClient.Close()
+	first := RoutedConnection(context.Background(), firstServer, metadataFrom("192.0.2.10:1000"))
+	go func() { _, _ = firstClient.Write([]byte("up")) }()
+	buffer := make([]byte, 2)
+	if _, err := first.Read(buffer); err != nil {
+		t.Fatalf("first address read: %v", err)
+	}
+	if sent, _ := user.GetTraffic(); sent != 2 {
+		t.Fatalf("first address upload counter = %d, want 2", sent)
+	}
+
+	// Second address: one more than the limit.
+	secondServer, secondClient := net.Pipe()
+	defer secondClient.Close()
+	// If the connection were let through, the read below would block on the
+	// pipe; the deadline turns that regression into a failure, not a hang.
+	_ = secondServer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	second := RoutedConnection(context.Background(), secondServer, metadataFrom("192.0.2.11:1000"))
+	if _, err := second.Read(buffer); !errors.Is(err, errDeviceLimit) {
+		t.Fatalf("over-limit read error = %v, want errDeviceLimit", err)
+	}
+	if _, err := second.Write(buffer); !errors.Is(err, errDeviceLimit) {
+		t.Fatalf("over-limit write error = %v, want errDeviceLimit", err)
+	}
+	_ = secondClient.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err := secondClient.Read(buffer); err == nil {
+		t.Fatal("device limit did not close the underlying connection")
+	}
+
+	// Another connection from the first address still passes: the limit is
+	// on distinct addresses, not on connections.
+	thirdServer, thirdClient := net.Pipe()
+	defer thirdServer.Close()
+	defer thirdClient.Close()
+	third := RoutedConnection(context.Background(), thirdServer, metadataFrom("192.0.2.10:2000"))
+	if _, blocked := third.(*blockedConn); blocked {
+		t.Fatal("a second connection from an admitted address was blocked")
+	}
+
+	// UDP takes the same verdict.
+	packetConn := &routingTestPacketConn{readData: []byte("packet")}
+	blockedPacket := RoutedPacketConnection(context.Background(), packetConn, metadataFrom("192.0.2.12:1000"))
+	readBuffer := buf.NewPacket()
+	defer readBuffer.Release()
+	if _, err := blockedPacket.ReadPacket(readBuffer); !errors.Is(err, errDeviceLimit) {
+		t.Fatalf("over-limit packet read error = %v, want errDeviceLimit", err)
+	}
+	if !packetConn.closed {
+		t.Fatal("device limit did not close the underlying packet connection")
+	}
+}
+
+// Without a device limit (the default: EnableDeviceLimit off leaves it at 0)
+// every address is admitted.
+func TestRoutedConnectionNoDeviceLimitAdmitsEveryAddress(t *testing.T) {
+	controllerService, cleanup := installRoutingTestController(t, "device-off-in")
+	defer cleanup()
+	addRoutingTestUser(t, controllerService)
+
+	for _, source := range []string{"192.0.2.20:1", "192.0.2.21:1", "192.0.2.22:1"} {
+		server, client := net.Pipe()
+		wrapped := RoutedConnection(context.Background(), server, adapter.InboundContext{
+			Inbound:     "device-off-in",
+			User:        "u101",
+			Source:      M.ParseSocksaddr(source),
+			Destination: M.ParseSocksaddr("198.51.100.1:443"),
+		})
+		if _, blocked := wrapped.(*blockedConn); blocked {
+			t.Fatalf("address %s blocked although no device limit is set", source)
+		}
+		_ = server.Close()
+		_ = client.Close()
+	}
+}

@@ -2,13 +2,17 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"regexp"
 )
 
-const (
-	UserNotModified = "users not modified"
-	NodeNotModified = "node not modified"
-	RuleNotModified = "rules not modified"
+// Sentinel errors a panel client returns when the panel answers 304 Not
+// Modified for the corresponding resource. Callers must test with errors.Is;
+// they are not failures, they mean "keep what you have".
+var (
+	ErrUserNotModified = errors.New("users not modified")
+	ErrNodeNotModified = errors.New("node not modified")
+	ErrRuleNotModified = errors.New("rules not modified")
 )
 
 // Config API config

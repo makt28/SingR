@@ -60,6 +60,11 @@ type Box struct {
 	internalService     []adapter.LifecycleService
 	ntpService          *ntp.Service
 	scope               *adapter.Scope
+	// panelStarted is set once this box has started the panel (POET). Close
+	// only stops the panel then: a box that never started it — the throwaway
+	// instance `check` builds, also on SIGHUP inside the running process —
+	// must not stop the live one.
+	panelStarted bool
 }
 
 type Options struct {
@@ -183,7 +188,6 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "create log factory")
 	}
-	POET.SetLogger(logFactory)
 	service.MustRegister[log.Factory](ctx, logFactory)
 
 	var internalServices []adapter.LifecycleService
@@ -545,12 +549,16 @@ func (s *Box) preStart(startPanel bool) error {
 	}
 	s.scope.Add(s.logFactory.Close)
 	if startPanel {
+		// The panel logger is handed over here, not in New: a box that is
+		// only constructed (check) must not replace the running box's.
+		POET.SetLogger(s.logFactory)
 		monitor.Start("start panel")
 		err = POET.Start()
 		monitor.Finish()
 		if err != nil {
 			return E.Cause(err, "start panel")
 		}
+		s.panelStarted = true
 		s.logger.Info(POET.VersionLogLine())
 	}
 	applyDebugOptions(s.debugOptions)
@@ -667,7 +675,10 @@ func (s *Box) start() error {
 func (s *Box) Close() error {
 	// Stop the panel controllers before the scope tears inbounds down, so a
 	// node/user monitor tick cannot reconfigure an inbound mid-close.
-	POET.Stop()
+	if s.panelStarted {
+		s.panelStarted = false
+		POET.Stop()
+	}
 	return s.scope.Close()
 }
 
