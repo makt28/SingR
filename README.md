@@ -588,15 +588,15 @@ systemctl daemon-reload && systemctl enable --now singr
 
 ### AnyTLS padding（抗指纹）
 
-在 `anytls-in` 入站里加一行：
+默认就是随机：`anytls-in` 不写 `padding_scheme`，每次启动都会随机生成一套 padding 方案，避免所有节点用同一套公开的默认方案。也可以显式写：
 
 ```json
 "padding_scheme": ["random"]
 ```
 
-- `["random"]`：每次启动随机生成一套 padding 方案，避免所有节点用同一套公开的默认方案。
+- 不写或 `["random"]`：每次启动随机生成一套（2026-11 起不写即随机，之前不写是公开默认方案）。
+- `["default"]`：使用 sing-anytls 的公开默认方案。
 - 填其他内容：按你写的方案使用。
-- 不写：使用默认方案。
 
 只需要配服务端，客户端会自动同步。padding 不计入用户流量，也不影响限速。它只能打乱默认方案带来的特征，不能隐藏协议本身是 AnyTLS。
 

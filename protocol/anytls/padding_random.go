@@ -6,21 +6,52 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+
+	"github.com/anytls/sing-anytls/padding"
 )
 
-// randomPaddingSchemeSentinel is the opt-in marker: setting the anytls
-// inbound's padding_scheme to exactly ["random"] makes the server
-// synthesize a fresh, valid padding scheme at process startup instead of
-// shipping the public padding.DefaultPaddingScheme. The scheme is
+// padding_scheme resolution (SingR divergence from upstream sing-box, where
+// an empty list means the public padding.DefaultPaddingScheme):
+//
+//   - empty, or exactly ["random"] → a fresh scheme synthesized at process
+//     startup (randomPaddingScheme). Empty means random since 2026-11, so
+//     every install sheds the public default fingerprint without opting in.
+//   - exactly ["default"] → the public padding.DefaultPaddingScheme (the
+//     pre-2026-11 meaning of empty; the explicit way back).
+//   - any other list → used verbatim, lines joined with "\n".
+//
+// Sentinels are single-entry and case-insensitive. The scheme is
 // authoritative server-side (clients auto-sync via cmdUpdatePaddingScheme),
 // so only the server needs it. It is baked into the anytls.Service at
-// construction and is not hot-reloaded, matching the per-startup semantics.
-const randomPaddingSchemeSentinel = "random"
+// construction and is not hot-reloaded, so a random scheme changes only on
+// restart.
+const (
+	randomPaddingSchemeSentinel  = "random"
+	defaultPaddingSchemeSentinel = "default"
+)
 
-// isRandomPaddingScheme reports whether the configured padding_scheme is the
-// opt-in random sentinel (a single "random" entry, case-insensitive).
-func isRandomPaddingScheme[T ~[]string](scheme T) bool {
-	return len(scheme) == 1 && strings.EqualFold(strings.TrimSpace(scheme[0]), randomPaddingSchemeSentinel)
+// resolvePaddingScheme returns the scheme to hand to anytls.NewService, a
+// short description of where it came from (for the startup log) and its md5
+// (the value clients key on).
+func resolvePaddingScheme(configured []string) (scheme []byte, source string, md5hex string) {
+	switch {
+	case len(configured) == 0 || isPaddingSentinel(configured, randomPaddingSchemeSentinel):
+		scheme, md5hex = randomPaddingScheme()
+		return scheme, "randomized", md5hex
+	case isPaddingSentinel(configured, defaultPaddingSchemeSentinel):
+		scheme = padding.DefaultPaddingScheme
+		source = "public default"
+	default:
+		scheme = []byte(strings.Join(configured, "\n"))
+		source = "from config"
+	}
+	return scheme, source, fmt.Sprintf("%x", md5.Sum(scheme))
+}
+
+// isPaddingSentinel reports whether the configured padding_scheme is exactly
+// the given single-entry sentinel (case-insensitive, surrounding space ignored).
+func isPaddingSentinel(scheme []string, sentinel string) bool {
+	return len(scheme) == 1 && strings.EqualFold(strings.TrimSpace(scheme[0]), sentinel)
 }
 
 // randomPaddingScheme builds a fresh, valid padding scheme that stays inside
@@ -28,9 +59,15 @@ func isRandomPaddingScheme[T ~[]string](scheme T) bool {
 // public default. It shapes the first stop-1 records of every session:
 //
 //   - stop:      5..8 records shaped.
-//   - record 1:  a small initial record (24..64 .. up to 400 bytes).
+//   - record 1:  a small initial record, lower bound 24..64, upper bound
+//     lower+40..400 bytes.
 //   - records 2+: 1..3 body segments joined by the "c" continue-marker,
-//     each 300..1200 bytes, mirroring the default's multi-segment splitting.
+//     each lower bound 200..700 and upper bound lower+100..500 (so a
+//     segment spans 200..1200 bytes), mirroring the default's
+//     multi-segment splitting.
+//
+// There is no "0=" line, so once a client has synced this scheme its auth
+// packet carries no padding (the default pads it by a fixed 30 bytes).
 //
 // It returns the scheme and its md5 (the value clients key on) for logging.
 func randomPaddingScheme() (scheme []byte, md5hex string) {

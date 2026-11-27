@@ -26,7 +26,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	anytls "github.com/anytls/sing-anytls"
-	"github.com/anytls/sing-anytls/padding"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -75,15 +74,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.tlsConfig = tlsConfig
 	}
 
-	paddingScheme := padding.DefaultPaddingScheme
-	switch {
-	case isRandomPaddingScheme(options.PaddingScheme):
-		var md5hex string
-		paddingScheme, md5hex = randomPaddingScheme()
-		logger.Debug("anytls: randomized padding scheme generated, md5=", md5hex)
-	case len(options.PaddingScheme) > 0:
-		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
-	}
+	paddingScheme, paddingSource, paddingMD5 := resolvePaddingScheme(options.PaddingScheme)
+	logger.Debug("anytls: padding scheme ", paddingSource, ", md5=", paddingMD5)
 
 	service, err := anytls.NewService(anytls.ServiceConfig{
 		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
