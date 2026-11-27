@@ -27,10 +27,14 @@ before_show_menu() {
 #   3. bash 是按字节偏移边读边执行的，就地覆盖还会让当前这次运行读到错位内容。
 # 换成 临时文件 + bash -n 校验 + mv(rename)：失败时原脚本一个字节都没动；成功时
 # rename 换的是 inode，正在运行的 bash 继续持有旧 inode，第 3 条也一并消失。
-update_shell() {
-    local tmp
-    tmp="$(mktemp /usr/bin/.SingR.XXXXXX 2>/dev/null)" || {
-        echo -e "${red}无法在 /usr/bin 下创建临时文件（磁盘写满？先看 df -h / 和 df -i /）${plain}"
+# 只下载、校验、替换，不退出。docker 版的 update 拉完镜像后也调它，让管理脚本跟着
+# 升级（裸机版的 update 跑的是现拉的 install.sh，它自己会装最新脚本）。
+# SHELL_TARGET 只给测试用。
+update_shell_install() {
+    local target="${SHELL_TARGET:-/usr/bin/SingR}" dir tmp
+    dir="$(dirname "${target}")"
+    tmp="$(mktemp "${dir}/.SingR.XXXXXX" 2>/dev/null)" || {
+        echo -e "${red}无法在 ${dir} 下创建临时文件（磁盘写满？先看 df -h / 和 df -i /）${plain}"
         return 1
     }
     if ! curl -fsSL "${SCRIPT_URL}" -o "${tmp}"; then
@@ -46,12 +50,16 @@ update_shell() {
         return 1
     fi
     chmod 755 "${tmp}"
-    if ! mv -f "${tmp}" /usr/bin/SingR; then
+    if ! mv -f "${tmp}" "${target}"; then
         rm -f "${tmp}"
-        echo -e "${red}替换 /usr/bin/SingR 失败，管理脚本未改动${plain}"
+        echo -e "${red}替换 ${target} 失败，管理脚本未改动${plain}"
         return 1
     fi
-    ln -sf /usr/bin/SingR /usr/bin/singr
+    ln -sf "${target}" "${dir}/singr"
+}
+
+update_shell() {
+    update_shell_install || return 1
     echo -e "${green}管理脚本升级成功，请重新运行 SingR${plain}"
     exit 0
 }

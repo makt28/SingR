@@ -60,10 +60,14 @@ before_show_menu() {
 #   3. bash 是按字节偏移边读边执行的，就地覆盖还会让当前这次运行读到错位内容。
 # 换成 临时文件 + bash -n 校验 + mv(rename)：失败时原脚本一个字节都没动；成功时
 # rename 换的是 inode，正在运行的 bash 继续持有旧 inode，第 3 条也一并消失。
-update_shell() {
-    local tmp
-    tmp="$(mktemp /usr/bin/.SingR.XXXXXX 2>/dev/null)" || {
-        echo -e "${red}无法在 /usr/bin 下创建临时文件（磁盘写满？先看 df -h / 和 df -i /）${plain}"
+# 只下载、校验、替换，不退出。docker 版的 update 拉完镜像后也调它，让管理脚本跟着
+# 升级（裸机版的 update 跑的是现拉的 install.sh，它自己会装最新脚本）。
+# SHELL_TARGET 只给测试用。
+update_shell_install() {
+    local target="${SHELL_TARGET:-/usr/bin/SingR}" dir tmp
+    dir="$(dirname "${target}")"
+    tmp="$(mktemp "${dir}/.SingR.XXXXXX" 2>/dev/null)" || {
+        echo -e "${red}无法在 ${dir} 下创建临时文件（磁盘写满？先看 df -h / 和 df -i /）${plain}"
         return 1
     }
     if ! curl -fsSL "${SCRIPT_URL}" -o "${tmp}"; then
@@ -79,12 +83,16 @@ update_shell() {
         return 1
     fi
     chmod 755 "${tmp}"
-    if ! mv -f "${tmp}" /usr/bin/SingR; then
+    if ! mv -f "${tmp}" "${target}"; then
         rm -f "${tmp}"
-        echo -e "${red}替换 /usr/bin/SingR 失败，管理脚本未改动${plain}"
+        echo -e "${red}替换 ${target} 失败，管理脚本未改动${plain}"
         return 1
     fi
-    ln -sf /usr/bin/SingR /usr/bin/singr
+    ln -sf "${target}" "${dir}/singr"
+}
+
+update_shell() {
+    update_shell_install || return 1
     echo -e "${green}管理脚本升级成功，请重新运行 SingR${plain}"
     exit 0
 }
@@ -181,6 +189,7 @@ uninstall_singr() {
     systemctl reset-failed >/dev/null 2>&1 || true
     rm -f /etc/logrotate.d/singr
     cert_timer_remove
+    cert_timer_remove_unit "${NODE_CERT_TIMER}"
     rm -rf "${INSTALL_DIR}" "${CONFIG_DIR}"
 
     echo -e "${green}卸载成功${plain}"
@@ -611,6 +620,64 @@ node_effective_cert() {
     printf '%s|%s' "${cert}" "${key}"
 }
 
+# ---- 节点实际生效的 SNI（只用于显示和证书覆盖检查）----
+#
+# 运行时面板 host= 优先，其次 server.json 的 server_name（--sni）。面板 host 本地没有
+# 别处存着，所以 add 时把查到的 host 记进 ${NODE_META}（{"<intag>": {"panel_host": ...}}），
+# 升级上来的老节点没有记录，singr list 时补查一次面板（node_meta_backfill）。只是显示
+# 用：面板之后改了 host 这里不会跟着变，进程不读这个文件。
+NODE_META="${CONFIG_DIR}/node-meta.json"
+
+node_meta_has() {
+    jq -e --arg t "$1" 'has($t)' "${NODE_META}" >/dev/null 2>&1
+}
+
+node_meta_set() { # <intag> <panel_host>
+    local tmp src="${NODE_META}"
+    [[ -s "${src}" ]] && jq -e 'type == "object"' "${src}" >/dev/null 2>&1 || src=/dev/null
+    tmp="$(mktemp "${CONFIG_DIR}/.node-meta.XXXXXX")" || return 1
+    if jq -n --arg t "$1" --arg h "$2" --slurpfile m "${src}" \
+        '($m[0] // {}) | .[$t] = {panel_host: $h}' >"${tmp}" && mv -f "${tmp}" "${NODE_META}"; then
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+node_meta_del() { # <intag>
+    local tmp
+    node_meta_has "$1" || return 0
+    tmp="$(mktemp "${CONFIG_DIR}/.node-meta.XXXXXX")" || return 1
+    jq --arg t "$1" 'del(.[$t])' "${NODE_META}" >"${tmp}" && mv -f "${tmp}" "${NODE_META}" || rm -f "${tmp}"
+}
+
+node_sni() { # <intag>
+    local h
+    h="$(jq -r --arg t "$1" '.[$t].panel_host // ""' "${NODE_META}" 2>/dev/null)"
+    [[ -n "${h}" ]] || h="$(jq -r --arg t "$1" '(first(.inbounds[]? | select(.tag==$t) | .tls.server_name)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+    printf '%s' "${h}"
+}
+
+# 证书提示里称呼一个节点："a-in（SNI x.com）"。
+node_desc() { # <intag>
+    local sni
+    sni="$(node_sni "$1")"
+    printf '%s（SNI %s）' "$1" "${sni:-未知}"
+}
+
+# 没有记录的节点向面板补查一次 host（老版本装的节点）。查不到就下次再试，不报错。
+node_meta_backfill() {
+    local intag api_url api_key node_id node_type res host
+    while IFS=$'\t' read -r intag api_url api_key node_id node_type; do
+        [[ -n "${intag}" && -n "${api_url}" && "${node_id}" =~ ^[0-9]+$ ]] || continue
+        node_meta_has "${intag}" && continue
+        res="$(node_panel_detect "${api_url}" "${api_key}" "${node_id}" "${node_type:-V2ray}" 5 2>/dev/null)" || continue
+        IFS=$'\t' read -r _ _ host <<<"${res}"
+        node_meta_set "${intag}" "${host}" || true
+    done < <(jq -r '(.nodes // [])[] | [(.intag // ""), (.apiconfig.apihost // ""), (.apiconfig.apikey // ""),
+            ((.apiconfig.nodeid // "") | tostring), (.apiconfig.nodetype // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null)
+}
+
 # tag 是否已被某个节点占用。只看 panel.json：server.json 里存在同名 inbound 但没有
 # 节点引用它（默认配置铺的 anytls-in / hysteria2-in / naive-in 超集就是这种），那不是"占用"，
 # 而是可以直接接管的模板——第一次 add 就该落在 anytls-in 上，与老装机保持一致。
@@ -667,9 +734,12 @@ node_drop_placeholder() {
         "${PANEL_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${PANEL_CONFIG}"
 }
 
+# 带 --refresh 时先给没有 SNI 记录的节点补查面板（只有 singr list 命令这么调；菜单和
+# add/del 之后的列表不发网络请求）。
 node_list() {
     node_require_jq || return 1
     node_configs_ready || return 1
+    [[ "${1:-}" == "--refresh" ]] && node_meta_backfill
 
     echo -e "${green}当前节点（${PANEL_CONFIG}）：${plain}"
     if [[ "$(node_count)" == "0" ]]; then
@@ -678,8 +748,8 @@ node_list() {
     fi
 
     # 表头用 ASCII：printf 的宽度按字节算，中文表头会和下面的数据列对不齐。
-    printf '  %-3s %-8s %-10s %-34s %-20s %s\n' "#" "NodeID" "PROTO" "DOMAIN" "INTAG" "CERT"
-    local i=1 nodeid apihost intag proto paths cert key mark
+    printf '  %-3s %-8s %-10s %-34s %-20s %-28s %s\n' "#" "NodeID" "PROTO" "DOMAIN" "INTAG" "SNI" "CERT"
+    local i=1 nodeid apihost intag proto paths cert key mark sni
     while IFS=$'\t' read -r nodeid apihost intag; do
         [[ -z "${intag}" ]] && continue
         proto="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .type)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
@@ -699,7 +769,8 @@ node_list() {
                 mark="${red}缺失${plain}"
             fi
         fi
-        printf '  %-3s %-8s %-10s %-34s %-20s ' "${i}" "${nodeid}" "${proto}" "${apihost}" "${intag}"
+        sni="$(node_sni "${intag}")"
+        printf '  %-3s %-8s %-10s %-34s %-20s %-28s ' "${i}" "${nodeid}" "${proto}" "${apihost}" "${intag}" "${sni:--}"
         echo -e "${mark}"
         i=$((i + 1))
     done < <(jq -r '(.nodes // [])[] | [((.apiconfig.nodeid // "?")|tostring), (.apiconfig.apihost // "?"), (.intag // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null)
@@ -847,7 +918,7 @@ node_add() {
     node_configs_ready || return 1
 
     local api_url="" api_key="" node_id="" protocol="" sni="" cert_src="" key_src=""
-    local cert_url="" key_url=""
+    local cert_url="" key_url="" node_cert_url="" node_key_url=""
     local panel_type="SSpanel" node_type="V2ray" timeout="20" speed_limit="0"
     local device_limit="0" enable_device_limit="false" update_periodic="60"
 
@@ -862,6 +933,8 @@ node_add() {
             --key-path) key_src="$2"; shift 2 ;;
             --cert-url) cert_url="$2"; shift 2 ;;
             --key-url) key_url="$2"; shift 2 ;;
+            --node-cert-url) node_cert_url="$2"; shift 2 ;;
+            --node-key-url) node_key_url="$2"; shift 2 ;;
             --panel-type) panel_type="$2"; shift 2 ;;
             --node-type) node_type="$2"; shift 2 ;;
             --timeout) timeout="$2"; shift 2 ;;
@@ -882,7 +955,8 @@ node_add() {
             [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
             [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
             [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
-            if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
+            if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" &&
+                -z "${node_cert_url}" && -z "${node_key_url}" ]]; then
                 echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
                 read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
             fi
@@ -929,6 +1003,19 @@ node_add() {
         echo -e "${red}--cert-path 与 --cert-url 只能二选一${plain}"
         return 1
     fi
+    # --node-cert-url/--node-key-url 是这个节点独占的远程证书（见「节点独立证书」块），
+    # 和默认证书、显式路径都不相干，所以三种只能选一种。
+    if [[ -n "${node_cert_url}" && -z "${node_key_url}" ]] || [[ -z "${node_cert_url}" && -n "${node_key_url}" ]]; then
+        echo -e "${red}--node-cert-url 与 --node-key-url 必须同时给出${plain}"
+        return 1
+    fi
+    if [[ -n "${node_cert_url}" && ( -n "${cert_src}" || -n "${cert_url}" ) ]]; then
+        echo -e "${red}--node-cert-url 不能和 --cert-path / --cert-url 一起用${plain}"
+        return 1
+    fi
+    if [[ -n "${node_cert_url}" ]]; then
+        node_cert_check_urls "${node_cert_url}" "${node_key_url}" || return 1
+    fi
     # 路径原样写进 server.json，由后端进程解析：systemd 的工作目录是 /，容器里更是
     # 另一个命名空间，相对路径到那边就指错了。这里按当前目录补成绝对路径，但不解析
     # 符号链接 —— certbot 的 live/ 软链要保留原样，续期换的正是软链。
@@ -970,9 +1057,17 @@ node_add() {
         node_drop_placeholder || { echo -e "${red}清理占位节点失败${plain}"; return 1; }
     fi
 
-    local tag paths cert_path key_path eff_cert eff_key
+    local tag paths cert_path key_path eff_cert eff_key own_cert=0
     tag="$(node_alloc_tag "${proto}" "${node_id}")"
-    if [[ -n "${cert_src}" ]]; then
+    if [[ -n "${node_cert_url}" ]]; then
+        # 先下载校验，失败什么都不留、配置也没动。之后任何一步失败都要 node_cert_forget。
+        node_cert_prepare "${tag}" "${node_cert_url}" "${node_key_url}" "${panel_host:-${sni}}" || return 1
+        own_cert=1
+        cert_path="$(node_cert_path "${tag}")"
+        key_path="$(node_cert_key_path "${tag}")"
+        eff_cert="${cert_path}"
+        eff_key="${key_path}"
+    elif [[ -n "${cert_src}" ]]; then
         paths="$(node_backend_place_cert "${tag}" "${cert_src}" "${key_src}")" || return 1
         cert_path="${paths%%|*}"
         key_path="${paths##*|}"
@@ -1010,14 +1105,21 @@ node_add() {
         echo -e "  cp 证书 ${CERT_DIR}/default.pem"
         echo -e "  cp 私钥 ${CERT_DIR}/default.key"
         echo -e "${yellow}（.crt 后缀也认；或用 --cert-path/--key-path 指定其他路径，"
-        echo -e "  或用 --cert-url/--key-url 从远程地址下载并每日检查更新）${plain}"
+        echo -e "  或用 --cert-url/--key-url 从远程地址下载并每日检查更新，"
+        echo -e "  或用 --node-cert-url/--node-key-url 给这个节点单独配一张远程证书）${plain}"
+        ((own_cert)) && node_cert_forget "${tag}"
         return 1
     fi
 
-    node_backup || { echo -e "${red}备份配置失败，已中止${plain}"; return 1; }
+    if ! node_backup; then
+        echo -e "${red}备份配置失败，已中止${plain}"
+        ((own_cert)) && node_cert_forget "${tag}"
+        return 1
+    fi
     if ! node_write_server "${tag}" "${proto}" "${sni}" "${cert_path}" "${key_path}"; then
         echo -e "${red}写入 ${SERVER_CONFIG} 失败${plain}"
         node_restore
+        ((own_cert)) && node_cert_forget "${tag}"
         return 1
     fi
     if ! node_write_panel "${tag}" "${proto}" "${api_url}" "${api_key}" "${node_id}" \
@@ -1025,11 +1127,14 @@ node_add() {
         "${update_periodic}" "${enable_device_limit}"; then
         echo -e "${red}写入 ${PANEL_CONFIG} 失败${plain}"
         node_restore
+        ((own_cert)) && node_cert_forget "${tag}"
         return 1
     fi
 
     echo -e "${green}已添加节点：${api_url} #${node_id}（${proto}，InTag=${tag}）${plain}"
     if node_apply; then
+        node_meta_set "${tag}" "${panel_host}" || true
+        ((own_cert)) && node_cert_commit "${tag}" "${node_cert_url}" "${node_key_url}"
         node_backend_resume
         echo
         node_list
@@ -1039,6 +1144,7 @@ node_add() {
         node_cert_renew_hint
         return 0
     fi
+    ((own_cert)) && node_cert_forget "${tag}"
     return 1
 }
 
@@ -1144,11 +1250,15 @@ node_del() {
     echo -e "${green}已删除节点 ${sel}（InTag=${tag}）${plain}"
     if ((last)); then
         node_commit
+        node_meta_del "${tag}"
+        node_cert_forget "${tag}"
         node_backend_idle
         echo -e "${green}${APP_NAME} 已停止（当前没有节点）。用 singr add 添加节点后会自动启动。${plain}"
         return 0
     fi
     if node_apply; then
+        node_meta_del "${tag}"
+        node_cert_forget "${tag}"
         echo
         node_list
         return 0
@@ -1239,7 +1349,8 @@ node_cert_renew_hint() {
     echo -e "无需重启，也不需要 --deploy-hook（default.pem 软链到 certbot 的除外，那种情况"
     echo -e "监视不到 live/ 里的变化，仍需 --deploy-hook \"singr restart\"）。默认证书可以用"
     echo -e "  singr cert-source"
-    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。${plain}"
+    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。单个节点要用自己的远程证书，"
+    echo -e "添加时用 --node-cert-url/--node-key-url，之后用 singr node-cert 管理。${plain}"
 }
 
 # >>>>>>>>>>>>>>>> SYNC BLOCK: 默认证书更新源 >>>>>>>>>>>>>>>>
@@ -1256,7 +1367,11 @@ node_cert_renew_hint() {
 # 文件一换就自动重新加载；新证书加载失败时进程继续用内存里的旧证书。重启则会让同一
 # 进程里用别的证书的节点也一起断线 —— 默认证书的事不该牵连它们。
 #
-# 依赖节点管理块里的 node_default_cert_path / node_cert_end_epoch / node_cert_days_left。
+# 下载 → 校验 → 替换这一段（cert_pair_update）和 timer 的读写也给「节点独立证书」块
+# 用，两边只是目标文件、登记文件和 timer 不同，互不读写对方的东西。
+#
+# 依赖节点管理块里的 node_default_cert_path / node_cert_end_epoch / node_cert_days_left /
+# node_sni / node_desc。
 
 CERT_SOURCE="${CONFIG_DIR}/cert-source.json"
 CERT_TIMER="singr-cert-update"
@@ -1301,68 +1416,82 @@ cert_fingerprint() {
     openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null
 }
 
-# 正在使用默认证书的节点：每行 "<intag>\t<server_name>"。
+# 正在使用默认证书的节点：每行 "<intag>\t<SNI>"。SNI 取实际生效的那个（node_sni：
+# 面板 host= 优先，其次 server.json 的 server_name）。
 cert_default_inbounds() {
     [[ -f "${PANEL_CONFIG}" && -f "${SERVER_CONFIG}" ]] || return 0
-    jq -r --slurpfile s "${SERVER_CONFIG}" '
+    local tag
+    while IFS= read -r tag; do
+        [[ -n "${tag}" ]] || continue
+        printf '%s\t%s\n' "${tag}" "$(node_sni "${tag}")"
+    done < <(jq -r --slurpfile s "${SERVER_CONFIG}" '
         (.nodes // [])[] | (.intag // "") as $t | select($t != "")
         | ($s[0].inbounds // [])[] | select(.tag == $t)
         | select(((.tls.certificate_path // "") == "") and ((.tls.key_path // "") == ""))
-        | [$t, (.tls.server_name // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null
+        | $t' "${PANEL_CONFIG}" 2>/dev/null)
+}
+
+# 默认证书的使用者，一行文案："a-in（SNI x.com）、b-in（SNI 未知）"；没有就输出空。
+cert_default_users_desc() {
+    local tag sni out=""
+    while IFS=$'\t' read -r tag sni; do
+        [[ -n "${tag}" ]] || continue
+        out+="${out:+、}${tag}（SNI ${sni:-未知}）"
+    done < <(cert_default_inbounds)
+    printf '%s' "${out}"
 }
 
 # 新证书没覆盖到的 SNI 只警告不拦：SNI 也可能由面板 host= 下发，server.json 里看不到。
 # 只认明确的 "does NOT match"；openssl 不支持 -checkhost（LibreSSL）时判定不了，不报。
-cert_warn_sni() {
+cert_warn_sni() { # <cert> <"<intag>\t<sni>" 每行一个>
     local c="$1" tag sni
     while IFS=$'\t' read -r tag sni; do
         [[ -n "${sni}" ]] || continue
         if openssl x509 -noout -in "${c}" -checkhost "${sni}" 2>/dev/null | grep -q 'does NOT match'; then
             echo -e "${yellow}[证书] 注意：新证书不包含节点 ${tag} 的 SNI ${sni}，客户端校验会失败${plain}"
         fi
-    done < <(cert_default_inbounds)
+    done <<<"${2:-}"
 }
 
-# 下载、校验并换上默认证书（只换文件，见块头）。
-#   mode  auto  —— 定时任务：本地剩余不足 CERT_RENEW_DAYS 天才下载，且远端须比本地新
-#         force —— 立即下载，只要和本地不是同一张就替换（首次配置、手动更新）
-cert_default_update() {
-    local mode="$1" cert_url="$2" key_url="$3"
-    local cur_cert cur_key new_cert new_key why days cur_end new_end
+cert_tools_ready() {
     command -v openssl >/dev/null 2>&1 || { echo -e "${red}[证书] 需要 openssl${plain}"; return 1; }
     command -v curl >/dev/null 2>&1 || { echo -e "${red}[证书] 需要 curl${plain}"; return 1; }
+}
 
-    # 定时任务与手动执行撞在一起时，后来的直接退出。
-    if command -v flock >/dev/null 2>&1; then
-        exec 9>"${CONFIG_DIR}/.cert-update.lock"
-        flock -n 9 || { echo -e "${yellow}[证书] 另一个证书更新正在进行，跳过${plain}"; return 0; }
-    fi
+# 下载、校验并换上一对证书（只换文件，见块头）。默认证书和节点独立证书共用。
+#   mode      auto  —— 定时任务：本地剩余不足 CERT_RENEW_DAYS 天才下载，且远端须比本地新
+#             force —— 立即下载，只要和本地不是同一张就替换（首次配置、手动更新）
+#   label     文案里的称呼："默认证书" / "节点 a-in（SNI x.com）的证书"
+#   sni_lines "<intag>\t<sni>" 每行一个，新证书要覆盖的 SNI（见 cert_warn_sni）
+# 下载用的临时文件和换下来的旧证书备份都放在目标证书的同一目录（同文件系统 rename）。
+cert_pair_update() { # <mode> <cur_cert> <cur_key> <cert_url> <key_url> <label> [sni_lines]
+    local mode="$1" cur_cert="$2" cur_key="$3" cert_url="$4" key_url="$5" label="$6" sni_lines="${7:-}"
+    local dir bak new_cert new_key why days cur_end new_end
+    dir="$(dirname "${cur_cert}")"
+    bak="${dir}/.$(basename "${cur_key}" .key)-prev"
 
-    cur_cert="$(node_default_cert_path)"
-    cur_key="$(node_default_key_path)"
     if [[ "${mode}" == "auto" && -s "${cur_cert}" ]] &&
         openssl x509 -checkend $((CERT_RENEW_DAYS * 86400)) -noout -in "${cur_cert}" >/dev/null 2>&1; then
-        echo -e "${green}[证书] 默认证书剩余 $(node_cert_days_left "${cur_cert}") 天，未到 ${CERT_RENEW_DAYS} 天更新线，无需下载${plain}"
+        echo -e "${green}[证书] ${label}剩余 $(node_cert_days_left "${cur_cert}") 天，未到 ${CERT_RENEW_DAYS} 天更新线，无需下载${plain}"
         return 0
     fi
 
-    [[ -d "${CERT_DIR}" ]] || mkdir -m 700 -p "${CERT_DIR}" || return 1
-    # 下到同目录的临时文件，换上去才是同一文件系统内的 rename。
-    new_cert="$(mktemp "${CERT_DIR}/.download.XXXXXX")" || return 1
-    new_key="$(mktemp "${CERT_DIR}/.download.XXXXXX")" || { rm -f "${new_cert}"; return 1; }
+    [[ -d "${dir}" ]] || mkdir -m 700 -p "${dir}" || return 1
+    new_cert="$(mktemp "${dir}/.download.XXXXXX")" || return 1
+    new_key="$(mktemp "${dir}/.download.XXXXXX")" || { rm -f "${new_cert}"; return 1; }
     if ! cert_source_fetch "${cert_url}" "${new_cert}"; then
         rm -f "${new_cert}" "${new_key}"
-        echo -e "${red}[证书] 下载证书失败：$(cert_url_mask "${cert_url}")，现有证书未改动${plain}"
+        echo -e "${red}[证书] ${label}：下载证书失败：$(cert_url_mask "${cert_url}")，现有证书未改动${plain}"
         return 1
     fi
     if ! cert_source_fetch "${key_url}" "${new_key}"; then
         rm -f "${new_cert}" "${new_key}"
-        echo -e "${red}[证书] 下载私钥失败：$(cert_url_mask "${key_url}")，现有证书未改动${plain}"
+        echo -e "${red}[证书] ${label}：下载私钥失败：$(cert_url_mask "${key_url}")，现有证书未改动${plain}"
         return 1
     fi
     if ! why="$(cert_check_pair "${new_cert}" "${new_key}")"; then
         rm -f "${new_cert}" "${new_key}"
-        echo -e "${red}[证书] 下载到的${why}，现有证书未改动${plain}"
+        echo -e "${red}[证书] ${label}：下载到的${why}，现有证书未改动${plain}"
         return 1
     fi
 
@@ -1370,10 +1499,10 @@ cert_default_update() {
         if [[ "$(cert_fingerprint "${new_cert}")" == "$(cert_fingerprint "${cur_cert}")" ]]; then
             rm -f "${new_cert}" "${new_key}"
             if [[ "${mode}" == "auto" ]]; then
-                echo -e "${yellow}[证书] 默认证书剩余 $(node_cert_days_left "${cur_cert}") 天，但远端还是同一张证书，远端尚未续期${plain}"
+                echo -e "${yellow}[证书] ${label}剩余 $(node_cert_days_left "${cur_cert}") 天，但远端还是同一张证书，远端尚未续期${plain}"
                 return 1
             fi
-            echo -e "${green}[证书] 远端证书与本地相同，无需替换${plain}"
+            echo -e "${green}[证书] ${label}：远端证书与本地相同，无需替换${plain}"
             return 0
         fi
         if [[ "${mode}" == "auto" ]]; then
@@ -1381,7 +1510,7 @@ cert_default_update() {
             new_end="$(node_cert_end_epoch "${new_cert}")"
             if [[ -n "${cur_end}" && -n "${new_end}" && "${new_end}" -le "${cur_end}" ]]; then
                 rm -f "${new_cert}" "${new_key}"
-                echo -e "${yellow}[证书] 远端证书不比本地新，不替换（远端尚未续期？）${plain}"
+                echo -e "${yellow}[证书] ${label}：远端证书不比本地新，不替换（远端尚未续期？）${plain}"
                 return 1
             fi
         fi
@@ -1389,49 +1518,66 @@ cert_default_update() {
 
     days="$(node_cert_days_left "${new_cert}")"
     if [[ -n "${days}" && "${days}" -lt "${CERT_RENEW_DAYS}" ]]; then
-        echo -e "${yellow}[证书] 注意：远端证书只剩 ${days} 天，远端该续期了${plain}"
+        echo -e "${yellow}[证书] 注意：${label}的远端证书只剩 ${days} 天，远端该续期了${plain}"
     fi
-    cert_warn_sni "${new_cert}"
+    cert_warn_sni "${new_cert}" "${sni_lines}"
 
     # 留一份旧证书：私钥换上了、证书却没换成时要换回去，否则磁盘上是不配对的一对，
     # 下次启动直接起不来。
     local have_bak=0
     if [[ -s "${cur_cert}" && -s "${cur_key}" ]]; then
-        cp -p "${cur_cert}" "${CERT_DIR}/.default-prev.cert" &&
-            cp -p "${cur_key}" "${CERT_DIR}/.default-prev.key" && have_bak=1
+        cp -p "${cur_cert}" "${bak}.cert" && cp -p "${cur_key}" "${bak}.key" && have_bak=1
     fi
     chmod 644 "${new_cert}"
     chmod 600 "${new_key}"
     if ! mv -f "${new_key}" "${cur_key}" || ! mv -f "${new_cert}" "${cur_cert}"; then
         rm -f "${new_cert}" "${new_key}"
-        [[ "${have_bak}" == 1 ]] && mv -f "${CERT_DIR}/.default-prev.cert" "${cur_cert}" &&
-            mv -f "${CERT_DIR}/.default-prev.key" "${cur_key}"
+        [[ "${have_bak}" == 1 ]] && mv -f "${bak}.cert" "${cur_cert}" && mv -f "${bak}.key" "${cur_key}"
         echo -e "${red}[证书] 写入 ${cur_cert} 失败，已保留原证书${plain}"
         return 1
     fi
-    echo -e "${green}[证书] 已更新默认证书 ${cur_cert}（剩余 $(node_cert_days_left "${cur_cert}") 天），运行中的进程会自动重新加载，无需重启${plain}"
-    rm -f "${CERT_DIR}/.default-prev.cert" "${CERT_DIR}/.default-prev.key"
+    echo -e "${green}[证书] 已更新${label} ${cur_cert}（剩余 $(node_cert_days_left "${cur_cert}") 天），运行中的进程会自动重新加载，无需重启${plain}"
+    rm -f "${bak}.cert" "${bak}.key"
     return 0
 }
 
-cert_timer_install() {
+# 默认证书：mode 同 cert_pair_update。
+cert_default_update() {
+    local mode="$1" cert_url="$2" key_url="$3" users
+    cert_tools_ready || return 1
+
+    # 定时任务与手动执行撞在一起时，后来的直接退出。
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${CONFIG_DIR}/.cert-update.lock"
+        flock -n 9 || { echo -e "${yellow}[证书] 另一个证书更新正在进行，跳过${plain}"; return 0; }
+    fi
+
+    users="$(cert_default_users_desc)"
+    [[ -n "${users}" ]] && echo -e "[证书] 默认证书的使用节点：${users}"
+    cert_pair_update "${mode}" "$(node_default_cert_path)" "$(node_default_key_path)" \
+        "${cert_url}" "${key_url}" "默认证书" "$(cert_default_inbounds)"
+}
+
+# 写一个每天跑一次 "${SELF_CMD} <子命令>" 的 systemd timer 并启用。
+cert_timer_write() { # <unit 名> <描述> <子命令>
+    local unit="$1" desc="$2" sub="$3"
     if ! command -v systemctl >/dev/null 2>&1; then
-        echo -e "${yellow}[证书] 未检测到 systemd，无法安装每日检查。请自行每天执行一次：${SELF_CMD} cert-update${plain}"
+        echo -e "${yellow}[证书] 未检测到 systemd，无法安装每日检查。请自行每天执行一次：${SELF_CMD} ${sub}${plain}"
         return 0
     fi
-    cat >"${CERT_TIMER_DIR}/${CERT_TIMER}.service" <<EOF
+    cat >"${CERT_TIMER_DIR}/${unit}.service" <<EOF
 [Unit]
-Description=SingR default certificate update check
+Description=${desc}
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${SELF_CMD} cert-update
+ExecStart=${SELF_CMD} ${sub}
 EOF
-    cat >"${CERT_TIMER_DIR}/${CERT_TIMER}.timer" <<EOF
+    cat >"${CERT_TIMER_DIR}/${unit}.timer" <<EOF
 [Unit]
-Description=Daily SingR default certificate update check
+Description=Daily ${desc}
 
 [Timer]
 OnCalendar=daily
@@ -1442,16 +1588,24 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable --now "${CERT_TIMER}.timer" >/dev/null 2>&1 ||
-        echo -e "${yellow}[证书] 启用 ${CERT_TIMER}.timer 失败，请检查 systemctl status ${CERT_TIMER}.timer${plain}"
+    systemctl enable --now "${unit}.timer" >/dev/null 2>&1 ||
+        echo -e "${yellow}[证书] 启用 ${unit}.timer 失败，请检查 systemctl status ${unit}.timer${plain}"
+}
+
+cert_timer_remove_unit() { # <unit 名>
+    command -v systemctl >/dev/null 2>&1 || return 0
+    [[ -f "${CERT_TIMER_DIR}/$1.timer" ]] || return 0
+    systemctl disable --now "$1.timer" >/dev/null 2>&1 || true
+    rm -f "${CERT_TIMER_DIR}/$1.timer" "${CERT_TIMER_DIR}/$1.service"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+cert_timer_install() {
+    cert_timer_write "${CERT_TIMER}" "SingR default certificate update check" "cert-update"
 }
 
 cert_timer_remove() {
-    command -v systemctl >/dev/null 2>&1 || return 0
-    [[ -f "${CERT_TIMER_DIR}/${CERT_TIMER}.timer" ]] || return 0
-    systemctl disable --now "${CERT_TIMER}.timer" >/dev/null 2>&1 || true
-    rm -f "${CERT_TIMER_DIR}/${CERT_TIMER}.timer" "${CERT_TIMER_DIR}/${CERT_TIMER}.service"
-    systemctl daemon-reload 2>/dev/null || true
+    cert_timer_remove_unit "${CERT_TIMER}"
 }
 
 # 配置（或更换）默认证书更新源并立即下载一次。下载和校验都通过才写配置；失败什么
@@ -1510,6 +1664,9 @@ cert_source_show() {
     else
         echo -e "  状态：${red}不存在${plain}"
     fi
+    local users
+    users="$(cert_default_users_desc)"
+    echo -e "  使用节点：${users:-无}"
     if [[ -s "${CERT_SOURCE}" ]]; then
         echo -e "${green}更新源：${plain}"
         echo "  证书：$(cert_url_mask "$(cert_source_get cert_url)")"
@@ -1587,6 +1744,297 @@ cert_update_cmd() {
     cert_default_update "${mode}" "$(cert_source_get cert_url)" "$(cert_source_get key_url)"
 }
 # <<<<<<<<<<<<<<<< SYNC BLOCK: 默认证书更新源 <<<<<<<<<<<<<<<<
+
+# >>>>>>>>>>>>>>>> SYNC BLOCK: 节点独立证书 >>>>>>>>>>>>>>>>
+# 本块在 SingR.sh 与 SingR-docker.sh 中逐字相同（源在 scripts/src/lib/node-cert.sh）。
+#
+# 和默认证书平行的另一套：某个节点独占一张从远程地址下载的证书，放在
+# ${CERT_DIR}/node/<intag>.pem + <intag>.key。server.json 里写的就是这两个显式路径，
+# 对二进制来说是普通的显式证书（Go 侧不需要知道这套机制）；对默认证书那套来说，这些
+# 节点不算"用默认证书的节点"，默认更新源怎么换都碰不到它们，反过来也一样。
+#
+# 来源登记在 ${NODE_CERT_SOURCE}：{"<intag>": {"cert_url": ..., "key_url": ...}}，0600
+# （地址里常带 token）。定时任务 singr-node-cert-update.timer 每天跑一次
+# singr node-cert-update，规则与默认证书相同：剩余不足 CERT_RENEW_DAYS 天才下载、远端
+# 更新才替换、只换文件不重启（进程按文件路径监视，换哪个节点的证书只重载那个节点）。
+# 各节点互不影响：一个失败照样处理其余的，只要有失败就以非零退出。
+#
+# 生命周期跟着节点走：singr add --node-cert-url/--node-key-url 下载并登记，singr del
+# 删节点时连证书和登记一起删，登记删空了顺带卸掉 timer。
+#
+# 依赖「默认证书更新源」块的 cert_pair_update / cert_tools_ready / cert_url_mask /
+# cert_timer_write / cert_timer_remove_unit / CERT_RENEW_DAYS，和「节点管理」块的
+# node_resolve_tag / node_effective_cert / node_inbound_exists / node_sni / node_desc /
+# node_cert_status。
+
+NODE_CERT_DIR="${CERT_DIR}/node"
+NODE_CERT_SOURCE="${CONFIG_DIR}/node-certs.json"
+NODE_CERT_TIMER="singr-node-cert-update"
+
+node_cert_path() { printf '%s' "${NODE_CERT_DIR}/$1.pem"; }
+node_cert_key_path() { printf '%s' "${NODE_CERT_DIR}/$1.key"; }
+
+node_cert_source_get() { # <intag> <cert_url|key_url>
+    jq -r --arg t "$1" --arg k "$2" '.[$t][$k] // ""' "${NODE_CERT_SOURCE}" 2>/dev/null
+}
+
+node_cert_registered() {
+    jq -e --arg t "$1" 'has($t)' "${NODE_CERT_SOURCE}" >/dev/null 2>&1
+}
+
+node_cert_tags() {
+    jq -r 'keys[]' "${NODE_CERT_SOURCE}" 2>/dev/null
+}
+
+# 该节点的 server.json 是否正指向它的独立证书路径。
+node_cert_in_use() {
+    node_inbound_exists "$1" || return 1
+    [[ "$(node_effective_cert "$1")" == "$(node_cert_path "$1")|$(node_cert_key_path "$1")" ]]
+}
+
+# 私钥要走这条链路，只接受 https（下载时 --proto =https 还会拒绝重定向到 http）。
+node_cert_check_urls() { # <cert_url> <key_url>
+    local u
+    for u in "$1" "$2"; do
+        if [[ "${u}" != https://* ]]; then
+            echo -e "${red}证书地址必须是 https://（私钥不能明文传输）：$(cert_url_mask "${u}")${plain}"
+            return 1
+        fi
+    done
+}
+
+node_cert_registry_set() { # <intag> <cert_url> <key_url>
+    local tmp src="${NODE_CERT_SOURCE}"
+    [[ -s "${src}" ]] && jq -e 'type == "object"' "${src}" >/dev/null 2>&1 || src=/dev/null
+    tmp="$(mktemp "${CONFIG_DIR}/.node-certs.XXXXXX")" || return 1
+    chmod 600 "${tmp}"
+    if jq -n --arg t "$1" --arg c "$2" --arg k "$3" --slurpfile m "${src}" \
+        '($m[0] // {}) | .[$t] = {cert_url: $c, key_url: $k}' >"${tmp}" && mv -f "${tmp}" "${NODE_CERT_SOURCE}"; then
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+node_cert_registry_del() { # <intag>
+    local tmp
+    node_cert_registered "$1" || return 0
+    tmp="$(mktemp "${CONFIG_DIR}/.node-certs.XXXXXX")" || return 1
+    chmod 600 "${tmp}"
+    if jq --arg t "$1" 'del(.[$t])' "${NODE_CERT_SOURCE}" >"${tmp}" && mv -f "${tmp}" "${NODE_CERT_SOURCE}"; then
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+# 登记删空了就卸掉 timer（连文件一起删，免得留一个每天空跑的任务）。
+node_cert_timer_sync() {
+    if [[ -n "$(node_cert_tags)" ]]; then
+        cert_timer_write "${NODE_CERT_TIMER}" "SingR per-node certificate update check" "node-cert-update"
+    else
+        rm -f "${NODE_CERT_SOURCE}"
+        cert_timer_remove_unit "${NODE_CERT_TIMER}"
+    fi
+}
+
+# 下载、校验并换上某节点的独立证书。sni 缺省取该节点当前生效的 SNI。
+node_cert_fetch() { # <mode> <intag> <cert_url> <key_url> [sni]
+    local sni
+    if [[ $# -ge 5 ]]; then sni="$5"; else sni="$(node_sni "$2")"; fi
+    cert_pair_update "$1" "$(node_cert_path "$2")" "$(node_cert_key_path "$2")" "$3" "$4" \
+        "节点 $2（SNI ${sni:-未知}）的证书" "$(printf '%s\t%s' "$2" "${sni}")"
+}
+
+# add 时、节点落盘之前：先把证书下好。失败时不留文件（cert_pair_update 自己清临时文件，
+# 目标文件只有成功时才出现）。
+node_cert_prepare() { # <intag> <cert_url> <key_url> <sni>
+    cert_tools_ready || return 1
+    echo -e "${green}正在下载节点 $1 的独立证书...${plain}"
+    node_cert_fetch force "$1" "$2" "$3" "$4"
+}
+
+# add 成功（节点已生效）之后：登记来源、装 timer。
+node_cert_commit() { # <intag> <cert_url> <key_url>
+    if ! node_cert_registry_set "$1" "$2" "$3"; then
+        echo -e "${red}写入 ${NODE_CERT_SOURCE} 失败：节点 $1 的证书已就位，但不会自动更新${plain}"
+        return 1
+    fi
+    node_cert_timer_sync
+    echo -e "${green}节点 $1 使用独立远程证书，每天检查一次，剩余不足 ${CERT_RENEW_DAYS} 天时自动下载更新${plain}"
+}
+
+# 节点没加成或已被删除：删掉它的独立证书与登记。没有就什么都不做。
+node_cert_forget() { # <intag>
+    local had=0
+    [[ -e "$(node_cert_path "$1")" || -e "$(node_cert_key_path "$1")" ]] && had=1
+    node_cert_registered "$1" && had=1
+    ((had)) || return 0
+    rm -f "$(node_cert_path "$1")" "$(node_cert_key_path "$1")" \
+        "${NODE_CERT_DIR}/.$1-prev.cert" "${NODE_CERT_DIR}/.$1-prev.key"
+    node_cert_registry_del "$1" || true
+    node_cert_timer_sync
+}
+
+# 定时任务调用的就是不带参数的这个：逐个检查所有登记的节点。
+node_cert_update_all() { # [--force]
+    local mode="auto" tag rc=0
+    [[ "${1:-}" == "--force" ]] && mode="force"
+    node_require_jq || return 1
+    if [[ -z "$(node_cert_tags)" ]]; then
+        echo -e "${yellow}没有节点使用独立远程证书，无事可做（用 singr add --node-cert-url 配置）${plain}"
+        return 0
+    fi
+    cert_tools_ready || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec 8>"${CONFIG_DIR}/.node-cert-update.lock"
+        flock -n 8 || { echo -e "${yellow}[证书] 另一个节点证书更新正在进行，跳过${plain}"; return 0; }
+    fi
+    while IFS= read -r tag; do
+        [[ -n "${tag}" ]] || continue
+        if ! node_cert_in_use "${tag}"; then
+            echo -e "${yellow}[证书] 节点 ${tag} 已不再使用独立证书（节点被删或证书路径被手改过），跳过。清理：singr node-cert ${tag} --clear${plain}"
+            continue
+        fi
+        node_cert_fetch "${mode}" "${tag}" "$(node_cert_source_get "${tag}" cert_url)" \
+            "$(node_cert_source_get "${tag}" key_url)" </dev/null || rc=1
+    done < <(node_cert_tags)
+    return "${rc}"
+}
+
+node_cert_show_one() { # <intag>
+    local tag="$1" c
+    c="$(node_cert_path "${tag}")"
+    echo -e "${green}节点 $(node_desc "${tag}")${plain}"
+    echo -e "  证书：${c} + $(node_cert_key_path "${tag}")"
+    if [[ -s "${c}" ]]; then
+        echo -e "  状态：$(node_cert_status "${c}")"
+    else
+        echo -e "  状态：${red}不存在${plain}"
+    fi
+    node_cert_in_use "${tag}" || echo -e "  ${yellow}注意：该节点的 server.json 已不指向这张证书（或节点已不存在）${plain}"
+    if node_cert_registered "${tag}"; then
+        echo "  证书地址：$(cert_url_mask "$(node_cert_source_get "${tag}" cert_url)")"
+        echo "  私钥地址：$(cert_url_mask "$(node_cert_source_get "${tag}" key_url)")"
+    else
+        echo -e "  ${yellow}来源：未登记，不会自动更新${plain}"
+    fi
+}
+
+node_cert_show_all() {
+    local tag any=0
+    while IFS= read -r tag; do
+        [[ -n "${tag}" ]] || continue
+        any=1
+        node_cert_show_one "${tag}"
+    done < <(node_cert_tags)
+    if ((any == 0)); then
+        echo -e "${yellow}没有节点使用独立远程证书（singr add --node-cert-url URL --node-key-url URL 添加）${plain}"
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${NODE_CERT_TIMER}.timer"; then
+        echo -e "每日检查：${green}已启用${plain}（剩余不足 ${CERT_RENEW_DAYS} 天时下载）"
+    else
+        echo -e "每日检查：${red}未启用${plain}"
+    fi
+}
+
+# singr node-cert [<@序号|NodeID|InTag> [--cert-url URL --key-url URL | --force | --clear]]
+node_cert_cmd() {
+    local sel="" cert_url="" key_url="" force=0 clear=0 tag
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cert-url) cert_url="$2"; shift 2 ;;
+            --key-url) key_url="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            --clear) clear=1; shift ;;
+            -*)
+                echo -e "${red}未知参数：$1${plain}"
+                echo "用法：singr node-cert [<@序号|NodeID|InTag> [--cert-url URL --key-url URL | --force | --clear]]"
+                return 1
+                ;;
+            *) sel="$1"; shift ;;
+        esac
+    done
+    node_require_jq || return 1
+
+    if [[ -z "${sel}" ]]; then
+        node_cert_show_all
+        return 0
+    fi
+    # 已登记的 tag 直接认（节点被手动删掉后也要能 --clear）；否则按节点选择器解析。
+    if node_cert_registered "${sel}"; then
+        tag="${sel}"
+    else
+        tag="$(node_resolve_tag "${sel}")" || return 1
+    fi
+
+    if ((clear)); then
+        node_cert_registry_del "${tag}" || { echo -e "${red}写入 ${NODE_CERT_SOURCE} 失败${plain}"; return 1; }
+        if node_cert_in_use "${tag}"; then
+            echo -e "${green}已清除节点 ${tag} 的证书来源。证书文件保留（节点还在用），不再自动更新${plain}"
+        else
+            rm -f "$(node_cert_path "${tag}")" "$(node_cert_key_path "${tag}")"
+            echo -e "${green}已清除节点 ${tag} 的证书来源和证书文件${plain}"
+        fi
+        node_cert_timer_sync
+        return 0
+    fi
+
+    if [[ -n "${cert_url}" || -n "${key_url}" ]]; then
+        [[ -n "${cert_url}" && -n "${key_url}" ]] || { echo -e "${red}--cert-url 与 --key-url 必须同时给出${plain}"; return 1; }
+        if ! node_cert_in_use "${tag}"; then
+            echo -e "${red}节点 ${tag} 没有使用独立证书，不能只换来源。${plain}"
+            echo -e "${yellow}要改用独立证书：singr del 后用 --node-cert-url/--node-key-url 重新添加${plain}"
+            return 1
+        fi
+        node_cert_check_urls "${cert_url}" "${key_url}" || return 1
+        cert_tools_ready || return 1
+        node_cert_fetch force "${tag}" "${cert_url}" "${key_url}" || return 1
+        node_cert_registry_set "${tag}" "${cert_url}" "${key_url}" || {
+            echo -e "${red}写入 ${NODE_CERT_SOURCE} 失败（证书已更新，但不会自动续期）${plain}"
+            return 1
+        }
+        node_cert_timer_sync
+        echo -e "${green}已更换节点 ${tag} 的证书来源${plain}"
+        return 0
+    fi
+
+    if ((force)); then
+        node_cert_registered "${tag}" || { echo -e "${red}节点 ${tag} 没有登记独立证书来源${plain}"; return 1; }
+        node_cert_in_use "${tag}" || { echo -e "${red}节点 ${tag} 已不再使用独立证书${plain}"; return 1; }
+        cert_tools_ready || return 1
+        node_cert_fetch force "${tag}" "$(node_cert_source_get "${tag}" cert_url)" "$(node_cert_source_get "${tag}" key_url)"
+        return
+    fi
+
+    node_cert_show_one "${tag}"
+}
+
+# 菜单入口。
+node_cert_menu() {
+    local sel u1 u2
+    node_cert_show_all
+    [[ -t 0 ]] || return 0
+    echo -e "
+  1. 更换某个节点的证书来源
+  2. 立即更新全部节点证书
+  0. 返回
+"
+    read -r -p "请输入选择 [0-2]: " sel
+    case "${sel}" in
+        1)
+            read -r -p "节点（@序号 / NodeID / InTag）: " sel
+            read -r -p "证书地址 (https://...): " u1
+            read -r -p "私钥地址 (https://...): " u2
+            [[ -n "${sel}" && -n "${u1}" && -n "${u2}" ]] || { echo -e "${red}三项都要填${plain}"; return 1; }
+            node_cert_cmd "${sel}" --cert-url "${u1}" --key-url "${u2}"
+            ;;
+        2) node_cert_update_all --force ;;
+        *) return 0 ;;
+    esac
+}
+# <<<<<<<<<<<<<<<< SYNC BLOCK: 节点独立证书 <<<<<<<<<<<<<<<<
 
 # >>>>>>>>>>>>>>>> SYNC BLOCK: DERP 中继 >>>>>>>>>>>>>>>>
 # 本块在 SingR.sh 与 SingR-docker.sh 中逐字相同，改一处必须同步另一处。
@@ -2259,6 +2707,8 @@ show_usage() {
     echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
     echo "SingR cert-source           查看/配置默认证书的远程更新源"
     echo "SingR cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
+    echo "SingR node-cert [节点]       查看节点独立证书；加 --cert-url/--key-url 换来源、--force 立即更新、--clear 停止更新"
+    echo "SingR node-cert-update [--force] 检查并更新所有节点独立证书（每日定时任务调用的就是它）"
     echo "SingR derp [子命令]         DERP 中继（组网）：enable/disable/port，详见 singr derp help"
     echo "------------------------------------------"
     echo "添加节点参数："
@@ -2266,6 +2716,7 @@ show_usage() {
     echo "  （协议按面板节点的 path 自动判断：/anytls、/hy2、/naive；给了 --protocol 只做校验）"
     echo "  --sni HOST --cert-path PATH --key-path PATH"
     echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
+    echo "  或 --node-cert-url URL --node-key-url URL（本节点独占的远程证书，并每日检查更新）"
     echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"
     echo "  [--speed-limit 0] [--device-limit 0] [--enable-device-limit false]"
     echo "  [--update-periodic 60]"
@@ -2299,6 +2750,7 @@ ${line}
  14. 节点管理（查看 / 添加 / 删除）
  15. 默认证书更新源
  16. DERP 中继（组网）
+ 17. 节点独立证书
 ${line}"
     show_status | sed 's/^/  /'
     echo -e "${line}"
@@ -2309,7 +2761,7 @@ ${line}"
         printf '%s\n' "${nodes}"
         echo -e "${line}"
     fi
-    read -r -p "请输入选择 [0-16]: " num
+    read -r -p "请输入选择 [0-17]: " num
     case "${num}" in
         0) check_install && config ;;
         1) check_uninstall && install_singr ;;
@@ -2328,7 +2780,8 @@ ${line}"
         14) check_install && node_menu && before_show_menu ;;
         15) check_install && { cert_source_cmd; before_show_menu; } ;;
         16) check_install && { derp_cmd; before_show_menu; } ;;
-        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" && before_show_menu ;;
+        17) check_install && { node_cert_menu; before_show_menu; } ;;
+        *) echo -e "${red}请输入正确的数字 [0-17]${plain}" && before_show_menu ;;
     esac
 }
 
@@ -2347,11 +2800,13 @@ if [[ $# -gt 0 ]]; then
         uninstall) check_install 0 && uninstall_singr 0 ;;
         version) check_install 0 && show_version 0 ;;
         update_shell) update_shell ;;
-        list | nodes) check_install 0 && node_list ;;
+        list | nodes) check_install 0 && node_list --refresh ;;
         add) check_install 0 && shift && node_add "$@" ;;
         del | delete | rm) check_install 0 && node_del "${2:-}" ;;
         cert-source) check_install 0 && shift && cert_source_cmd "$@" ;;
         cert-update) check_install 0 && cert_update_cmd "${2:-}" ;;
+        node-cert) check_install 0 && shift && node_cert_cmd "$@" ;;
+        node-cert-update) check_install 0 && node_cert_update_all "${2:-}" ;;
         derp) check_install 0 && shift && derp_cmd "$@" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;

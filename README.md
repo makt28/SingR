@@ -99,12 +99,13 @@ Docker 版安装脚本同样按面板判断协议，面板不通时在装 docker
 | --- | --- |
 | `singr status` / `start` / `stop` / `restart` | 查看状态、启停 |
 | `singr log` | 查看日志 |
-| `singr update [版本]` | 更新到最新版或指定版本 |
+| `singr update [版本]` | 更新到最新版或指定版本，管理脚本也一起更新到最新 |
 | `singr config` | 编辑 `panel.json` / `server.json`，保存后可选择重启 |
-| `singr list` | 查看所有节点及证书剩余天数 |
+| `singr list` | 查看所有节点、SNI 及证书剩余天数 |
 | `singr add` / `singr del` | 添加 / 删除节点，见[「多节点」](#多节点) |
 | `singr cert-source` | 设置默认证书的下载地址（菜单第 15 项） |
 | `singr cert-update --force` | 立即重新下载默认证书 |
+| `singr node-cert [节点]` | 查看 / 管理节点独立证书，见[「单个节点用自己的远程证书」](#单个节点用自己的远程证书)（菜单第 17 项） |
 | `singr porthop` | Hysteria2 端口跳跃规则（菜单第 13 项） |
 | `singr derp` | DERP 中继（组网），见[「DERP 中继」](#derp-中继组网)（菜单第 16 项） |
 | `singr version` | 查看 SingR 和 sing-box 核心版本 |
@@ -206,6 +207,31 @@ singr cert-source --cert-url https://example.com/a.pem --key-url https://example
 - 只管默认证书，写了具体路径的节点不受影响。
 - 只接受 `https://` 地址。地址存放在 `cert-source.json`（权限 600），里面可以带 token。
 - 安装时可以直接带上：`install-docker.sh ... --cert-url URL --key-url URL`，或 `singr add ... --cert-url URL --key-url URL`。不能和 `--cert-path` 同时使用。
+
+### 单个节点用自己的远程证书
+
+同一台机器上的节点域名不同、证书也分开分发时，可以给某个节点单独配一张远程证书。它和默认证书完全独立：默认证书怎么更新都不影响它，它也不影响默认证书和其他节点。
+
+```sh
+singr add --api-url ... --api-key ... --node-id 41 \
+  --node-cert-url https://example.com/b.pem --node-key-url https://example.com/b.key
+```
+
+- 添加时先下载并校验，证书有问题就不添加，配置不变。
+- 证书放在 `certs/node/<InTag>.pem` / `.key`，下载地址存在 `node-certs.json`（权限 600）。
+- 每天检查一次（systemd timer `singr-node-cert-update.timer`），规则和默认证书一样：剩余不足 7 天才下载，远端更新才替换，只换文件不重启。每个节点各自检查，一个失败不影响其他节点。
+- `singr del` 删节点时证书和下载地址一起删除；没有节点使用独立证书后 timer 也会卸掉。
+- 和 `--cert-path`、`--cert-url` 三选一。
+
+管理：
+
+```sh
+singr node-cert                    # 查看所有节点独立证书
+singr node-cert @2                 # 查看某个节点（@序号 / NodeID / InTag）
+singr node-cert @2 --cert-url URL --key-url URL   # 换下载地址并立即下载
+singr node-cert @2 --force         # 立即重新下载
+singr node-cert @2 --clear         # 不再自动更新（节点还在用时证书文件保留）
+```
 
 ---
 

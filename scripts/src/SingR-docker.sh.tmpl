@@ -277,6 +277,11 @@ update_singr() {
 
     IMAGE="${image}"
     save_image
+    # 管理脚本跟着升级到最新 main（裸机版靠 install.sh 做同样的事）。下载失败只是脚本
+    # 没换，镜像照常更新。换掉的是磁盘上的文件，这次运行继续用内存里的旧代码走完。
+    if update_shell_install; then
+        echo -e "${green}管理脚本已同步更新${plain}"
+    fi
     # 没有节点时进程起不来，重建出来的容器会按 --restart 无限重启。删掉旧容器（它还挂着
     # 旧镜像），singr add 添加节点时 container_ensure 会用新镜像重建。
     if node_none_configured; then
@@ -314,6 +319,7 @@ uninstall_singr() {
         systemctl daemon-reload 2>/dev/null || true
     fi
     cert_timer_remove
+    cert_timer_remove_unit "${NODE_CERT_TIMER}"
 
     rm -rf "${CONFIG_DIR}"
     echo -e "${green}卸载成功${plain}"
@@ -547,7 +553,8 @@ node_cert_renew_hint() {
     echo -e "自动重新加载，无需重启，也不需要 --deploy-hook（default.pem 软链到 certbot 的除外，"
     echo -e "那种情况监视不到 live/ 里的变化，仍需 --deploy-hook \"singr restart\"）。默认证书可以用"
     echo -e "  singr cert-source"
-    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。${plain}"
+    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。单个节点要用自己的远程证书，"
+    echo -e "添加时用 --node-cert-url/--node-key-url，之后用 singr node-cert 管理。${plain}"
 }
 
 # 把旧版本（复制模型）的机器迁到原地引用。certs.json 存在才跑，跑完改名，所以是一次
@@ -645,6 +652,8 @@ certs_migrate() {
 
 #@include lib/cert-source.sh
 
+#@include lib/node-cert.sh
+
 #@include lib/derp.sh
 
 #@include lib/porthop.sh
@@ -673,6 +682,8 @@ show_usage() {
     echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
     echo "singr cert-source           查看/配置默认证书的远程更新源"
     echo "singr cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
+    echo "singr node-cert [节点]       查看节点独立证书；加 --cert-url/--key-url 换来源、--force 立即更新、--clear 停止更新"
+    echo "singr node-cert-update [--force] 检查并更新所有节点独立证书（每日定时任务调用的就是它）"
     echo "singr derp [子命令]         DERP 中继（组网）：enable/disable/port，详见 singr derp help"
     echo "------------------------------------------"
     echo "添加节点参数："
@@ -680,6 +691,7 @@ show_usage() {
     echo "  （协议按面板节点的 path 自动判断：/anytls、/hy2、/naive；给了 --protocol 只做校验）"
     echo "  --sni HOST --cert-path PATH --key-path PATH（宿主机路径，容器按原路径挂载）"
     echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
+    echo "  或 --node-cert-url URL --node-key-url URL（本节点独占的远程证书，并每日检查更新）"
     echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"
     echo "  [--speed-limit 0] [--device-limit 0] [--enable-device-limit false]"
     echo "  [--update-periodic 60]"
@@ -712,6 +724,7 @@ ${line}
  14. 节点管理（查看 / 添加 / 删除）
  15. 默认证书更新源
  16. DERP 中继（组网）
+ 17. 节点独立证书
 ${line}"
     show_status | sed 's/^/  /'
     echo -e "${line}"
@@ -722,7 +735,7 @@ ${line}"
         printf '%s\n' "${nodes}"
         echo -e "${line}"
     fi
-    read -r -p "请输入选择 [0-16]: " num
+    read -r -p "请输入选择 [0-17]: " num
     case "${num}" in
         0) config ;;
         2) update_singr ;;
@@ -740,7 +753,8 @@ ${line}"
         14) node_menu && before_show_menu ;;
         15) cert_source_cmd; before_show_menu ;;
         16) derp_cmd; before_show_menu ;;
-        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" && before_show_menu ;;
+        17) node_cert_menu; before_show_menu ;;
+        *) echo -e "${red}请输入正确的数字 [0-17]${plain}" && before_show_menu ;;
     esac
 }
 
@@ -766,11 +780,13 @@ if [[ $# -gt 0 ]]; then
         uninstall) uninstall_singr 0 ;;
         version) show_version 0 ;;
         update_shell) update_shell ;;
-        list | nodes) node_list ;;
+        list | nodes) node_list --refresh ;;
         add) shift; node_add "$@" ;;
         del | delete | rm) node_del "${2:-}" ;;
         cert-source) shift; cert_source_cmd "$@" ;;
         cert-update) cert_update_cmd "${2:-}" ;;
+        node-cert) shift; node_cert_cmd "$@" ;;
+        node-cert-update) node_cert_update_all "${2:-}" ;;
         derp) shift; derp_cmd "$@" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;

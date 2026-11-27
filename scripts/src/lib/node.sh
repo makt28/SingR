@@ -293,6 +293,64 @@ node_effective_cert() {
     printf '%s|%s' "${cert}" "${key}"
 }
 
+# ---- 节点实际生效的 SNI（只用于显示和证书覆盖检查）----
+#
+# 运行时面板 host= 优先，其次 server.json 的 server_name（--sni）。面板 host 本地没有
+# 别处存着，所以 add 时把查到的 host 记进 ${NODE_META}（{"<intag>": {"panel_host": ...}}），
+# 升级上来的老节点没有记录，singr list 时补查一次面板（node_meta_backfill）。只是显示
+# 用：面板之后改了 host 这里不会跟着变，进程不读这个文件。
+NODE_META="${CONFIG_DIR}/node-meta.json"
+
+node_meta_has() {
+    jq -e --arg t "$1" 'has($t)' "${NODE_META}" >/dev/null 2>&1
+}
+
+node_meta_set() { # <intag> <panel_host>
+    local tmp src="${NODE_META}"
+    [[ -s "${src}" ]] && jq -e 'type == "object"' "${src}" >/dev/null 2>&1 || src=/dev/null
+    tmp="$(mktemp "${CONFIG_DIR}/.node-meta.XXXXXX")" || return 1
+    if jq -n --arg t "$1" --arg h "$2" --slurpfile m "${src}" \
+        '($m[0] // {}) | .[$t] = {panel_host: $h}' >"${tmp}" && mv -f "${tmp}" "${NODE_META}"; then
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+node_meta_del() { # <intag>
+    local tmp
+    node_meta_has "$1" || return 0
+    tmp="$(mktemp "${CONFIG_DIR}/.node-meta.XXXXXX")" || return 1
+    jq --arg t "$1" 'del(.[$t])' "${NODE_META}" >"${tmp}" && mv -f "${tmp}" "${NODE_META}" || rm -f "${tmp}"
+}
+
+node_sni() { # <intag>
+    local h
+    h="$(jq -r --arg t "$1" '.[$t].panel_host // ""' "${NODE_META}" 2>/dev/null)"
+    [[ -n "${h}" ]] || h="$(jq -r --arg t "$1" '(first(.inbounds[]? | select(.tag==$t) | .tls.server_name)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
+    printf '%s' "${h}"
+}
+
+# 证书提示里称呼一个节点："a-in（SNI x.com）"。
+node_desc() { # <intag>
+    local sni
+    sni="$(node_sni "$1")"
+    printf '%s（SNI %s）' "$1" "${sni:-未知}"
+}
+
+# 没有记录的节点向面板补查一次 host（老版本装的节点）。查不到就下次再试，不报错。
+node_meta_backfill() {
+    local intag api_url api_key node_id node_type res host
+    while IFS=$'\t' read -r intag api_url api_key node_id node_type; do
+        [[ -n "${intag}" && -n "${api_url}" && "${node_id}" =~ ^[0-9]+$ ]] || continue
+        node_meta_has "${intag}" && continue
+        res="$(node_panel_detect "${api_url}" "${api_key}" "${node_id}" "${node_type:-V2ray}" 5 2>/dev/null)" || continue
+        IFS=$'\t' read -r _ _ host <<<"${res}"
+        node_meta_set "${intag}" "${host}" || true
+    done < <(jq -r '(.nodes // [])[] | [(.intag // ""), (.apiconfig.apihost // ""), (.apiconfig.apikey // ""),
+            ((.apiconfig.nodeid // "") | tostring), (.apiconfig.nodetype // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null)
+}
+
 # tag 是否已被某个节点占用。只看 panel.json：server.json 里存在同名 inbound 但没有
 # 节点引用它（默认配置铺的 anytls-in / hysteria2-in / naive-in 超集就是这种），那不是"占用"，
 # 而是可以直接接管的模板——第一次 add 就该落在 anytls-in 上，与老装机保持一致。
@@ -349,9 +407,12 @@ node_drop_placeholder() {
         "${PANEL_CONFIG}" >"${tmp}" && mv -f "${tmp}" "${PANEL_CONFIG}"
 }
 
+# 带 --refresh 时先给没有 SNI 记录的节点补查面板（只有 singr list 命令这么调；菜单和
+# add/del 之后的列表不发网络请求）。
 node_list() {
     node_require_jq || return 1
     node_configs_ready || return 1
+    [[ "${1:-}" == "--refresh" ]] && node_meta_backfill
 
     echo -e "${green}当前节点（${PANEL_CONFIG}）：${plain}"
     if [[ "$(node_count)" == "0" ]]; then
@@ -360,8 +421,8 @@ node_list() {
     fi
 
     # 表头用 ASCII：printf 的宽度按字节算，中文表头会和下面的数据列对不齐。
-    printf '  %-3s %-8s %-10s %-34s %-20s %s\n' "#" "NodeID" "PROTO" "DOMAIN" "INTAG" "CERT"
-    local i=1 nodeid apihost intag proto paths cert key mark
+    printf '  %-3s %-8s %-10s %-34s %-20s %-28s %s\n' "#" "NodeID" "PROTO" "DOMAIN" "INTAG" "SNI" "CERT"
+    local i=1 nodeid apihost intag proto paths cert key mark sni
     while IFS=$'\t' read -r nodeid apihost intag; do
         [[ -z "${intag}" ]] && continue
         proto="$(jq -r --arg t "${intag}" '(first(.inbounds[]? | select(.tag==$t) | .type)) // ""' "${SERVER_CONFIG}" 2>/dev/null)"
@@ -381,7 +442,8 @@ node_list() {
                 mark="${red}缺失${plain}"
             fi
         fi
-        printf '  %-3s %-8s %-10s %-34s %-20s ' "${i}" "${nodeid}" "${proto}" "${apihost}" "${intag}"
+        sni="$(node_sni "${intag}")"
+        printf '  %-3s %-8s %-10s %-34s %-20s %-28s ' "${i}" "${nodeid}" "${proto}" "${apihost}" "${intag}" "${sni:--}"
         echo -e "${mark}"
         i=$((i + 1))
     done < <(jq -r '(.nodes // [])[] | [((.apiconfig.nodeid // "?")|tostring), (.apiconfig.apihost // "?"), (.intag // "")] | @tsv' "${PANEL_CONFIG}" 2>/dev/null)
@@ -529,7 +591,7 @@ node_add() {
     node_configs_ready || return 1
 
     local api_url="" api_key="" node_id="" protocol="" sni="" cert_src="" key_src=""
-    local cert_url="" key_url=""
+    local cert_url="" key_url="" node_cert_url="" node_key_url=""
     local panel_type="SSpanel" node_type="V2ray" timeout="20" speed_limit="0"
     local device_limit="0" enable_device_limit="false" update_periodic="60"
 
@@ -544,6 +606,8 @@ node_add() {
             --key-path) key_src="$2"; shift 2 ;;
             --cert-url) cert_url="$2"; shift 2 ;;
             --key-url) key_url="$2"; shift 2 ;;
+            --node-cert-url) node_cert_url="$2"; shift 2 ;;
+            --node-key-url) node_key_url="$2"; shift 2 ;;
             --panel-type) panel_type="$2"; shift 2 ;;
             --node-type) node_type="$2"; shift 2 ;;
             --timeout) timeout="$2"; shift 2 ;;
@@ -564,7 +628,8 @@ node_add() {
             [[ -z "${api_key}" ]] && read -r -p "面板密钥 (--api-key): " api_key
             [[ -z "${node_id}" ]] && read -r -p "节点 ID  (--node-id): " node_id
             [[ -z "${sni}" ]] && read -r -p "SNI 域名 (--sni，留空则由面板 host= 决定): " sni
-            if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" ]]; then
+            if [[ -z "${cert_src}" && -z "${key_src}" && -z "${cert_url}" && -z "${key_url}" &&
+                -z "${node_cert_url}" && -z "${node_key_url}" ]]; then
                 echo -e "${yellow}证书留空则使用默认路径 ${CERT_DIR}/default.pem 与 default.key${plain}"
                 read -r -p "证书路径 (--cert-path，回车用默认): " cert_src
             fi
@@ -611,6 +676,19 @@ node_add() {
         echo -e "${red}--cert-path 与 --cert-url 只能二选一${plain}"
         return 1
     fi
+    # --node-cert-url/--node-key-url 是这个节点独占的远程证书（见「节点独立证书」块），
+    # 和默认证书、显式路径都不相干，所以三种只能选一种。
+    if [[ -n "${node_cert_url}" && -z "${node_key_url}" ]] || [[ -z "${node_cert_url}" && -n "${node_key_url}" ]]; then
+        echo -e "${red}--node-cert-url 与 --node-key-url 必须同时给出${plain}"
+        return 1
+    fi
+    if [[ -n "${node_cert_url}" && ( -n "${cert_src}" || -n "${cert_url}" ) ]]; then
+        echo -e "${red}--node-cert-url 不能和 --cert-path / --cert-url 一起用${plain}"
+        return 1
+    fi
+    if [[ -n "${node_cert_url}" ]]; then
+        node_cert_check_urls "${node_cert_url}" "${node_key_url}" || return 1
+    fi
     # 路径原样写进 server.json，由后端进程解析：systemd 的工作目录是 /，容器里更是
     # 另一个命名空间，相对路径到那边就指错了。这里按当前目录补成绝对路径，但不解析
     # 符号链接 —— certbot 的 live/ 软链要保留原样，续期换的正是软链。
@@ -652,9 +730,17 @@ node_add() {
         node_drop_placeholder || { echo -e "${red}清理占位节点失败${plain}"; return 1; }
     fi
 
-    local tag paths cert_path key_path eff_cert eff_key
+    local tag paths cert_path key_path eff_cert eff_key own_cert=0
     tag="$(node_alloc_tag "${proto}" "${node_id}")"
-    if [[ -n "${cert_src}" ]]; then
+    if [[ -n "${node_cert_url}" ]]; then
+        # 先下载校验，失败什么都不留、配置也没动。之后任何一步失败都要 node_cert_forget。
+        node_cert_prepare "${tag}" "${node_cert_url}" "${node_key_url}" "${panel_host:-${sni}}" || return 1
+        own_cert=1
+        cert_path="$(node_cert_path "${tag}")"
+        key_path="$(node_cert_key_path "${tag}")"
+        eff_cert="${cert_path}"
+        eff_key="${key_path}"
+    elif [[ -n "${cert_src}" ]]; then
         paths="$(node_backend_place_cert "${tag}" "${cert_src}" "${key_src}")" || return 1
         cert_path="${paths%%|*}"
         key_path="${paths##*|}"
@@ -692,14 +778,21 @@ node_add() {
         echo -e "  cp 证书 ${CERT_DIR}/default.pem"
         echo -e "  cp 私钥 ${CERT_DIR}/default.key"
         echo -e "${yellow}（.crt 后缀也认；或用 --cert-path/--key-path 指定其他路径，"
-        echo -e "  或用 --cert-url/--key-url 从远程地址下载并每日检查更新）${plain}"
+        echo -e "  或用 --cert-url/--key-url 从远程地址下载并每日检查更新，"
+        echo -e "  或用 --node-cert-url/--node-key-url 给这个节点单独配一张远程证书）${plain}"
+        ((own_cert)) && node_cert_forget "${tag}"
         return 1
     fi
 
-    node_backup || { echo -e "${red}备份配置失败，已中止${plain}"; return 1; }
+    if ! node_backup; then
+        echo -e "${red}备份配置失败，已中止${plain}"
+        ((own_cert)) && node_cert_forget "${tag}"
+        return 1
+    fi
     if ! node_write_server "${tag}" "${proto}" "${sni}" "${cert_path}" "${key_path}"; then
         echo -e "${red}写入 ${SERVER_CONFIG} 失败${plain}"
         node_restore
+        ((own_cert)) && node_cert_forget "${tag}"
         return 1
     fi
     if ! node_write_panel "${tag}" "${proto}" "${api_url}" "${api_key}" "${node_id}" \
@@ -707,11 +800,14 @@ node_add() {
         "${update_periodic}" "${enable_device_limit}"; then
         echo -e "${red}写入 ${PANEL_CONFIG} 失败${plain}"
         node_restore
+        ((own_cert)) && node_cert_forget "${tag}"
         return 1
     fi
 
     echo -e "${green}已添加节点：${api_url} #${node_id}（${proto}，InTag=${tag}）${plain}"
     if node_apply; then
+        node_meta_set "${tag}" "${panel_host}" || true
+        ((own_cert)) && node_cert_commit "${tag}" "${node_cert_url}" "${node_key_url}"
         node_backend_resume
         echo
         node_list
@@ -721,6 +817,7 @@ node_add() {
         node_cert_renew_hint
         return 0
     fi
+    ((own_cert)) && node_cert_forget "${tag}"
     return 1
 }
 
@@ -826,11 +923,15 @@ node_del() {
     echo -e "${green}已删除节点 ${sel}（InTag=${tag}）${plain}"
     if ((last)); then
         node_commit
+        node_meta_del "${tag}"
+        node_cert_forget "${tag}"
         node_backend_idle
         echo -e "${green}${APP_NAME} 已停止（当前没有节点）。用 singr add 添加节点后会自动启动。${plain}"
         return 0
     fi
     if node_apply; then
+        node_meta_del "${tag}"
+        node_cert_forget "${tag}"
         echo
         node_list
         return 0

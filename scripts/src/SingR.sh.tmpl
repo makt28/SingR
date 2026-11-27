@@ -106,6 +106,7 @@ uninstall_singr() {
     systemctl reset-failed >/dev/null 2>&1 || true
     rm -f /etc/logrotate.d/singr
     cert_timer_remove
+    cert_timer_remove_unit "${NODE_CERT_TIMER}"
     rm -rf "${INSTALL_DIR}" "${CONFIG_DIR}"
 
     echo -e "${green}卸载成功${plain}"
@@ -305,10 +306,13 @@ node_cert_renew_hint() {
     echo -e "无需重启，也不需要 --deploy-hook（default.pem 软链到 certbot 的除外，那种情况"
     echo -e "监视不到 live/ 里的变化，仍需 --deploy-hook \"singr restart\"）。默认证书可以用"
     echo -e "  singr cert-source"
-    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。${plain}"
+    echo -e "配置远程更新源，每天检查一次、剩余不足 7 天时自动下载。单个节点要用自己的远程证书，"
+    echo -e "添加时用 --node-cert-url/--node-key-url，之后用 singr node-cert 管理。${plain}"
 }
 
 #@include lib/cert-source.sh
+
+#@include lib/node-cert.sh
 
 #@include lib/derp.sh
 
@@ -340,6 +344,8 @@ show_usage() {
     echo "                            也可用 NodeID 或 InTag；NodeID 在多面板下可能重复"
     echo "SingR cert-source           查看/配置默认证书的远程更新源"
     echo "SingR cert-update [--force] 检查并更新默认证书（每日定时任务调用的就是它）"
+    echo "SingR node-cert [节点]       查看节点独立证书；加 --cert-url/--key-url 换来源、--force 立即更新、--clear 停止更新"
+    echo "SingR node-cert-update [--force] 检查并更新所有节点独立证书（每日定时任务调用的就是它）"
     echo "SingR derp [子命令]         DERP 中继（组网）：enable/disable/port，详见 singr derp help"
     echo "------------------------------------------"
     echo "添加节点参数："
@@ -347,6 +353,7 @@ show_usage() {
     echo "  （协议按面板节点的 path 自动判断：/anytls、/hy2、/naive；给了 --protocol 只做校验）"
     echo "  --sni HOST --cert-path PATH --key-path PATH"
     echo "  或 --cert-url URL --key-url URL（下载为默认证书，并每日检查更新）"
+    echo "  或 --node-cert-url URL --node-key-url URL（本节点独占的远程证书，并每日检查更新）"
     echo "  [--panel-type SSpanel] [--node-type V2ray] [--timeout 20]"
     echo "  [--speed-limit 0] [--device-limit 0] [--enable-device-limit false]"
     echo "  [--update-periodic 60]"
@@ -380,6 +387,7 @@ ${line}
  14. 节点管理（查看 / 添加 / 删除）
  15. 默认证书更新源
  16. DERP 中继（组网）
+ 17. 节点独立证书
 ${line}"
     show_status | sed 's/^/  /'
     echo -e "${line}"
@@ -390,7 +398,7 @@ ${line}"
         printf '%s\n' "${nodes}"
         echo -e "${line}"
     fi
-    read -r -p "请输入选择 [0-16]: " num
+    read -r -p "请输入选择 [0-17]: " num
     case "${num}" in
         0) check_install && config ;;
         1) check_uninstall && install_singr ;;
@@ -409,7 +417,8 @@ ${line}"
         14) check_install && node_menu && before_show_menu ;;
         15) check_install && { cert_source_cmd; before_show_menu; } ;;
         16) check_install && { derp_cmd; before_show_menu; } ;;
-        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" && before_show_menu ;;
+        17) check_install && { node_cert_menu; before_show_menu; } ;;
+        *) echo -e "${red}请输入正确的数字 [0-17]${plain}" && before_show_menu ;;
     esac
 }
 
@@ -428,11 +437,13 @@ if [[ $# -gt 0 ]]; then
         uninstall) check_install 0 && uninstall_singr 0 ;;
         version) check_install 0 && show_version 0 ;;
         update_shell) update_shell ;;
-        list | nodes) check_install 0 && node_list ;;
+        list | nodes) check_install 0 && node_list --refresh ;;
         add) check_install 0 && shift && node_add "$@" ;;
         del | delete | rm) check_install 0 && node_del "${2:-}" ;;
         cert-source) check_install 0 && shift && cert_source_cmd "$@" ;;
         cert-update) check_install 0 && cert_update_cmd "${2:-}" ;;
+        node-cert) check_install 0 && shift && node_cert_cmd "$@" ;;
+        node-cert-update) check_install 0 && node_cert_update_all "${2:-}" ;;
         derp) check_install 0 && shift && derp_cmd "$@" ;;
         porthop) porthop_menu ;;
         porthop-apply) porthop_reapply_all ;;

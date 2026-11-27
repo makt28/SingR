@@ -49,6 +49,10 @@ mkdir -p "${CFG}/certs" "${STATE}"
     echo "PANEL_CONFIG=\"${CFG}/panel.json\""
     echo "CERT_SOURCE=\"${CFG}/cert-source.json\""
     extract_block "${REPO_DIR}/SingR.sh" 节点管理
+    # add/del 会调到这两块（节点独立证书的登记与清理），一起抠出来，别让调用落空。
+    echo "CERT_TIMER_DIR=\"${TMP}\""
+    extract_block "${REPO_DIR}/SingR.sh" 默认证书更新源
+    extract_block "${REPO_DIR}/SingR.sh" 节点独立证书
     # ---- 后端桩 ----
     echo "node_backend_restart() { echo x >> '${STATE}/restarts'; }"
     echo 'node_backend_verify() { return 0; }'
